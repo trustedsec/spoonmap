@@ -187,7 +187,7 @@ https://www.rapid7.com/db/modules/exploit/linux/redis/redis_replication_cmd_exec
   
 6970  
 Cisco Unified Commuications Manager  
-http://<ip address>:6970/ConfigFileCacheList.txt  
+http://[CUCM IP Address]:6970/ConfigFileCacheList.txt  
   
 8080  
 Adobe CodFusion BlazeDS  
