@@ -1,5 +1,5 @@
 {
-    "__scan_type_choices__" : "Small Port Scan, Medium Port Scan, Large Port Scan, Extra Large Port Scan, Custom Port Scan", 
+    "__scan_type_choices__" : "Small Port Scan, Medium Port Scan, Large Port Scan, Extra Large Port Scan, Full Port Scan, Custom Port Scan", 
     "scan_type" : "Custom Port Scan", 
     "dest_ports" : ["80","443","8000","8080"],
     "__banner_scan_choices__" : "True, False", 
