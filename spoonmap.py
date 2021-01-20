@@ -39,7 +39,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file):
         # Commence masscan!
         print('\x1b[33m' + f'Scanning port {dest_port}...' + '\x1b[0m')
         masscan_process = subprocess.Popen(f'masscan -p {dest_port} --open --max-rate {max_rate} ' \
-            f'--source-port {source_port} -iL {target_file} -oX {dir_path}/masscan_results/port{dest_port}.xml',
+            f'--source-port {source_port} -iL {target_file} -oX \"{dir_path}/masscan_results/port{dest_port}.xml\"',
             shell=True)
         try:
            masscan_process.wait()
