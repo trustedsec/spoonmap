@@ -11,4 +11,5 @@
     "max_rate" : "2000",
     "target_file" : "ranges.txt"
     "output_path" : "./"
+    "exclusions_file" : "exclusions.txt"
 }

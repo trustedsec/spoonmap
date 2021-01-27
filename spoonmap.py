@@ -30,17 +30,23 @@ ____/ /__  /_/ / /_/ / /_/ /  /|  / _  /  / / _  ___ |  ____/
        /_/                                                 
     ''')
 
-def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file):
+def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file):
     status_summary = '\nSummary'
 
-    os.makedirs(output_path+"/masscan_results", exist_ok=True)
+    if not os.path.exists(f'{output_path}/masscan_results'):
+        os.makedirs(f'{output_path}/masscan_results')
     for dest_port in dest_ports:
 
         # Commence masscan!
         print('\x1b[33m' + f'Scanning port {dest_port}...' + '\x1b[0m')
-        masscan_process = subprocess.Popen(f'masscan -p {dest_port} --open --max-rate {max_rate} ' \
-            f'--source-port {source_port} -iL {target_file} -oX \"{output_path}/masscan_results/port{dest_port}.xml\"',
-            shell=True)
+        if exclusions_file:
+            masscan_process = subprocess.Popen(f'masscan -p {dest_port} --open --max-rate {max_rate} ' \
+                f'--source-port {source_port} -iL {target_file} --excludefile {exclusions_file} -oX \"{output_path}/masscan_results/port{dest_port}.xml\"',
+                shell=True)
+        else:
+            masscan_process = subprocess.Popen(f'masscan -p {dest_port} --open --max-rate {max_rate} ' \
+                f'--source-port {source_port} -iL {target_file} -oX \"{output_path}/masscan_results/port{dest_port}.xml\"',
+                shell=True)
         try:
            masscan_process.wait()
         except KeyboardInterrupt:
@@ -86,7 +92,7 @@ def nmap_scan(source_port):
     # Commence NMAP banner grabbing!
     os.makedirs(output_path+"/nmap_results", exist_ok=True)
     try:
-        host_files = os.listdir('live_hosts')
+        host_files = os.listdir(f'{dir_path}/live_hosts')
         for host_file in host_files:
             dest_port = ((host_file.split('.')[0])[4:])
             if not os.path.exists(f'{output_path}/nmap_results/port{dest_port}.xml'):
@@ -130,6 +136,7 @@ def main():
     source_port = '53'
     max_rate = ''
     target_file = ''
+    exclusions_file = ''
     status_summary = ''
     output_path = ''
 
@@ -151,6 +158,7 @@ def main():
         max_rate = config_parser['max_rate']
         target_file = config_parser['target_file']
         output_path = config_parser['output_path']
+        exclusions_file = config_parser['exclusions_file']
 
     if scan_type == '':
         scan_choice = '1'
@@ -279,18 +287,41 @@ def main():
             target_file = input(f'\nPlease enter the full path for the file '
                 f'containing target hosts (default: {target_file}): '
                 ) or target_file
+            
             if os.path.exists(target_file):
                 print("Should be here")
                 break
 
+    if not exclusions_file:
+        exclusions_choice = 'n'
+        exclusions_choice = input(f'\nWould you like to exclude any hosts?  (default: No) '
+            ) or exclusions_choice
+
+        if exclusions_choice[0].lower() == 'y':
+            exclusions_file = 'exclusions.txt'
+            while True:
+                print('\nExample Exclusions File')
+                print('One CIDR or IP Address per line\n')
+                print('\t192.168.0.0/24')
+                print('\t192.168.1.23')
+                exclusions_file = input(f'\nPlease enter the full path for the file '
+                    f'containing excluded hosts if applicable (default: {dir_path}/{exclusions_file}): '
+                    ) or exclusions_file
+                
+                if os.path.exists(target_file):
+                    break
+        else:
+            exclusions_file = None
+    
     print(f'\nScan Type: {scan_type}')
     print(f'Target Ports: {dest_ports}')
     print(f'Service Banner: {banner_scan}')
     print(f'Source Port: {source_port}')
     print(f'Masscan Max Packet Rate (pps): {max_rate}')
-    print(f'Target File: {target_file}\n')
+    print(f'Target File: {target_file}')
+    print(f'Exclusions File: {exclusions_file}\n')
 
-    status_summary = mass_scan(scan_type, dest_ports, source_port, max_rate, target_file)
+    status_summary = mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file)
 
     # If service banners requested, send to nmap
     if banner_scan or banner_scan == 'Yes':

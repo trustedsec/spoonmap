@@ -50,12 +50,15 @@ One CIDR or IP Address per line
 
 Please enter the full path for the file containing target hosts (default: /opt/spoonmap/ranges.txt): 
 
+Would you like to exclude any hosts?  (default: No) 
+
 Scan Type: Small Port Scan
 Target Ports: ['80', '443', '8000', '8080', '8008', '8181', '8443']
 Service Banner: False
 Source Port: 53
 Masscan Max Packet Rate (pps): 2000
 Target File: ranges.txt
+Exclusions File: exclusions.txt
 
 Scanning port 80...
 ```
@@ -76,6 +79,7 @@ is named 'config.json'
     "__max_rate_internal_recommedation__" : "Single Port = 2000, Full Port = 1000", 
     "max_rate" : "2000",
     "target_file" : "ranges.txt"
+	"exclusions_file" : "exclusions.txt"
 }
 ```
 #### config.json Parameters
