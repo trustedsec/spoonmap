@@ -32,8 +32,8 @@ ____/ /__  /_/ / /_/ / /_/ /  /|  / _  /  / / _  ___ |  ____/
 def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file):
     status_summary = '\nSummary'
 
-    if not os.path.exists('masscan_results'):
-        os.makedirs('masscan_results')
+    if not os.path.exists(f'{dir_path}/masscan_results'):
+        os.makedirs(f'{dir_path}/masscan_results')
     for dest_port in dest_ports:
 
         # Commence masscan!
@@ -56,7 +56,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
 
         # Parse results from masscan
         if os.stat(f'{dir_path}/masscan_results/port{dest_port}.xml').st_size == 0:
-            os.remove(f'masscan_results/port{dest_port}.xml')
+            os.remove(f'{dir_path}/masscan_results/port{dest_port}.xml')
             print('\x1b[33m' + f'\nHosts Found on Port {dest_port}: 0')
             print('Masscan Completion Status: ' + '{:.0%}'.format((dest_ports.index(dest_port) + 1) / len(dest_ports)) + '\x1b[0m')
         else:
@@ -94,7 +94,7 @@ def nmap_scan(source_port):
     if not os.path.exists(f'{dir_path}/nmap_results'):
         os.makedirs(f'{dir_path}/nmap_results')
     try:
-        host_files = os.listdir('live_hosts')
+        host_files = os.listdir(f'{dir_path}/live_hosts')
         for host_file in host_files:
             dest_port = ((host_file.split('.')[0])[4:])
             if not os.path.exists(f'{dir_path}/nmap_results/port{dest_port}.xml'):
