@@ -289,7 +289,6 @@ def main():
                 ) or target_file
             
             if os.path.exists(target_file):
-                print("Should be here")
                 break
 
     if not exclusions_file:
