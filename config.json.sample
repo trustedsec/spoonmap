@@ -9,6 +9,7 @@
     "__max_rate_external_recommedation__" : "Single Port = 20000, Full Port = 10000", 
     "__max_rate_internal_recommedation__" : "Single Port = 2000, Full Port = 1000", 
     "max_rate" : "2000",
-    "target_file" : "ranges.txt",
+    "target_file" : "ranges.txt"
+    "output_path" : "./"
     "exclusions_file" : "exclusions.txt"
 }

@@ -5,6 +5,7 @@
 
 import json
 import os
+from pathlib import Path
 import subprocess
 import xml.etree.ElementTree as etree
 
@@ -32,20 +33,19 @@ ____/ /__  /_/ / /_/ / /_/ /  /|  / _  /  / / _  ___ |  ____/
 def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file):
     status_summary = '\nSummary'
 
-    if not os.path.exists(f'{dir_path}/masscan_results'):
-        os.makedirs(f'{dir_path}/masscan_results')
+    if not os.path.exists(f'{output_path}/masscan_results'):
+        os.makedirs(f'{output_path}/masscan_results')
     for dest_port in dest_ports:
 
         # Commence masscan!
         print('\x1b[33m' + f'Scanning port {dest_port}...' + '\x1b[0m')
-
         if exclusions_file:
             masscan_process = subprocess.Popen(f'masscan -p {dest_port} --open --max-rate {max_rate} ' \
-                f'--source-port {source_port} -iL {target_file} --excludefile {exclusions_file} -oX \"{dir_path}/masscan_results/port{dest_port}.xml\"',
+                f'--source-port {source_port} -iL {target_file} --excludefile {exclusions_file} -oX \"{output_path}/masscan_results/port{dest_port}.xml\"',
                 shell=True)
         else:
             masscan_process = subprocess.Popen(f'masscan -p {dest_port} --open --max-rate {max_rate} ' \
-                f'--source-port {source_port} -iL {target_file} -oX \"{dir_path}/masscan_results/port{dest_port}.xml\"',
+                f'--source-port {source_port} -iL {target_file} -oX \"{output_path}/masscan_results/port{dest_port}.xml\"',
                 shell=True)
         try:
            masscan_process.wait()
@@ -55,32 +55,31 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             quit(1)
 
         # Parse results from masscan
-        if os.stat(f'{dir_path}/masscan_results/port{dest_port}.xml').st_size == 0:
-            os.remove(f'{dir_path}/masscan_results/port{dest_port}.xml')
+        if os.stat(f'{output_path}/masscan_results/port{dest_port}.xml').st_size == 0:
+            os.remove(f'{output_path}/masscan_results/port{dest_port}.xml')
             print('\x1b[33m' + f'\nHosts Found on Port {dest_port}: 0')
             print('Masscan Completion Status: ' + '{:.0%}'.format((dest_ports.index(dest_port) + 1) / len(dest_ports)) + '\x1b[0m')
         else:
-            root = etree.parse(f'{dir_path}/masscan_results/port{dest_port}.xml')
+            root = etree.parse(f'{output_path}/masscan_results/port{dest_port}.xml')
             hosts = root.findall('host')
             for host in hosts:
                 ip_address = host.findall('address')[0].attrib['addr']
                 live_port = host.findall('ports/port')[0].attrib['portid']
 
                 # Write live hosts out to file
-                if not os.path.exists(f'{dir_path}/live_hosts'):
-                    os.makedirs(f'{dir_path}/live_hosts')
-                if os.path.exists(f'{dir_path}/live_hosts/port{live_port}.txt'):
-                    with open(f'{dir_path}/live_hosts/port{live_port}.txt') as file:
+                os.makedirs(output_path+"/live_hosts", exist_ok=True)
+                if os.path.exists(f'{output_path}/live_hosts/port{live_port}.txt'):
+                    with open(f'{output_path}/live_hosts/port{live_port}.txt') as file:
                         ip_exists = False
                         if f'{ip_address}\n' in file.read():
                             ip_exists = True
                     if not ip_exists:
-                        with open(f'{dir_path}/live_hosts/port{live_port}.txt', 'a') as file:
+                        with open(f'{output_path}/live_hosts/port{live_port}.txt', 'a') as file:
                             file.write(f'{ip_address}\n')
                 else:
-                    with open(f'{dir_path}/live_hosts/port{live_port}.txt', 'w') as file:
+                    with open(f'{output_path}/live_hosts/port{live_port}.txt', 'w') as file:
                         file.write(f'{ip_address}\n')
-            host_count = lineCount(f'{dir_path}/live_hosts/port{live_port}.txt')
+            host_count = lineCount(f'{output_path}/live_hosts/port{live_port}.txt')
             status_update = f'\nHosts Found on Port {dest_port}: {host_count}'
             status_summary += status_update
             print('\x1b[33m' + status_update)
@@ -91,17 +90,16 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
 def nmap_scan(source_port):
 
     # Commence NMAP banner grabbing!
-    if not os.path.exists(f'{dir_path}/nmap_results'):
-        os.makedirs(f'{dir_path}/nmap_results')
+    os.makedirs(output_path+"/nmap_results", exist_ok=True)
     try:
         host_files = os.listdir(f'{dir_path}/live_hosts')
         for host_file in host_files:
             dest_port = ((host_file.split('.')[0])[4:])
-            if not os.path.exists(f'{dir_path}/nmap_results/port{dest_port}.xml'):
+            if not os.path.exists(f'{output_path}/nmap_results/port{dest_port}.xml'):
                 print('\x1b[33m' + f'Grabbing service banners for port {dest_port}...\n' + '\x1b[0m')
                 nmap_process = subprocess.Popen(f'nmap -T4 -sS -sV --version-intensity 0 -Pn -p {dest_port} --open ' \
-                    f'--randomize-hosts --source-port {source_port} -iL {dir_path}/live_hosts/port{dest_port}.txt ' \
-                    f'-oX {dir_path}/nmap_results/port{dest_port}.xml',
+                    f'--randomize-hosts --source-port {source_port} -iL {output_path}/live_hosts/port{dest_port}.txt ' \
+                    f'-oX {output_path}/nmap_results/port{dest_port}.xml',
                     shell=True)
                 try:
                     nmap_process.wait()
@@ -128,6 +126,7 @@ def lineCount(file):
 # The Main Guts
 def main():
     global dir_path
+    global output_path
     ascii_art()
 
     scan_type = ''
@@ -139,6 +138,7 @@ def main():
     target_file = ''
     exclusions_file = ''
     status_summary = ''
+    output_path = ''
 
 
     # Get options from configuration file if it exists
@@ -157,6 +157,7 @@ def main():
         target_scan = config_parser['target_scan']
         max_rate = config_parser['max_rate']
         target_file = config_parser['target_file']
+        output_path = config_parser['output_path']
         exclusions_file = config_parser['exclusions_file']
 
     if scan_type == '':
@@ -268,15 +269,23 @@ def main():
             except ValueError:
                 pass
 
+    if not output_path:
+        output_path = dir_path
+        output_path = input(f'\nPlease enter full path for output '
+            f'(default: {dir_path}): '
+            ) or output_path
+        os.makedirs(output_path, exist_ok=True)
+
     if not target_file:
-        target_file = 'ranges.txt'
+        target_file = output_path+"/ranges.txt"
         while True:
+            print(target_file)
             print('\nExample Target File')
             print('One CIDR or IP Address per line\n')
             print('\t192.168.0.0/24')
             print('\t192.168.1.23')
             target_file = input(f'\nPlease enter the full path for the file '
-                f'containing target hosts (default: {dir_path}/{target_file}): '
+                f'containing target hosts (default: {target_file}): '
                 ) or target_file
             
             if os.path.exists(target_file):
@@ -319,21 +328,21 @@ def main():
 
     # Combine all live hosts into one file
     all_ips = set()
-    if os.path.exists(f'{dir_path}/live_hosts'):
-        host_files = os.listdir(f'{dir_path}/live_hosts')
+    if os.path.exists(f'{output_path}/live_hosts'):
+        host_files = os.listdir(f'{output_path}/live_hosts')
         for host_file in host_files:
-            with open(f'{dir_path}/live_hosts/{host_file}') as input_file:
+            with open(f'{output_path}/live_hosts/{host_file}') as input_file:
                 for line in input_file:
                     all_ips.add(line)
-        with open(f'{dir_path}/all_live_hosts.txt', 'w') as output_file:
+        with open(f'{output_path}/all_live_hosts.txt', 'w') as output_file:
             for ip in all_ips:
                 output_file.write(ip)
 
         # Combine all XML results into one file
         if banner_scan :
-            result_dir = f'{dir_path}/nmap_results/'
+            result_dir = f'{output_path}/nmap_results/'
         else:
-            result_dir = f'{dir_path}/masscan_results/'
+            result_dir = f'{output_path}/masscan_results/'
         xml_result = '<?xml version="1.0"?>\n<!-- SpooNMAP -->\n<nmaprun>\n'
         xml_files = os.listdir(result_dir)
         for xml_file in xml_files:
@@ -342,9 +351,9 @@ def main():
             for host in hosts:
                 xml_result += etree.tostring(host, encoding="unicode", method="xml")
         xml_result += '</nmaprun>'
-        with open(f'{dir_path}/spoonmap_output.xml', 'w+') as spoonmap_output:
+        with open(f'{output_path}/spoonmap_output.xml', 'w+') as spoonmap_output:
             spoonmap_output.write(xml_result)
-        print('\x1b[33m' + f'\nResults written to {dir_path}/spoonmap_output.xml' + '\x1b[0m')
+        print('\x1b[33m' + f'\nResults written to {output_path}/spoonmap_output.xml' + '\x1b[0m')
 
     else:
         status_summary += '\nNo hosts found.'
