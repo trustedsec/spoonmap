@@ -66,6 +66,9 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                 ip_address = host.findall('address')[0].attrib['addr']
                 live_port = host.findall('ports/port')[0].attrib['portid']
 
+                if 'U:' in dest_port:
+                    live_port = 'U:'+live_port
+
                 # Write live hosts out to file
                 os.makedirs(output_path+"/live_hosts", exist_ok=True)
                 if os.path.exists(f'{output_path}/live_hosts/port{live_port}.txt'):
@@ -97,10 +100,17 @@ def nmap_scan(source_port):
             dest_port = ((host_file.split('.')[0])[4:])
             if not os.path.exists(f'{output_path}/nmap_results/port{dest_port}.xml'):
                 print('\x1b[33m' + f'Grabbing service banners for port {dest_port}...\n' + '\x1b[0m')
-                nmap_process = subprocess.Popen(f'nmap -T4 -sS -sV --version-intensity 0 -Pn -p {dest_port} --open ' \
-                    f'--randomize-hosts --source-port {source_port} -iL {output_path}/live_hosts/port{dest_port}.txt ' \
-                    f'-oX {output_path}/nmap_results/port{dest_port}.xml',
-                    shell=True)
+
+                if 'U:' in dest_port:
+                    nmap_process = subprocess.Popen(f'nmap -T4 -sU -sV --version-intensity 0 -Pn -p {dest_port[2:]} --open ' \
+                        f'--randomize-hosts --source-port {source_port} -iL {output_path}/live_hosts/port{dest_port}.txt ' \
+                        f'-oX {output_path}/nmap_results/port{dest_port}.xml',
+                        shell=True)
+                else:
+                    nmap_process = subprocess.Popen(f'nmap -T4 -sS -sV --version-intensity 0 -Pn -p {dest_port} --open ' \
+                        f'--randomize-hosts --source-port {source_port} -iL {output_path}/live_hosts/port{dest_port}.txt ' \
+                        f'-oX {output_path}/nmap_results/port{dest_port}.xml',
+                        shell=True)
                 try:
                     nmap_process.wait()
                     print('\x1b[33m' + '\nNMAP Completion Status: ' + \

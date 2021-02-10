@@ -68,9 +68,9 @@ is named 'config.json'
 ```
 # cat config.json
 {
-    "__scan_type_choices__" : "Small Port Scan, Medium Port Scan, Large Port Scan, Extra Large Port Scan, Custom Port Scan", 
+    "__scan_type_choices__" : "Small Port Scan, Medium Port Scan, Large Port Scan, Extra Large Port Scan, Full Port Scan, Custom Port Scan", 
     "scan_type" : "Custom Port Scan", 
-    "dest_ports" : ["80","443","8000","8080"],
+    "dest_ports" : ["80","443","8000","8080","U:53"],
     "__banner_scan_choices__" : "True, False", 
     "banner_scan" : "True", 
     "__target_scan_choices__" : "External, Internal", 
@@ -78,10 +78,12 @@ is named 'config.json'
     "__max_rate_external_recommedation__" : "Single Port = 20000, Full Port = 10000", 
     "__max_rate_internal_recommedation__" : "Single Port = 2000, Full Port = 1000", 
     "max_rate" : "2000",
-    "target_file" : "ranges.txt"
-	"exclusions_file" : "exclusions.txt"
+    "target_file" : "ranges.txt",
+    "output_path" : "./",
+    "exclusions_file" : "exclusions.txt"
 }
 ```
+Note: To perform UDP scans simply prepend 'U:' to the port you'd like to scan (i.e 'U:53').
 #### config.json Parameters
 ##### scan_type
 This paramater is used to determine what ports to scan.

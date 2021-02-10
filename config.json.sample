@@ -1,7 +1,7 @@
 {
     "__scan_type_choices__" : "Small Port Scan, Medium Port Scan, Large Port Scan, Extra Large Port Scan, Full Port Scan, Custom Port Scan", 
     "scan_type" : "Custom Port Scan", 
-    "dest_ports" : ["80","443","8000","8080"],
+    "dest_ports" : ["80","443","8000","8080","U:53"],
     "__banner_scan_choices__" : "True, False", 
     "banner_scan" : "True", 
     "__target_scan_choices__" : "External, Internal", 
@@ -9,7 +9,7 @@
     "__max_rate_external_recommedation__" : "Single Port = 20000, Full Port = 10000", 
     "__max_rate_internal_recommedation__" : "Single Port = 2000, Full Port = 1000", 
     "max_rate" : "2000",
-    "target_file" : "ranges.txt"
-    "output_path" : "./"
+    "target_file" : "ranges.txt",
+    "output_path" : "./",
     "exclusions_file" : "exclusions.txt"
 }
