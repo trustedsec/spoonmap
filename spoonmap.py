@@ -22,12 +22,12 @@ def verify_python_version():
 
 def ascii_art():
     print(r'''
-________                   _____   _______  _________________ 
+________                   _____   _______  _________________
 __  ___/______________________  | / /__   |/  /__    |__  __ \
 _____ \___  __ \  __ \  __ \_   |/ /__  /|_/ /__  /| |_  /_/ /
-____/ /__  /_/ / /_/ / /_/ /  /|  / _  /  / / _  ___ |  ____/ 
-/____/ _  .___/\____/\____//_/ |_/  /_/  /_/  /_/  |_/_/      
-       /_/                                                 
+____/ /__  /_/ / /_/ / /_/ /  /|  / _  /  / / _  ___ |  ____/
+/____/ _  .___/\____/\____//_/ |_/  /_/  /_/  /_/  |_/_/
+       /_/
     ''')
 
 def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file):
@@ -99,7 +99,7 @@ def nmap_scan(source_port):
                 print('\x1b[33m' + f'Grabbing service banners for port {dest_port}...\n' + '\x1b[0m')
                 nmap_process = subprocess.Popen(f'nmap -T4 -sS -sV --version-intensity 0 -Pn -p {dest_port} --open ' \
                     f'--randomize-hosts --source-port {source_port} -iL {output_path}/live_hosts/port{dest_port}.txt ' \
-                    f'-oX {output_path}/nmap_results/port{dest_port}.xml',
+                    f'-oX {output_path}/nmap_results/port{dest_port}.xml -oG {output_path}/results.gnmap --append-output',
                     shell=True)
                 try:
                     nmap_process.wait()
@@ -193,15 +193,15 @@ def main():
                 break
 
     small_ports = ['80', '443', '8000', '8080', '8008', '8181', '8443']
-    medium_ports = ['7001', '1433', '445', '139', '21', '22', '23', '25', 
-                '53', '111', '389', '4243', '3389', '3306', '4786', 
+    medium_ports = ['7001', '1433', '445', '139', '21', '22', '23', '25',
+                '53', '111', '389', '4243', '3389', '3306', '4786',
                 '5900', '5901', '5985', '5986', '6379', '6970', '9100']
-    large_ports = ['1090', '1098', '1099', '10999', '11099', '11111', 
-                '3300', '4243', '4444', '4445', '45000', '45001', 
-                '47001', '47002', '4786', '4848', '50500', '5555', 
-                '5556', '6129', '6379', '6970', '7000', 
-                '7002', '7003', '7004', '7070', '7071', 
-                '8001', '8002', '8003', '8686', '9000', 
+    large_ports = ['1090', '1098', '1099', '10999', '11099', '11111',
+                '3300', '4243', '4444', '4445', '45000', '45001',
+                '47001', '47002', '4786', '4848', '50500', '5555',
+                '5556', '6129', '6379', '6970', '7000',
+                '7002', '7003', '7004', '7070', '7071',
+                '8001', '8002', '8003', '8686', '9000',
                 '9001', '9002', '9003', '9012', '9503']
     if scan_type == 'Small Port Scan':
         dest_ports = small_ports
@@ -287,7 +287,7 @@ def main():
             target_file = input(f'\nPlease enter the full path for the file '
                 f'containing target hosts (default: {target_file}): '
                 ) or target_file
-            
+
             if os.path.exists(target_file):
                 break
 
@@ -306,12 +306,12 @@ def main():
                 exclusions_file = input(f'\nPlease enter the full path for the file '
                     f'containing excluded hosts if applicable (default: {dir_path}/{exclusions_file}): '
                     ) or exclusions_file
-                
+
                 if os.path.exists(target_file):
                     break
         else:
             exclusions_file = None
-    
+
     print(f'\nScan Type: {scan_type}')
     print(f'Target Ports: {dest_ports}')
     print(f'Service Banner: {banner_scan}')
