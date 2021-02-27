@@ -99,7 +99,7 @@ def nmap_scan(source_port):
                 print('\x1b[33m' + f'Grabbing service banners for port {dest_port}...\n' + '\x1b[0m')
                 nmap_process = subprocess.Popen(f'nmap -T4 -sS -sV --version-intensity 0 -Pn -p {dest_port} --open ' \
                     f'--randomize-hosts --source-port {source_port} -iL {output_path}/live_hosts/port{dest_port}.txt ' \
-                    f'-oX {output_path}/nmap_results/port{dest_port}.xml -oG {output_path}/results.gnmap --append-output',
+                    f'-oX {output_path}/nmap_results/port{dest_port}.xml -oG {output_path}/spoonmap_output.gnmap --append-output',
                     shell=True)
                 try:
                     nmap_process.wait()
