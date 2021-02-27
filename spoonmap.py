@@ -92,7 +92,7 @@ def nmap_scan(source_port):
     # Commence NMAP banner grabbing!
     os.makedirs(output_path+"/nmap_results", exist_ok=True)
     try:
-        host_files = os.listdir(f'{dir_path}/live_hosts')
+        host_files = os.listdir(f'{output_path}/live_hosts')
         for host_file in host_files:
             dest_port = ((host_file.split('.')[0])[4:])
             if not os.path.exists(f'{output_path}/nmap_results/port{dest_port}.xml'):
