@@ -170,6 +170,15 @@ def main():
         output_path = config_parser['output_path']
         exclusions_file = config_parser['exclusions_file']
 
+    single_ip = input( f'\nWould you like to use a single IP Address? (y/n) ')
+    if single_ip == 'y':
+        ip_input = input( f'\nPlease input an IP Address: ' )
+        rangefile = open('ranges.txt', 'w')
+        rangefile.write(ip_input)
+        rangefile.close()
+    if single_ip == 'n':
+        print('Using ranges.txt')
+
     if scan_type == '':
         scan_choice = '1'
         while True:
