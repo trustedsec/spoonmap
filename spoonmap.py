@@ -173,12 +173,12 @@ def main():
     single_ip = input( f'\nWould you like to use a single IP Address? (y/n) ')
     if single_ip == '':
         single_ip = 'n'
-    if single_ip == 'y':
+    elif single_ip[0].lower() == 'y':
         ip_input = input( f'\nPlease input an IP Address: ' )
         rangefile = open('ranges.txt', 'w')
         rangefile.write(ip_input)
         rangefile.close()
-    elif single_ip == 'n':
+    elif single_ip[0].lower() == 'n':
         print('Using ranges.txt')
 
     if scan_type == '':
