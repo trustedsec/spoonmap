@@ -35,58 +35,88 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
 
     if not os.path.exists(f'{output_path}/masscan_results'):
         os.makedirs(f'{output_path}/masscan_results')
-    for dest_port in dest_ports:
 
+    # Track unique IPs per port in memory for efficiency
+    port_ips = {}
+
+    for dest_port in dest_ports:
         # Commence masscan!
         print('\x1b[33m' + f'Scanning port {dest_port}...' + '\x1b[0m')
+
+        output_file = f'{output_path}/masscan_results/port{dest_port}.xml'
+
+        # Build command as list to prevent shell injection
+        masscan_cmd = [
+            'masscan',
+            '-p', dest_port,
+            '--open',
+            '--max-rate', max_rate,
+            '--source-port', source_port,
+            '-iL', target_file,
+            '-oX', output_file
+        ]
+
         if exclusions_file:
-            masscan_process = subprocess.Popen(f'masscan -p {dest_port} --open --max-rate {max_rate} ' \
-                f'--source-port {source_port} -iL {target_file} --excludefile {exclusions_file} -oX \"{output_path}/masscan_results/port{dest_port}.xml\"',
-                shell=True)
-        else:
-            masscan_process = subprocess.Popen(f'masscan -p {dest_port} --open --max-rate {max_rate} ' \
-                f'--source-port {source_port} -iL {target_file} -oX \"{output_path}/masscan_results/port{dest_port}.xml\"',
-                shell=True)
+            masscan_cmd.extend(['--excludefile', exclusions_file])
+
         try:
-           masscan_process.wait()
+            masscan_process = subprocess.Popen(masscan_cmd)
+            masscan_process.wait()
         except KeyboardInterrupt:
             print(f'Killing PID {str(masscan_process.pid)}...')
+            masscan_process.kill()
+            masscan_process.wait()
+            raise
+        except FileNotFoundError:
+            print('\x1b[31m' + 'Error: masscan not found. Please install masscan.' + '\x1b[0m')
+            quit(1)
+        except Exception as e:
+            print('\x1b[31m' + f'Error running masscan: {e}' + '\x1b[0m')
+            quit(1)
+
         if masscan_process.returncode == 1:
             quit(1)
 
         # Parse results from masscan
-        if os.stat(f'{output_path}/masscan_results/port{dest_port}.xml').st_size == 0:
-            os.remove(f'{output_path}/masscan_results/port{dest_port}.xml')
-            print('\x1b[33m' + f'\nHosts Found on Port {dest_port}: 0')
-            print('Masscan Completion Status: ' + '{:.0%}'.format((dest_ports.index(dest_port) + 1) / len(dest_ports)) + '\x1b[0m')
-        else:
-            root = etree.parse(f'{output_path}/masscan_results/port{dest_port}.xml')
-            hosts = root.findall('host')
-            for host in hosts:
-                ip_address = host.findall('address')[0].attrib['addr']
-                live_port = host.findall('ports/port')[0].attrib['portid']
+        try:
+            if os.stat(output_file).st_size == 0:
+                os.remove(output_file)
+                print('\x1b[33m' + f'\nHosts Found on Port {dest_port}: 0')
+                print('Masscan Completion Status: ' + '{:.0%}'.format((dest_ports.index(dest_port) + 1) / len(dest_ports)) + '\x1b[0m')
+            else:
+                root = etree.parse(output_file)
+                hosts = root.findall('host')
 
-                if 'U:' in dest_port:
-                    live_port = 'U:'+live_port
+                # Initialize set for this port if needed
+                live_port = dest_port
+                if live_port not in port_ips:
+                    port_ips[live_port] = set()
+                    # Load existing IPs from file if it exists
+                    live_host_file = f'{output_path}/live_hosts/port{live_port}.txt'
+                    if os.path.exists(live_host_file):
+                        with open(live_host_file, 'r') as file:
+                            port_ips[live_port].update(line.strip() for line in file if line.strip())
 
-                # Write live hosts out to file
+                # Add new IPs to the set
+                for host in hosts:
+                    ip_address = host.findall('address')[0].attrib['addr']
+                    port_ips[live_port].add(ip_address)
+
+                # Write all IPs for this port to file
                 os.makedirs(output_path+"/live_hosts", exist_ok=True)
-                if os.path.exists(f'{output_path}/live_hosts/port{live_port}.txt'):
-                    with open(f'{output_path}/live_hosts/port{live_port}.txt') as file:
-                        ip_exists = False
-                        if f'{ip_address}\n' in file.read():
-                            ip_exists = True
-                    if not ip_exists:
-                        with open(f'{output_path}/live_hosts/port{live_port}.txt', 'a') as file:
-                            file.write(f'{ip_address}\n')
-                else:
-                    with open(f'{output_path}/live_hosts/port{live_port}.txt', 'w') as file:
-                        file.write(f'{ip_address}\n')
-            host_count = lineCount(f'{output_path}/live_hosts/port{live_port}.txt')
-            status_update = f'\nHosts Found on Port {dest_port}: {host_count}'
-            status_summary += status_update
-            print('\x1b[33m' + status_update)
-            print('Masscan Completion Status: ' + '{:.0%}'.format((dest_ports.index(dest_port) + 1) / len(dest_ports)) + '\x1b[0m')
+                with open(f'{output_path}/live_hosts/port{live_port}.txt', 'w') as file:
+                    for ip in sorted(port_ips[live_port]):
+                        file.write(f'{ip}\n')
+
+                host_count = len(port_ips[live_port])
+                status_update = f'\nHosts Found on Port {dest_port}: {host_count}'
+                status_summary += status_update
+                print('\x1b[33m' + status_update)
+                print('Masscan Completion Status: ' + '{:.0%}'.format((dest_ports.index(dest_port) + 1) / len(dest_ports)) + '\x1b[0m')
+        except etree.ParseError as e:
+            print('\x1b[31m' + f'Error parsing XML for port {dest_port}: {e}' + '\x1b[0m')
+        except Exception as e:
+            print('\x1b[31m' + f'Error processing results for port {dest_port}: {e}' + '\x1b[0m')
 
     return status_summary
 
@@ -95,41 +125,68 @@ def nmap_scan(source_port):
     # Commence NMAP banner grabbing!
     os.makedirs(output_path+"/nmap_results", exist_ok=True)
     try:
-        host_files = os.listdir(f'{dir_path}/live_hosts')
+        host_files = os.listdir(f'{output_path}/live_hosts')
         for host_file in host_files:
             dest_port = ((host_file.split('.')[0])[4:])
             if not os.path.exists(f'{output_path}/nmap_results/port{dest_port}.xml'):
                 print('\x1b[33m' + f'Grabbing service banners for port {dest_port}...\n' + '\x1b[0m')
 
+                output_file = f'{output_path}/nmap_results/port{dest_port}.xml'
+                input_file = f'{output_path}/live_hosts/port{dest_port}.txt'
+
+                # Build command as list to prevent shell injection
                 if 'U:' in dest_port:
-                    nmap_process = subprocess.Popen(f'nmap -T4 -sU -sV --version-intensity 0 -Pn -p {dest_port[2:]} --open ' \
-                        f'--randomize-hosts --source-port {source_port} -iL {output_path}/live_hosts/port{dest_port}.txt ' \
-                        f'-oX {output_path}/nmap_results/port{dest_port}.xml',
-                        shell=True)
+                    nmap_cmd = [
+                        'nmap', '-T4', '-sU', '-sV',
+                        '--version-intensity', '0',
+                        '-Pn', '-p', dest_port[2:],
+                        '--open', '--randomize-hosts',
+                        '--source-port', source_port,
+                        '-iL', input_file,
+                        '-oX', output_file
+                    ]
                 else:
-                    nmap_process = subprocess.Popen(f'nmap -T4 -sS -sV --version-intensity 0 -Pn -p {dest_port} --open ' \
-                        f'--randomize-hosts --source-port {source_port} -iL {output_path}/live_hosts/port{dest_port}.txt ' \
-                        f'-oX {output_path}/nmap_results/port{dest_port}.xml',
-                        shell=True)
+                    nmap_cmd = [
+                        'nmap', '-T4', '-sS', '-sV',
+                        '--version-intensity', '0',
+                        '-Pn', '-p', dest_port,
+                        '--open', '--randomize-hosts',
+                        '--source-port', source_port,
+                        '-iL', input_file,
+                        '-oX', output_file
+                    ]
+
                 try:
+                    nmap_process = subprocess.Popen(nmap_cmd)
                     nmap_process.wait()
                     print('\x1b[33m' + '\nNMAP Completion Status: ' + \
                         '{:.0%}'.format((host_files.index(host_file) + 1) / len(host_files)) + \
                         '\x1b[0m')
                 except KeyboardInterrupt:
                     print(f'Killing PID {str(nmap_process.pid)}...')
-    except:
-        pass
+                    nmap_process.kill()
+                    nmap_process.wait()
+                    raise
+                except FileNotFoundError:
+                    print('\x1b[31m' + 'Error: nmap not found. Please install nmap.' + '\x1b[0m')
+                    return
+                except Exception as e:
+                    print('\x1b[31m' + f'Error running nmap for port {dest_port}: {e}' + '\x1b[0m')
+    except FileNotFoundError:
+        print('\x1b[31m' + f'Error: live_hosts directory not found at {output_path}/live_hosts' + '\x1b[0m')
+    except Exception as e:
+        print('\x1b[31m' + f'Error during nmap scan: {e}' + '\x1b[0m')
 
 # Counts the number of lines in a file
 def lineCount(file):
     try:
         with open(file) as outFile:
-            count = 0
-            for line in outFile:
-                count = count + 1
-        return count
-    except:
+            return sum(1 for line in outFile)
+    except FileNotFoundError:
+        print('\x1b[31m' + f'Warning: File not found: {file}' + '\x1b[0m')
+        return 0
+    except Exception as e:
+        print('\x1b[31m' + f'Warning: Error reading file {file}: {e}' + '\x1b[0m')
         return 0
 
 
@@ -207,10 +264,9 @@ def main():
                 '53', '111', '389', '4243', '3389', '3306', '4786', 
                 '5900', '5901', '5985', '5986', '6379', '6970', '9100']
     large_ports = ['1090', '1098', '1099', '10999', '11099', '11111', 
-                '3300', '4243', '4444', '4445', '45000', '45001', 
-                '47001', '47002', '4786', '4848', '50500', '5555', 
-                '5556', '6129', '6379', '6970', '7000', 
-                '7002', '7003', '7004', '7070', '7071', 
+                '3300', '4444', '4445', '45000', '45001', '47001', 
+                '47002', '4848', '50500', '5555', '5556', '6129', 
+                '7000', '7002', '7003', '7004', '7070', '7071', 
                 '8001', '8002', '8003', '8686', '9000', 
                 '9001', '9002', '9003', '9012', '9503']
     if scan_type == 'Small Port Scan':
@@ -316,9 +372,11 @@ def main():
                 exclusions_file = input(f'\nPlease enter the full path for the file '
                     f'containing excluded hosts if applicable (default: {dir_path}/{exclusions_file}): '
                     ) or exclusions_file
-                
-                if os.path.exists(target_file):
+
+                if os.path.exists(exclusions_file):
                     break
+                else:
+                    print('\x1b[31m' + f'Error: File not found: {exclusions_file}' + '\x1b[0m')
         else:
             exclusions_file = None
     
