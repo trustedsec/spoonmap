@@ -7,6 +7,10 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
+import termios
+import threading
+from queue import Queue
 import xml.etree.ElementTree as etree
 
 
@@ -20,14 +24,34 @@ def verify_python_version():
         quit(1)
 
 
+def save_terminal_state():
+    """Save the current terminal state"""
+    try:
+        return termios.tcgetattr(sys.stdin)
+    except:
+        return None
+
+def restore_terminal_state(state):
+    """Restore terminal state and reset terminal"""
+    if state:
+        try:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, state)
+        except:
+            pass
+    # Always try to reset terminal using stty as a fallback
+    try:
+        subprocess.run(['stty', 'sane'], check=False, stderr=subprocess.DEVNULL)
+    except:
+        pass
+
 def ascii_art():
     print(r'''
-________                   _____   _______  _________________ 
+________                   _____   _______  _________________
 __  ___/______________________  | / /__   |/  /__    |__  __ \
 _____ \___  __ \  __ \  __ \_   |/ /__  /|_/ /__  /| |_  /_/ /
-____/ /__  /_/ / /_/ / /_/ /  /|  / _  /  / / _  ___ |  ____/ 
-/____/ _  .___/\____/\____//_/ |_/  /_/  /_/  /_/  |_/_/      
-       /_/                                                 
+____/ /__  /_/ / /_/ / /_/ /  /|  / _  /  / / _  ___ |  ____/
+/____/ _  .___/\____/\____//_/ |_/  /_/  /_/  /_/  |_/_/
+       /_/
     ''')
 
 def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file):
@@ -59,6 +83,9 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         if exclusions_file:
             masscan_cmd.extend(['--excludefile', exclusions_file])
 
+        # Save terminal state before running masscan
+        term_state = save_terminal_state()
+
         try:
             masscan_process = subprocess.Popen(masscan_cmd)
             masscan_process.wait()
@@ -66,13 +93,19 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             print(f'Killing PID {str(masscan_process.pid)}...')
             masscan_process.kill()
             masscan_process.wait()
+            restore_terminal_state(term_state)
             raise
         except FileNotFoundError:
             print('\x1b[31m' + 'Error: masscan not found. Please install masscan.' + '\x1b[0m')
+            restore_terminal_state(term_state)
             quit(1)
         except Exception as e:
             print('\x1b[31m' + f'Error running masscan: {e}' + '\x1b[0m')
+            restore_terminal_state(term_state)
             quit(1)
+        finally:
+            # Always restore terminal state after process completes
+            restore_terminal_state(term_state)
 
         if masscan_process.returncode == 1:
             quit(1)
@@ -120,58 +153,159 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
 
     return status_summary
 
-def nmap_scan(source_port):
+def nmap_worker(work_queue, completed_count, total_count, source_port, lock, interrupt_event):
+    """Worker thread function to process NMAP scans from queue"""
+    while not interrupt_event.is_set():
+        try:
+            # Get work item with timeout to check interrupt_event periodically
+            try:
+                host_file = work_queue.get(timeout=0.5)
+            except:
+                # Queue is empty or timeout occurred
+                continue
 
+            if host_file is None:  # Poison pill to stop worker
+                work_queue.task_done()
+                break
+
+            dest_port = ((host_file.split('.')[0])[4:])
+            output_file = f'{output_path}/nmap_results/port{dest_port}.xml'
+            input_file = f'{output_path}/live_hosts/port{dest_port}.txt'
+
+            # Build command as list to prevent shell injection
+            if 'U:' in dest_port:
+                nmap_cmd = [
+                    'nmap', '-T4', '-sU', '-sV',
+                    '--version-intensity', '0',
+                    '-Pn', '-p', dest_port[2:],
+                    '--open', '--randomize-hosts',
+                    '--source-port', source_port,
+                    '-iL', input_file,
+                    '-oX', output_file
+                ]
+            else:
+                nmap_cmd = [
+                    'nmap', '-T4', '-sS', '-sV',
+                    '--version-intensity', '0',
+                    '-Pn', '-p', dest_port,
+                    '--open', '--randomize-hosts',
+                    '--source-port', source_port,
+                    '-iL', input_file,
+                    '-oX', output_file
+                ]
+
+            # Save terminal state before running nmap
+            term_state = save_terminal_state()
+
+            try:
+                with lock:
+                    print('\x1b[33m' + f'Grabbing service banners for port {dest_port}...\n' + '\x1b[0m')
+
+                nmap_process = subprocess.Popen(nmap_cmd)
+
+                # Poll process to allow interrupt checking
+                while nmap_process.poll() is None and not interrupt_event.is_set():
+                    threading.Event().wait(0.1)
+
+                if interrupt_event.is_set() and nmap_process.poll() is None:
+                    nmap_process.kill()
+                    nmap_process.wait()
+                else:
+                    nmap_process.wait()
+
+                    with lock:
+                        completed_count[0] += 1
+                        print('\x1b[33m' + '\nNMAP Completion Status: ' + \
+                            '{:.0%}'.format(completed_count[0] / total_count) + \
+                            '\x1b[0m')
+
+            except FileNotFoundError:
+                with lock:
+                    print('\x1b[31m' + 'Error: nmap not found. Please install nmap.' + '\x1b[0m')
+            except Exception as e:
+                with lock:
+                    print('\x1b[31m' + f'Error running nmap for port {dest_port}: {e}' + '\x1b[0m')
+            finally:
+                # Always restore terminal state after process completes
+                restore_terminal_state(term_state)
+                work_queue.task_done()
+
+        except Exception as e:
+            with lock:
+                print('\x1b[31m' + f'Worker thread error: {e}' + '\x1b[0m')
+            work_queue.task_done()
+
+def nmap_scan(source_port, max_threads=5):
+    """
+    Perform NMAP scans using multiple threads for efficiency
+
+    Args:
+        source_port: Source port to use for scans
+        max_threads: Maximum number of concurrent NMAP scans (default: 5)
+    """
     # Commence NMAP banner grabbing!
     os.makedirs(output_path+"/nmap_results", exist_ok=True)
+
     try:
         host_files = os.listdir(f'{output_path}/live_hosts')
+
+        # Filter out files that have already been scanned
+        files_to_scan = []
         for host_file in host_files:
             dest_port = ((host_file.split('.')[0])[4:])
             if not os.path.exists(f'{output_path}/nmap_results/port{dest_port}.xml'):
-                print('\x1b[33m' + f'Grabbing service banners for port {dest_port}...\n' + '\x1b[0m')
+                files_to_scan.append(host_file)
 
-                output_file = f'{output_path}/nmap_results/port{dest_port}.xml'
-                input_file = f'{output_path}/live_hosts/port{dest_port}.txt'
+        if not files_to_scan:
+            print('\x1b[33m' + 'All ports have already been scanned.' + '\x1b[0m')
+            return
 
-                # Build command as list to prevent shell injection
-                if 'U:' in dest_port:
-                    nmap_cmd = [
-                        'nmap', '-T4', '-sU', '-sV',
-                        '--version-intensity', '0',
-                        '-Pn', '-p', dest_port[2:],
-                        '--open', '--randomize-hosts',
-                        '--source-port', source_port,
-                        '-iL', input_file,
-                        '-oX', output_file
-                    ]
-                else:
-                    nmap_cmd = [
-                        'nmap', '-T4', '-sS', '-sV',
-                        '--version-intensity', '0',
-                        '-Pn', '-p', dest_port,
-                        '--open', '--randomize-hosts',
-                        '--source-port', source_port,
-                        '-iL', input_file,
-                        '-oX', output_file
-                    ]
+        print('\x1b[33m' + f'Starting NMAP scans with {max_threads} concurrent threads...' + '\x1b[0m')
 
-                try:
-                    nmap_process = subprocess.Popen(nmap_cmd)
-                    nmap_process.wait()
-                    print('\x1b[33m' + '\nNMAP Completion Status: ' + \
-                        '{:.0%}'.format((host_files.index(host_file) + 1) / len(host_files)) + \
-                        '\x1b[0m')
-                except KeyboardInterrupt:
-                    print(f'Killing PID {str(nmap_process.pid)}...')
-                    nmap_process.kill()
-                    nmap_process.wait()
-                    raise
-                except FileNotFoundError:
-                    print('\x1b[31m' + 'Error: nmap not found. Please install nmap.' + '\x1b[0m')
-                    return
-                except Exception as e:
-                    print('\x1b[31m' + f'Error running nmap for port {dest_port}: {e}' + '\x1b[0m')
+        # Create work queue and synchronization objects
+        work_queue = Queue()
+        completed_count = [0]  # Use list for mutable counter
+        total_count = len(files_to_scan)
+        lock = threading.Lock()
+        interrupt_event = threading.Event()
+
+        # Add work items to queue
+        for host_file in files_to_scan:
+            work_queue.put(host_file)
+
+        # Create and start worker threads
+        threads = []
+        for _ in range(max_threads):
+            thread = threading.Thread(
+                target=nmap_worker,
+                args=(work_queue, completed_count, total_count, source_port, lock, interrupt_event)
+            )
+            thread.daemon = True
+            thread.start()
+            threads.append(thread)
+
+        try:
+            # Wait for all work to complete
+            work_queue.join()
+
+            # Send poison pills to stop workers
+            for _ in range(max_threads):
+                work_queue.put(None)
+
+            # Wait for all threads to finish
+            for thread in threads:
+                thread.join(timeout=2)
+
+        except KeyboardInterrupt:
+            print('\x1b[31m' + '\nInterrupt received, stopping NMAP scans...' + '\x1b[0m')
+            interrupt_event.set()
+
+            # Wait for threads to finish with timeout
+            for thread in threads:
+                thread.join(timeout=5)
+
+            raise
+
     except FileNotFoundError:
         print('\x1b[31m' + f'Error: live_hosts directory not found at {output_path}/live_hosts' + '\x1b[0m')
     except Exception as e:
@@ -194,240 +328,253 @@ def lineCount(file):
 def main():
     global dir_path
     global output_path
-    ascii_art()
 
-    scan_type = ''
-    dest_ports = []
-    banner_scan = ''
-    target_scan = ''
-    source_port = '53'
-    max_rate = ''
-    target_file = ''
-    exclusions_file = ''
-    status_summary = ''
-    output_path = ''
+    # Save initial terminal state
+    initial_term_state = save_terminal_state()
+
+    try:
+        ascii_art()
+
+        scan_type = ''
+        dest_ports = []
+        banner_scan = ''
+        target_scan = ''
+        source_port = '53'
+        max_rate = ''
+        target_file = ''
+        exclusions_file = ''
+        status_summary = ''
+        output_path = ''
+        nmap_threads = 5  # Default number of concurrent NMAP threads
 
 
-    # Get options from configuration file if it exists
-    dir_path = os.path.dirname(os.path.realpath(__file__))
-    if os.path.exists(f'{dir_path}/config.json'):
-        with open(f'{dir_path}/config.json') as config:
-            config_parser = json.load(config)
+        # Get options from configuration file if it exists
+        dir_path = os.path.dirname(os.path.realpath(__file__))
+        if os.path.exists(f'{dir_path}/config.json'):
+            with open(f'{dir_path}/config.json') as config:
+                config_parser = json.load(config)
 
-        scan_type = config_parser['scan_type']
-        dest_ports = config_parser['dest_ports']
-        banner_scan = config_parser['banner_scan']
-        if banner_scan == 'True':
-            banner_scan = True
-        else:
-            banner_scan = False
-        target_scan = config_parser['target_scan']
-        max_rate = config_parser['max_rate']
-        target_file = config_parser['target_file']
-        output_path = config_parser['output_path']
-        exclusions_file = config_parser['exclusions_file']
+            scan_type = config_parser['scan_type']
+            dest_ports = config_parser['dest_ports']
+            banner_scan = config_parser['banner_scan']
+            if banner_scan == 'True':
+                banner_scan = True
+            else:
+                banner_scan = False
+            target_scan = config_parser['target_scan']
+            max_rate = config_parser['max_rate']
+            target_file = config_parser['target_file']
+            output_path = config_parser['output_path']
+            exclusions_file = config_parser['exclusions_file']
+            nmap_threads = config_parser.get('nmap_threads', 5)  # Get from config or use default
 
-    if scan_type == '':
-        scan_choice = '1'
-        while True:
-            print('\nScan Type')
-            print('\t(1) Small Port Scan')
-            print('\t(2) Medium Port Scan')
-            print('\t(3) Large Port Scan')
-            print('\t(4) Extra Large Port Scan (Small, Medium, and Large)')
-            print('\t(5) Full Port Scan')
-            print('\t(6) Custom Port Scan')
-            scan_choice = input(
-                f'\nWhat type of scan would you like to perform (default: Small Port Scan)? '
-                ) or scan_choice
-            if scan_choice == '1':
-                scan_type = 'Small Port Scan'
-                break
-            elif scan_choice == '2':
-                scan_type = 'Medium Port Scan'
-                break
-            elif scan_choice == '3':
-                scan_type = 'Large Port Scan'
-                break
-            elif scan_choice == '4':
-                scan_type = 'Extra Large Port Scan'
-                break
-            elif scan_choice == '5':
-                scan_type = 'Full Port Scan'
-                break
-            elif scan_choice == '6':
-                scan_type = 'Custom Port Scan'
-                break
-
-    small_ports = ['80', '443', '8000', '8080', '8008', '8181', '8443']
-    medium_ports = ['7001', '1433', '445', '139', '21', '22', '23', '25', 
-                '53', '111', '389', '4243', '3389', '3306', '4786', 
-                '5900', '5901', '5985', '5986', '6379', '6970', '9100']
-    large_ports = ['1090', '1098', '1099', '10999', '11099', '11111', 
-                '3300', '4444', '4445', '45000', '45001', '47001', 
-                '47002', '4848', '50500', '5555', '5556', '6129', 
-                '7000', '7002', '7003', '7004', '7070', '7071', 
-                '8001', '8002', '8003', '8686', '9000', 
-                '9001', '9002', '9003', '9012', '9503']
-    if scan_type == 'Small Port Scan':
-        dest_ports = small_ports
-    elif scan_type == 'Medium Port Scan':
-        dest_ports = medium_ports
-    elif scan_type == 'Large Port Scan':
-        dest_ports = large_ports
-    elif scan_type == 'Extra Large Port Scan':
-        dest_ports = small_ports + medium_ports + large_ports
-    elif scan_type == 'Full Port Scan':
-        dest_ports = ['1-65535']
-    elif scan_type == 'Custom Port Scan' and not dest_ports:
-        dest_ports = input(
-            '\nWhat ports would you like to scan (separated by space: 80 443)? ').split()
-
-    if banner_scan == '':
-        banner_choice = 1
-        banner_choice = input(
-            f'\nWould you like to enumerate service banners for any identified services '
-            f'(default: Yes)? '
-            ) or banner_choice
-        if banner_choice == 1 or banner_choice[0].lower() == 'y':
-            banner_scan = True
-        else:
-            banner_scan = False
-
-    if not target_scan:
-        source_choice = '1'
-        while True:
-            print('\nTarget Scan')
-            print('\t(1) External')
-            print('\t(2) Internal')
-            source_choice = input(
-                f'\nIs this an internal or external scan '
-                f'(default: External)? '
-                ) or source_choice
-            if source_choice == '1':
-                target_scan = 'External'
-                source_port = '53'
-                break
-            elif source_choice == '2':
-                target_scan = 'Internal'
-                source_port = '88'
-                break
-
-    if not max_rate:
-        if target_scan == "External" and scan_type == "Small Port Scan":
-            max_rate = '20000'
-        elif target_scan == "External" and scan_type == "Full Port Scan":
-            max_rate = '10000'
-        elif target_scan == "Internal" and scan_type == "Small Port Scan":
-            max_rate = '2000'
-        elif target_scan == "Internal" and scan_type == "Full Port Scan":
-            max_rate = '1000'
-        else:
-            max_rate = '2000'
-        while True:
-            try:
-                rate_choice = input(f'\nHow fast would you like to scan '
-                    f'(default: {max_rate} packets/second)? '
-                    ) or max_rate
-                if int(rate_choice):
-                    max_rate = rate_choice
-                    break
-            except ValueError:
-                pass
-
-    if not output_path:
-        output_path = dir_path
-        output_path = input(f'\nPlease enter full path for output '
-            f'(default: {dir_path}): '
-            ) or output_path
-        os.makedirs(output_path, exist_ok=True)
-
-    if not target_file:
-        target_file = output_path+"/ranges.txt"
-        while True:
-            print(target_file)
-            print('\nExample Target File')
-            print('One CIDR or IP Address per line\n')
-            print('\t192.168.0.0/24')
-            print('\t192.168.1.23')
-            target_file = input(f'\nPlease enter the full path for the file '
-                f'containing target hosts (default: {target_file}): '
-                ) or target_file
-            
-            if os.path.exists(target_file):
-                break
-
-    if not exclusions_file:
-        exclusions_choice = 'n'
-        exclusions_choice = input(f'\nWould you like to exclude any hosts?  (default: No) '
-            ) or exclusions_choice
-
-        if exclusions_choice[0].lower() == 'y':
-            exclusions_file = 'exclusions.txt'
+        if scan_type == '':
+            scan_choice = '1'
             while True:
-                print('\nExample Exclusions File')
+                print('\nScan Type')
+                print('\t(1) Small Port Scan')
+                print('\t(2) Medium Port Scan')
+                print('\t(3) Large Port Scan')
+                print('\t(4) Extra Large Port Scan (Small, Medium, and Large)')
+                print('\t(5) Full Port Scan')
+                print('\t(6) Custom Port Scan')
+                scan_choice = input(
+                    f'\nWhat type of scan would you like to perform (default: Small Port Scan)? '
+                    ) or scan_choice
+                if scan_choice == '1':
+                    scan_type = 'Small Port Scan'
+                    break
+                elif scan_choice == '2':
+                    scan_type = 'Medium Port Scan'
+                    break
+                elif scan_choice == '3':
+                    scan_type = 'Large Port Scan'
+                    break
+                elif scan_choice == '4':
+                    scan_type = 'Extra Large Port Scan'
+                    break
+                elif scan_choice == '5':
+                    scan_type = 'Full Port Scan'
+                    break
+                elif scan_choice == '6':
+                    scan_type = 'Custom Port Scan'
+                    break
+
+        small_ports = ['80', '443', '8000', '8080', '8008', '8181', '8443']
+        medium_ports = ['7001', '1433', '445', '139', '21', '22', '23', '25', 
+                    '53', '111', '389', '4243', '3389', '3306', '4786', 
+                    '5900', '5901', '5985', '5986', '6379', '6970', '9100']
+        large_ports = ['1090', '1098', '1099', '10999', '11099', '11111', 
+                    '3300', '4444', '4445', '45000', '45001', '47001', 
+                    '47002', '4848', '50500', '5555', '5556', '6129', 
+                    '7000', '7002', '7003', '7004', '7070', '7071', 
+                    '8001', '8002', '8003', '8686', '9000', 
+                    '9001', '9002', '9003', '9012', '9503']
+        if scan_type == 'Small Port Scan':
+            dest_ports = small_ports
+        elif scan_type == 'Medium Port Scan':
+            dest_ports = medium_ports
+        elif scan_type == 'Large Port Scan':
+            dest_ports = large_ports
+        elif scan_type == 'Extra Large Port Scan':
+            dest_ports = small_ports + medium_ports + large_ports
+        elif scan_type == 'Full Port Scan':
+            dest_ports = ['1-65535']
+        elif scan_type == 'Custom Port Scan' and not dest_ports:
+            dest_ports = input(
+                '\nWhat ports would you like to scan (separated by space: 80 443)? ').split()
+
+        if banner_scan == '':
+            banner_choice = 1
+            banner_choice = input(
+                f'\nWould you like to enumerate service banners for any identified services '
+                f'(default: Yes)? '
+                ) or banner_choice
+            if banner_choice == 1 or banner_choice[0].lower() == 'y':
+                banner_scan = True
+            else:
+                banner_scan = False
+
+        if not target_scan:
+            source_choice = '1'
+            while True:
+                print('\nTarget Scan')
+                print('\t(1) External')
+                print('\t(2) Internal')
+                source_choice = input(
+                    f'\nIs this an internal or external scan '
+                    f'(default: External)? '
+                    ) or source_choice
+                if source_choice == '1':
+                    target_scan = 'External'
+                    source_port = '53'
+                    break
+                elif source_choice == '2':
+                    target_scan = 'Internal'
+                    source_port = '88'
+                    break
+
+        if not max_rate:
+            if target_scan == "External" and scan_type == "Small Port Scan":
+                max_rate = '20000'
+            elif target_scan == "External" and scan_type == "Full Port Scan":
+                max_rate = '10000'
+            elif target_scan == "Internal" and scan_type == "Small Port Scan":
+                max_rate = '2000'
+            elif target_scan == "Internal" and scan_type == "Full Port Scan":
+                max_rate = '1000'
+            else:
+                max_rate = '2000'
+            while True:
+                try:
+                    rate_choice = input(f'\nHow fast would you like to scan '
+                        f'(default: {max_rate} packets/second)? '
+                        ) or max_rate
+                    if int(rate_choice):
+                        max_rate = rate_choice
+                        break
+                except ValueError:
+                    pass
+
+        if not output_path:
+            output_path = dir_path
+            output_path = input(f'\nPlease enter full path for output '
+                f'(default: {dir_path}): '
+                ) or output_path
+            os.makedirs(output_path, exist_ok=True)
+
+        if not target_file:
+            target_file = output_path+"/ranges.txt"
+            while True:
+                print(target_file)
+                print('\nExample Target File')
                 print('One CIDR or IP Address per line\n')
                 print('\t192.168.0.0/24')
                 print('\t192.168.1.23')
-                exclusions_file = input(f'\nPlease enter the full path for the file '
-                    f'containing excluded hosts if applicable (default: {dir_path}/{exclusions_file}): '
-                    ) or exclusions_file
-
-                if os.path.exists(exclusions_file):
+                target_file = input(f'\nPlease enter the full path for the file '
+                    f'containing target hosts (default: {target_file}): '
+                    ) or target_file
+            
+                if os.path.exists(target_file):
                     break
-                else:
-                    print('\x1b[31m' + f'Error: File not found: {exclusions_file}' + '\x1b[0m')
-        else:
-            exclusions_file = None
+
+        if not exclusions_file:
+            exclusions_choice = 'n'
+            exclusions_choice = input(f'\nWould you like to exclude any hosts?  (default: No) '
+                ) or exclusions_choice
+
+            if exclusions_choice[0].lower() == 'y':
+                exclusions_file = 'exclusions.txt'
+                while True:
+                    print('\nExample Exclusions File')
+                    print('One CIDR or IP Address per line\n')
+                    print('\t192.168.0.0/24')
+                    print('\t192.168.1.23')
+                    exclusions_file = input(f'\nPlease enter the full path for the file '
+                        f'containing excluded hosts if applicable (default: {dir_path}/{exclusions_file}): '
+                        ) or exclusions_file
+
+                    if os.path.exists(exclusions_file):
+                        break
+                    else:
+                        print('\x1b[31m' + f'Error: File not found: {exclusions_file}' + '\x1b[0m')
+            else:
+                exclusions_file = None
     
-    print(f'\nScan Type: {scan_type}')
-    print(f'Target Ports: {dest_ports}')
-    print(f'Service Banner: {banner_scan}')
-    print(f'Source Port: {source_port}')
-    print(f'Masscan Max Packet Rate (pps): {max_rate}')
-    print(f'Target File: {target_file}')
-    print(f'Exclusions File: {exclusions_file}\n')
+        print(f'\nScan Type: {scan_type}')
+        print(f'Target Ports: {dest_ports}')
+        print(f'Service Banner: {banner_scan}')
+        print(f'Source Port: {source_port}')
+        print(f'Masscan Max Packet Rate (pps): {max_rate}')
+        print(f'Target File: {target_file}')
+        print(f'Exclusions File: {exclusions_file}')
+        print(f'NMAP Concurrent Threads: {nmap_threads}\n')
 
-    status_summary = mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file)
+        status_summary = mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file)
 
-    # If service banners requested, send to nmap
-    if banner_scan or banner_scan == 'Yes':
-        nmap_scan(source_port)
+        # If service banners requested, send to nmap
+        if banner_scan or banner_scan == 'Yes':
+            nmap_scan(source_port, nmap_threads)
 
-    # Combine all live hosts into one file
-    all_ips = set()
-    if os.path.exists(f'{output_path}/live_hosts'):
-        host_files = os.listdir(f'{output_path}/live_hosts')
-        for host_file in host_files:
-            with open(f'{output_path}/live_hosts/{host_file}') as input_file:
-                for line in input_file:
-                    all_ips.add(line)
-        with open(f'{output_path}/all_live_hosts.txt', 'w') as output_file:
-            for ip in all_ips:
-                output_file.write(ip)
+        # Combine all live hosts into one file
+        all_ips = set()
+        if os.path.exists(f'{output_path}/live_hosts'):
+            host_files = os.listdir(f'{output_path}/live_hosts')
+            for host_file in host_files:
+                with open(f'{output_path}/live_hosts/{host_file}') as input_file:
+                    for line in input_file:
+                        all_ips.add(line)
+            with open(f'{output_path}/all_live_hosts.txt', 'w') as output_file:
+                for ip in all_ips:
+                    output_file.write(ip)
 
-        # Combine all XML results into one file
-        if banner_scan :
-            result_dir = f'{output_path}/nmap_results/'
+            # Combine all XML results into one file
+            if banner_scan :
+                result_dir = f'{output_path}/nmap_results/'
+            else:
+                result_dir = f'{output_path}/masscan_results/'
+            xml_result = '<?xml version="1.0"?>\n<!-- SpooNMAP -->\n<nmaprun>\n'
+            xml_files = os.listdir(result_dir)
+            for xml_file in xml_files:
+                root = etree.parse(result_dir + xml_file)
+                hosts = root.findall('host')
+                for host in hosts:
+                    xml_result += etree.tostring(host, encoding="unicode", method="xml")
+            xml_result += '</nmaprun>'
+            with open(f'{output_path}/spoonmap_output.xml', 'w+') as spoonmap_output:
+                spoonmap_output.write(xml_result)
+            print('\x1b[33m' + f'\nResults written to {output_path}/spoonmap_output.xml' + '\x1b[0m')
+
         else:
-            result_dir = f'{output_path}/masscan_results/'
-        xml_result = '<?xml version="1.0"?>\n<!-- SpooNMAP -->\n<nmaprun>\n'
-        xml_files = os.listdir(result_dir)
-        for xml_file in xml_files:
-            root = etree.parse(result_dir + xml_file)
-            hosts = root.findall('host')
-            for host in hosts:
-                xml_result += etree.tostring(host, encoding="unicode", method="xml")
-        xml_result += '</nmaprun>'
-        with open(f'{output_path}/spoonmap_output.xml', 'w+') as spoonmap_output:
-            spoonmap_output.write(xml_result)
-        print('\x1b[33m' + f'\nResults written to {output_path}/spoonmap_output.xml' + '\x1b[0m')
+            status_summary += '\nNo hosts found.'
 
-    else:
-        status_summary += '\nNo hosts found.'
+        # Print Summary
+        print('\x1b[33m' + status_summary + '\x1b[0m')
 
-    # Print Summary
-    print('\x1b[33m' + status_summary + '\x1b[0m')
+
+    finally:
+        # Always restore terminal state on exit
+        restore_terminal_state(initial_term_state)
 
 # Boilerplate
 if __name__ == '__main__':
