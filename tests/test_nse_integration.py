@@ -100,6 +100,73 @@ def _run_nmap(port: int, script_path: str) -> str:
     return result.stdout + result.stderr
 
 
+def _udp_port_is_free(port: int) -> bool:
+    """Return True if nobody is bound to 127.0.0.1:port/udp."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(('127.0.0.1', port))
+            return True
+        except OSError:
+            return False
+
+
+class _UdpStubServer:
+    """Context manager: UDP server that sends a fixed response to any datagram received.
+
+    Runs in a daemon thread so it does not block the test.
+    """
+
+    def __init__(self, port: int, response: bytes):
+        self._port = port
+        self._response = response
+        self._sock: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def __enter__(self) -> '_UdpStubServer':
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.bind(('127.0.0.1', self._port))
+        self._sock.settimeout(0.2)
+
+        def _serve():
+            while not self._stop.is_set():
+                try:
+                    _, addr = self._sock.recvfrom(4096)
+                except (socket.timeout, OSError):
+                    continue
+                try:
+                    self._sock.sendto(self._response, addr)
+                except OSError:
+                    pass
+
+        self._thread = threading.Thread(target=_serve, daemon=True)
+        self._thread.start()
+        time.sleep(0.05)  # give the server a moment to bind
+        return self
+
+    def __exit__(self, *_):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=1)
+        if self._sock:
+            self._sock.close()
+
+
+def _run_nmap_udp(port: int, script_path: str) -> str:
+    """Run nmap UDP scan with a single NSE script against 127.0.0.1; return combined output."""
+    cmd = [
+        'nmap', '-sU', '-p', str(port),
+        '--script', script_path,
+        '--script-timeout', '10s',
+        '-T4',
+        '127.0.0.1',
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    return result.stdout + result.stderr
+
+
 # ── nodejs-inspector ──────────────────────────────────────────────────────────
 
 _NODEJS_PORT   = 9229
@@ -469,3 +536,59 @@ class TestWsusDetectNse:
         with _StubServer(_WSUS_PORT, _WSUS_INVALID):
             output = _run_nmap(_WSUS_PORT, _WSUS_SCRIPT)
         assert 'Microsoft WSUS detected' not in output
+
+
+# ── openvpn-detect ────────────────────────────────────────────────────────────
+
+_OPENVPN_PORT   = 1194
+_OPENVPN_SCRIPT = os.path.join(_NSE_DIR, 'openvpn-detect.nse')
+
+# P_CONTROL_HARD_RESET_SERVER_V2 (opcode 8, key_id 0 -> first byte 0x40):
+# 1-byte opcode + 8-byte session id + 1-byte ack-array length (0) + 4-byte packet id.
+_OPENVPN_SERVER_HARD_RESET_V2 = b'\x40' + b'\x22' * 8 + b'\x00' + b'\x00\x00\x00\x00'
+# Older P_CONTROL_HARD_RESET_SERVER_V1 (opcode 2 -> first byte 0x10).
+_OPENVPN_SERVER_HARD_RESET_V1 = b'\x10' + b'\x22' * 8 + b'\x00' + b'\x00\x00\x00\x00'
+# Not a hard-reset opcode -> must not be confirmed as OpenVPN.
+_OPENVPN_UNRELATED = b'\x00' * 14
+
+
+def _tcp_framed(payload: bytes) -> bytes:
+    """Prefix a payload with OpenVPN-over-TCP's 2-byte big-endian length header."""
+    length = len(payload)
+    return bytes([(length >> 8) & 0xFF, length & 0xFF]) + payload
+
+
+@pytest.mark.skipif(not _udp_port_is_free(_OPENVPN_PORT),
+                    reason=f'udp port {_OPENVPN_PORT} already in use — stub tests require a free port')
+class TestOpenvpnDetectNseUdp:
+    def test_detects_openvpn_server_v2(self):
+        """Stub replies with a P_CONTROL_HARD_RESET_SERVER_V2 -> script confirms OpenVPN over udp."""
+        with _UdpStubServer(_OPENVPN_PORT, _OPENVPN_SERVER_HARD_RESET_V2):
+            output = _run_nmap_udp(_OPENVPN_PORT, _OPENVPN_SCRIPT)
+        assert 'openvpn-detect' in output
+        assert 'OpenVPN server confirmed' in output
+        assert 'udp' in output
+
+    def test_no_output_for_non_openvpn_udp_service(self):
+        """Stub replies with a non-hard-reset opcode -> script produces no output."""
+        with _UdpStubServer(_OPENVPN_PORT, _OPENVPN_UNRELATED):
+            output = _run_nmap_udp(_OPENVPN_PORT, _OPENVPN_SCRIPT)
+        assert 'OpenVPN server confirmed' not in output
+
+
+@pytest.mark.skipif(not _port_is_free(_OPENVPN_PORT),
+                    reason=f'port {_OPENVPN_PORT} already in use — stub tests require a free port')
+class TestOpenvpnDetectNseTcp:
+    def test_detects_openvpn_server_v1(self):
+        """Stub replies with a length-prefixed P_CONTROL_HARD_RESET_SERVER_V1 -> script confirms OpenVPN over tcp."""
+        with _StubServer(_OPENVPN_PORT, _tcp_framed(_OPENVPN_SERVER_HARD_RESET_V1)):
+            output = _run_nmap(_OPENVPN_PORT, _OPENVPN_SCRIPT)
+        assert 'openvpn-detect' in output
+        assert 'OpenVPN server confirmed' in output
+        assert 'tcp' in output
+
+    def test_no_output_for_non_openvpn_tcp_service(self):
+        """Stub replies with a non-hard-reset opcode -> script produces no output."""
+        with _StubServer(_OPENVPN_PORT, _tcp_framed(_OPENVPN_UNRELATED)):
+            output = _run_nmap(_OPENVPN_PORT, _OPENVPN_SCRIPT)
+        assert 'OpenVPN server confirmed' not in output

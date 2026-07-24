@@ -4686,6 +4686,93 @@ class TestIKEFindings:
         assert 'IKE/IPsec Service Detected' in content
 
 
+class TestOpenVPNFindings:
+    """OpenVPN findings from the custom openvpn-detect script on 1194 (UDP + TCP)."""
+
+    def test_openvpn_udp_detected_low(self, nmap_dir):
+        """openvpn-detect's multi-line output on udp/1194 -> flattened LOW finding."""
+        xml = _nmap_xml(
+            '10.0.4.1', 'udp', '1194',
+            scripts={'openvpn-detect':
+                     'OpenVPN server confirmed via control-channel handshake\n'
+                     '  Handshake: P_CONTROL_HARD_RESET_SERVER_V2\n'
+                     '  Transport: udp\n'
+                     '  Version  : not disclosed pre-authentication (requires the TLS control channel)'})
+        (nmap_dir / 'nse_results' / 'portU_1194.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        content = (nmap_dir / 'findings.txt').read_text()
+        assert 'OpenVPN Service Detected' in content
+        assert 'LOW' in content
+        assert '10.0.4.1' in content
+
+        # Multi-line NSE output must be flattened to one line for the 'detail'
+        # field so findings.md's markdown table doesn't break on an embedded
+        # newline (mirrors the azure-sql-detect flattening fix).
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        openvpn = [r for r in records if r['title'] == 'OpenVPN Service Detected']
+        assert openvpn and openvpn[0]['severity'] == 'LOW'
+        assert '\n' not in openvpn[0]['detail']
+        assert 'Handshake: P_CONTROL_HARD_RESET_SERVER_V2; Transport: udp' in openvpn[0]['detail']
+
+        md = (nmap_dir / 'findings.md').read_text()
+        matching_lines = [ln for ln in md.splitlines() if '10.0.4.1' in ln]
+        assert len(matching_lines) == 1
+        row = matching_lines[0]
+        assert row.startswith('| `10.0.4.1`') and row.endswith('|')
+
+    def test_openvpn_tcp_detected_low(self, nmap_dir):
+        """openvpn-detect's multi-line output on tcp/1194 -> flattened LOW finding."""
+        xml = _nmap_xml(
+            '10.0.4.2', 'tcp', '1194',
+            scripts={'openvpn-detect':
+                     'OpenVPN server confirmed via control-channel handshake\n'
+                     '  Handshake: P_CONTROL_HARD_RESET_SERVER_V1\n'
+                     '  Transport: tcp\n'
+                     '  Version  : not disclosed pre-authentication (requires the TLS control channel)'})
+        (nmap_dir / 'nse_results' / 'port1194.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        content = (nmap_dir / 'findings.txt').read_text()
+        assert 'OpenVPN Service Detected' in content
+        assert 'LOW' in content
+        assert '10.0.4.2' in content
+
+    def test_openvpn_empty_output_no_finding(self, nmap_dir):
+        """openvpn-detect absent/empty -> no finding at all."""
+        xml = _nmap_xml('10.0.4.3', 'udp', '1194')
+        (nmap_dir / 'nse_results' / 'portU_1194.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        findings_file = nmap_dir / 'findings.txt'
+        if findings_file.exists():
+            content = findings_file.read_text()
+            assert 'OpenVPN' not in content
+
+    def test_openvpn_port_not_flagged_as_service_exposed(self, nmap_dir):
+        """1194 must never produce a 'Service Exposed Externally' finding — VPN exposure is expected."""
+        xml = _nmap_xml(
+            '10.0.4.4', 'udp', '1194',
+            scripts={'openvpn-detect':
+                     'OpenVPN server confirmed via control-channel handshake\n'
+                     '  Handshake: P_CONTROL_HARD_RESET_SERVER_V2\n'
+                     '  Transport: udp\n'
+                     '  Version  : not disclosed pre-authentication (requires the TLS control channel)'})
+        (nmap_dir / 'nse_results' / 'portU_1194.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        content = (nmap_dir / 'findings.txt').read_text()
+        assert 'Service Exposed Externally' not in content
+        assert 'OpenVPN Service Detected' in content
+
+    def test_openvpn_1194_not_in_external_sensitive_ports(self):
+        """1194/U:1194 must not be registered as an externally-sensitive port."""
+        assert '1194' not in spoonmap._EXTERNAL_SENSITIVE_PORT_KEYS
+        assert 'U:1194' not in spoonmap._EXTERNAL_SENSITIVE_PORT_KEYS
+
+    def test_openvpn_wired_into_both_port_script_tables(self):
+        """1194 (both transports) must be wired into external and internal script tables."""
+        for table in (spoonmap.EXTERNAL_PORT_SCRIPTS, spoonmap.INTERNAL_PORT_SCRIPTS):
+            assert 'openvpn-detect.nse' in table['1194']
+            assert 'openvpn-detect.nse' in table['U:1194']
+
+
 # ── _parse_masscan_ping_xml ───────────────────────────────────────────────────
 
 def _masscan_ping_xml(*ips):

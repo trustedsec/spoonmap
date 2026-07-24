@@ -1812,6 +1812,8 @@ EXTERNAL_PORT_SCRIPTS = {
     '10443': 'ssl-cert',
     'U:623': f'ipmi-version,ipmi-cipher-zero,{_DIR}/nse/ipmi-hashdump.nse',
     'U:500': 'ike-version',
+    'U:1194': f'{_DIR}/nse/openvpn-detect.nse',
+    '1194':  f'{_DIR}/nse/openvpn-detect.nse',
     '5900':  'vnc-info,realvnc-auth-bypass',
     '5901':  'vnc-info,realvnc-auth-bypass',
     '631':   f'{_DIR}/nse/cups-browsed-rce.nse',
@@ -1864,6 +1866,8 @@ INTERNAL_PORT_SCRIPTS = {
     '3269':  f'{_DIR}/nse/ldap-channel-binding-check.nse',
     'U:623': f'ipmi-version,ipmi-cipher-zero,{_DIR}/nse/ipmi-hashdump.nse',
     'U:500': 'ike-version',
+    'U:1194': f'{_DIR}/nse/openvpn-detect.nse',
+    '1194':  f'{_DIR}/nse/openvpn-detect.nse',
     '5900':  'vnc-info,realvnc-auth-bypass',
     '5901':  'vnc-info,realvnc-auth-bypass',
     '631':   f'{_DIR}/nse/cups-browsed-rce.nse',
@@ -1990,7 +1994,7 @@ SERVICE_CATEGORIES = {
         '389', '636'
     ],
     'Network Infrastructure': [
-        '53', '179', 'U:500', 'U:161', 'U:623', 'U:631'
+        '53', '179', 'U:500', 'U:161', 'U:623', 'U:631', 'U:1194', '1194'
     ],
     'File Transfer': [
         '21', '111'
@@ -2801,6 +2805,16 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                         'CVE-2025-59287 (unauthenticated RCE, CVSS 9.8, CISA KEV) is applied, '
                         'and that WSUS is not reachable from untrusted networks.')
 
+                # ── openvpn-detect (identification only — VPN exposure is expected) ──
+                openvpn_out = scripts.get('openvpn-detect', '')
+                if openvpn_out.strip():
+                    # openvpn-detect.nse returns a multi-line, screenshot-friendly
+                    # layout; flatten to one line since it feeds a finding 'detail'
+                    # field, which findings.md renders as a single markdown table cell.
+                    openvpn_flat = '; '.join(
+                        line.strip() for line in openvpn_out.splitlines() if line.strip())
+                    add('LOW', ip, port_str, 'OpenVPN Service Detected', openvpn_flat[:200])
+
                 # ── Local LLM — unauthenticated API access ───────────────────
                 sev_llm = 'HIGH' if target_scan == 'External' else 'MEDIUM'
 
@@ -3418,6 +3432,21 @@ _FINDING_REPRO = {
             '5001/tcp open  koboldcpp\n'
             '| koboldcpp-detect:\n'
             '|_  KoboldCpp API accessible without authentication \u2014 model: llama-2-7b-chat.Q4_K_M.gguf'
+        ),
+    },
+    'OpenVPN Service Detected': {
+        'flags': f'--script {_DIR}/nse/openvpn-detect.nse',
+        'extra_cmds': [
+            'openvpn --remote {host} 1194 --dev tun --client  # requires a matching client config/keys',
+        ],
+        'sample': (
+            'PORT     STATE SERVICE\n'
+            '1194/udp open  openvpn\n'
+            '| openvpn-detect:\n'
+            '|   OpenVPN server confirmed via control-channel handshake\n'
+            '|   Handshake: P_CONTROL_HARD_RESET_SERVER_V2\n'
+            '|   Transport: udp\n'
+            '|_  Version  : not disclosed pre-authentication (requires the TLS control channel)'
         ),
     },
 }
