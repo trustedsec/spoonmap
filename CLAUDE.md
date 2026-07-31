@@ -1,7 +1,5 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 ## Overview
 
 SpooNMAP is a Python 3.6+ wrapper that orchestrates masscan (fast port discovery) followed by nmap (service banner grabbing). Both external tools must be installed separately.
@@ -25,16 +23,9 @@ uv run pytest tests/
 uv run pytest tests/test_spoonmap.py::TestGenerateFindings  # single class
 ```
 
+Pass `--cleanup [dir]` to remove prior scan output non-interactively (reads `output_path` from `config.json` if no directory is given).
+
 ## Architecture
-
-The entire tool is a single script: `spoonmap.py`. Execution flow:
-
-1. `main()` — loads `config.json` if present, otherwise runs interactive prompts to collect: scan type, banner scan flag, internal/external target, max rate, output path, target file, exclusions file. When prompts are used (no `config.json` existed), the collected options are persisted to `config.json` via `_build_interactive_config()` / `_write_interactive_config()` before the scan starts, so the run can later be resumed with `--resume` and no prompts. A loaded `config.json` sets `config_loaded=True`, which suppresses the exclusions prompt and the config write.
-2. `preprocess_targets()` — reads the target file; resolves hostnames via DNS to IPs; writes `discovery/resolved_targets.txt` and `discovery/ip_hostname_map.json`
-3. `_host_discovery()` — determines live hosts before port scanning (skipped if `host_discovery=False`); delegates to `_internal_host_discovery()` or `_external_host_discovery()` depending on scan type
-4. `mass_scan()` — iterates over each port, runs masscan as a subprocess, parses XML output, deduplicates IPs per port using in-memory sets, writes `discovery/live_hosts/port<N>.txt`
-5. `nmap_scan()` — if banner scanning is enabled, uses a thread pool (`Queue` + worker threads, default 5 threads) to run nmap concurrently against each `discovery/live_hosts/port<N>.txt`; workers skip ports already present in `nmap_results/`
-6. `main()` — aggregates all live hosts into `all_live_hosts.txt` and merges all per-port XML into `spoonmap_output.xml`; if `script_scan` is enabled, calls `generate_findings()` to produce `findings.txt` / `findings.md`
 
 ### Host Discovery (Internal)
 
@@ -44,45 +35,6 @@ Internal discovery runs a single masscan sweep (no source-port override) followe
 2. `_internal_host_discovery()` — for target counts at or below `HOST_DISCOVERY_NMAP_THRESHOLD = 65_536`, starts `_nmap_host_discovery()` in a background `threading.Thread` before the masscan sweep begins, then joins the thread after masscan returns. Returns masscan IPs union nmap IPs.
 
 **Note**: The `-g 88` (Kerberos source port) bypass for Windows Firewall in AD environments is no longer attempted. The no-source-port sweep is used exclusively.
-
-### Host Discovery (External)
-
-`_external_host_discovery()` runs `_discover_external_masscan()` (single sweep, `DISCOVERY_MASSCAN_PORTS_EXTERNAL` 17 ports, `--retries 2`) followed by `_nmap_host_discovery()` sequentially, then returns the union.
-
-Pass `--cleanup [dir]` to remove prior scan output non-interactively (reads `output_path` from `config.json` if no directory is given).
-
-## Output Structure
-
-```
-<output_path>/
-  discovery/
-    resolved_targets.txt      # resolved IPs/CIDRs (input to host discovery)
-    ip_hostname_map.json      # hostname → IP mapping
-    live_hosts_discovery.txt  # hosts found during host-discovery phase
-    masscan_results/portN.xml # raw masscan XML per port
-    live_hosts/portN.txt      # deduplicated IPs per port
-  nmap_results/portN.xml      # nmap banner/script XML per port
-  all_live_hosts.txt          # union of all live IPs
-  spoonmap_output.xml         # merged XML (nmap if banner scan, masscan otherwise)
-  findings.txt                # severity-sorted findings report (script_scan only)
-  findings.md                 # same report in Markdown table format
-```
-
-## config.json Parameters
-
-| Key | Values |
-|-----|--------|
-| `scan_categories` | `"All"`, `"Full"`, or array of category names (e.g. `["Web","Database"]`); omit to use `dest_ports` |
-| `dest_ports` | Array of port strings; prefix `U:` for UDP (e.g. `"U:53"`); overrides `scan_categories` |
-| `banner_scan` | `"True"` or `"False"` |
-| `script_scan` | `"True"` or `"False"`; runs NSE security scripts (implies `banner_scan`) |
-| `target_scan` | `"External"` (source port 53) or `"Internal"` (source port 88) |
-| `max_rate` | Packets/second string; recommended: external=10000, internal=1000 |
-| `target_file` | Path to file with one IP/CIDR/hostname per line |
-| `output_path` | Directory for all output files |
-| `exclusions_file` | Path to file with IPs/CIDRs to exclude (passed to masscan `--excludefile`) |
-| `nmap_threads` | Integer, concurrent nmap processes (default: 5) |
-| `masscan_batch_size` | Integer, ports per masscan invocation (default: 5) |
 
 ## Key Implementation Details
 
