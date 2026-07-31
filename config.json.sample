@@ -10,7 +10,7 @@
     "__script_scan_choices__" : "True, False",
     "script_scan" : "False",
     "__host_discovery_choices__" : "True, False",
-    "__host_discovery_note__": "Even when False, both External and Internal scans run a dual masscan calibration probe (source-port vs no-source-port sweep) to determine the optimal source port for port scanning. External: source port 53 (DNS). Internal: source port 88 (Kerberos — bypasses Windows Firewall in domain environments). Whichever sweep finds more hosts wins. Internal discovery rate is always capped at 1000 pps regardless of max_rate to protect enterprise firewall state tables (~60K concurrent entries max).",
+    "__host_discovery_note__": "When False, no host discovery sweep runs and every target is port-scanned directly. No source-port override is used in any phase. Independent of this setting, the port scan always runs a rate-calibration probe on a few TCP ports (max_rate, then half that rate) and drops to the reduced rate if the slower pass finds more hosts. Internal discovery is always capped at 1000 pps regardless of max_rate to protect enterprise firewall state tables (~60K concurrent entries max).",
     "host_discovery" : "True",
     "__resume_choices__" : "True, False",
     "resume" : "False",

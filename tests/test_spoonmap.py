@@ -41,7 +41,12 @@ from spoonmap import (
     _sql_version_year,
     _summarize_vulns,
     _handle_previous_results,
+    _prior_default,
+    _prompt_int,
     _prompt_yes_no,
+    _CONFIG_DOCS,
+    _CONFIG_FIELD_ORDER,
+    _CONFIG_GENERATED_KEY,
     _host_discovery,
     _write_if_changed,
     _write_interactive_config,
@@ -1759,6 +1764,105 @@ class TestBuildInteractiveConfig:
         assert cfg['masscan_batch_size'] == 3
         assert cfg['nmap_threshold'] == 1_000_000
 
+    def _cfg(self, **overrides):
+        args = dict(
+            scan_categories='All', dest_ports=[], scan_type='All', banner_scan=True,
+            script_scan=False, target_scan='Internal', max_rate='2000',
+            target_file='r', output_path='o', exclusions_file=None, nmap_threads=5,
+            masscan_batch_size=5, nmap_threshold=5_000_000, host_discovery=True)
+        args.update(overrides)
+        return _build_interactive_config(*[args[k] for k in (
+            'scan_categories', 'dest_ports', 'scan_type', 'banner_scan',
+            'script_scan', 'target_scan', 'max_rate', 'target_file', 'output_path',
+            'exclusions_file', 'nmap_threads', 'masscan_batch_size',
+            'nmap_threshold', 'host_discovery')])
+
+    def test_marker_key_written_first(self):
+        cfg = self._cfg()
+        assert list(cfg)[0] == _CONFIG_GENERATED_KEY
+        assert 'Remove this key' in cfg[_CONFIG_GENERATED_KEY]
+
+    def test_doc_keys_written_for_present_fields(self):
+        cfg = self._cfg()
+        for field, entries in _CONFIG_DOCS.items():
+            if field not in cfg:
+                continue
+            for doc_key, doc_text in entries:
+                assert cfg[doc_key] == doc_text
+
+    def test_doc_key_precedes_its_field(self):
+        keys = list(self._cfg())
+        assert keys.index('__banner_scan_choices__') < keys.index('banner_scan')
+        assert keys.index('__banner_scan_udp_warning__') < keys.index('banner_scan')
+        assert keys.index('__target_scan_choices__') < keys.index('target_scan')
+
+    def test_fields_follow_canonical_order(self):
+        keys = [k for k in self._cfg() if not k.startswith('__')]
+        expected = [k for k in _CONFIG_FIELD_ORDER if k in keys]
+        assert keys == expected
+
+    def test_custom_carries_dest_ports_docs_only(self):
+        cfg = self._cfg(scan_categories=None, dest_ports=['80'], scan_type='Custom')
+        assert '__dest_ports_note__' in cfg
+        assert '__scan_categories_choices__' not in cfg
+
+    def test_categories_carry_scan_categories_docs_only(self):
+        cfg = self._cfg()
+        assert '__scan_categories_choices__' in cfg
+        assert '__dest_ports_note__' not in cfg
+
+    def test_doc_keys_do_not_disturb_round_trip(self):
+        """The loader must still resolve a documented config the same way."""
+        selected = ['Web', 'Database']
+        dest_ports = self._dest_ports_for(selected)
+        cfg = self._cfg(scan_categories=selected, dest_ports=dest_ports,
+                        scan_type='Web, Database')
+        assert self._resolve(cfg) == ('Web, Database', dest_ports)
+
+
+class TestConfigDocs:
+    """_CONFIG_DOCS is the single source of truth; config.json.sample must agree.
+
+    Both files document the same fields for the same users, so drift between
+    them is a defect — edit the constant and the sample together.
+    """
+
+    @staticmethod
+    def _sample():
+        sample = Path(__file__).resolve().parent.parent / 'config.json.sample'
+        with open(sample) as fh:
+            return json.load(fh)
+
+    def test_sample_parses(self):
+        assert isinstance(self._sample(), dict)
+
+    def test_every_constant_doc_key_matches_the_sample(self):
+        sample = self._sample()
+        for field, entries in _CONFIG_DOCS.items():
+            for doc_key, doc_text in entries:
+                assert doc_key in sample, f'{doc_key} missing from config.json.sample'
+                assert sample[doc_key] == doc_text, f'{doc_key} text differs from the sample'
+
+    def test_every_sample_doc_key_is_in_the_constant(self):
+        known = {doc_key for entries in _CONFIG_DOCS.values() for doc_key, _ in entries}
+        # The marker key is generated-only: the sample is hand-authored and must
+        # not carry it, or a copied sample would re-open the prompts.
+        sample_doc_keys = {k for k in self._sample() if k.startswith('__')}
+        assert sample_doc_keys - known == set()
+
+    def test_sample_has_no_generated_marker(self):
+        assert _CONFIG_GENERATED_KEY not in self._sample()
+
+    def test_scan_categories_choices_track_service_categories(self):
+        choices = dict(_CONFIG_DOCS['scan_categories'])['__scan_categories_choices__']
+        assert choices == 'All, Full, ' + ', '.join(SERVICE_CATEGORIES)
+
+    def test_host_discovery_note_does_not_claim_a_source_port_probe(self):
+        """source_port is unconditionally '' — the note described a removed feature."""
+        note = dict(_CONFIG_DOCS['host_discovery'])['__host_discovery_note__']
+        assert 'source port 53' not in note
+        assert 'source port 88' not in note
+
 
 class TestWriteInteractiveConfig:
     def test_writes_valid_json(self, tmp_path):
@@ -1785,6 +1889,43 @@ class TestWriteInteractiveConfig:
         assert _write_interactive_config(path, cfg) is True
         with open(path) as fh:
             assert json.load(fh) == cfg
+
+    def test_preserves_unknown_keys_from_existing_file(self, tmp_path):
+        """A re-prompted run rewrites a file the user may have annotated."""
+        path = str(tmp_path / 'config.json')
+        with open(path, 'w') as fh:
+            json.dump({'banner_scan': 'False', '__my_note__': 'keep me',
+                       'future_key': 42}, fh)
+        assert _write_interactive_config(path, {'banner_scan': 'True'}) is True
+        with open(path) as fh:
+            written = json.load(fh)
+        assert written['banner_scan'] == 'True'      # ours wins
+        assert written['__my_note__'] == 'keep me'   # theirs survives
+        assert written['future_key'] == 42
+
+    def test_written_keys_keep_their_order_ahead_of_preserved_ones(self, tmp_path):
+        path = str(tmp_path / 'config.json')
+        with open(path, 'w') as fh:
+            json.dump({'__my_note__': 'n'}, fh)
+        _write_interactive_config(path, {'a': 1, 'b': 2})
+        with open(path) as fh:
+            assert list(json.load(fh)) == ['a', 'b', '__my_note__']
+
+    def test_unparseable_existing_file_is_replaced(self, tmp_path):
+        path = str(tmp_path / 'config.json')
+        with open(path, 'w') as fh:
+            fh.write('{ not json')
+        assert _write_interactive_config(path, {'banner_scan': 'True'}) is True
+        with open(path) as fh:
+            assert json.load(fh) == {'banner_scan': 'True'}
+
+    def test_non_dict_existing_file_is_replaced(self, tmp_path):
+        path = str(tmp_path / 'config.json')
+        with open(path, 'w') as fh:
+            json.dump(['a', 'list'], fh)
+        assert _write_interactive_config(path, {'banner_scan': 'True'}) is True
+        with open(path) as fh:
+            assert json.load(fh) == {'banner_scan': 'True'}
 
 
 # ── resume freshness (idempotent target write + staleness gates) ──────────────
@@ -2024,54 +2165,118 @@ class TestPromptYesNo:
         assert _prompt_yes_no('q', True, MagicMock(return_value='   ')) is True
 
 
+class TestPromptInt:
+    def test_empty_uses_default(self):
+        assert _prompt_int('q', 5, prompt_fn=MagicMock(return_value='')) == 5
+
+    def test_whitespace_only_uses_default(self):
+        assert _prompt_int('q', 7, prompt_fn=MagicMock(return_value='  ')) == 7
+
+    def test_default_coerced_to_int(self):
+        # config.json may carry these as strings
+        assert _prompt_int('q', '9', prompt_fn=MagicMock(return_value='')) == 9
+
+    def test_accepts_valid_number(self):
+        assert _prompt_int('q', 5, prompt_fn=MagicMock(return_value='12')) == 12
+
+    def test_reprompts_on_non_numeric(self, capsys):
+        prompt = MagicMock(side_effect=['abc', '3'])
+        assert _prompt_int('q', 5, prompt_fn=prompt) == 3
+        assert prompt.call_count == 2
+        assert 'whole number' in capsys.readouterr().out
+
+    def test_reprompts_below_minimum(self, capsys):
+        prompt = MagicMock(side_effect=['0', '1'])
+        assert _prompt_int('q', 5, minimum=1, prompt_fn=prompt) == 1
+        assert prompt.call_count == 2
+        assert 'at least 1' in capsys.readouterr().out
+
+
+class TestPriorDefault:
+    def test_prior_value_wins(self):
+        assert _prior_default({'max_rate': '2000'}, 'max_rate', '20000') == '2000'
+
+    def test_missing_key_falls_back(self):
+        assert _prior_default({}, 'max_rate', '20000') == '20000'
+
+    def test_none_empty_string_and_empty_list_fall_back(self):
+        assert _prior_default({'k': None}, 'k', 'fb') == 'fb'
+        assert _prior_default({'k': ''}, 'k', 'fb') == 'fb'
+        assert _prior_default({'k': []}, 'k', 'fb') == 'fb'
+
+    def test_false_is_preserved_not_replaced(self):
+        """The reason this helper exists: a prior 'no' must survive a True
+        fallback, which a plain `or` would silently discard."""
+        assert _prior_default({'banner_scan': False}, 'banner_scan', True) is False
+        assert _prior_default({'host_discovery': False}, 'host_discovery', True) is False
+
+    def test_zero_is_preserved(self):
+        assert _prior_default({'n': 0}, 'n', 5) == 0
+
+    def test_non_empty_list_preserved(self):
+        assert _prior_default({'p': ['80']}, 'p', []) == ['80']
+
+
 class TestHandlePreviousResults:
     def test_no_previous_results_returns_resume_unchanged(self):
         prompt = MagicMock()
         with patch('spoonmap._previous_results_exist', return_value=False):
-            assert _handle_previous_results('/out', False, prompt) is False
-            assert _handle_previous_results('/out', True, prompt) is True
+            assert _handle_previous_results('/out', False, prompt) == (False, 'none')
+            assert _handle_previous_results('/out', True, prompt) == (True, 'none')
         prompt.assert_not_called()
 
     def test_resume_flag_skips_prompt(self):
         prompt = MagicMock()
         with patch('spoonmap._previous_results_exist', return_value=True):
-            assert _handle_previous_results('/out', True, prompt) is True
+            assert _handle_previous_results('/out', True, prompt) == (True, 'none')
         prompt.assert_not_called()
 
     def test_resume_choice_enables_resume_without_deleting(self):
         prompt = MagicMock(return_value='r')
         with patch('spoonmap._previous_results_exist', return_value=True), \
              patch('spoonmap._delete_previous_results') as del_mock:
-            assert _handle_previous_results('/out', False, prompt) is True
+            assert _handle_previous_results('/out', False, prompt) == (True, 'r')
         del_mock.assert_not_called()
 
     def test_delete_choice_removes_and_stays_off(self):
         prompt = MagicMock(return_value='d')
         with patch('spoonmap._previous_results_exist', return_value=True), \
              patch('spoonmap._delete_previous_results') as del_mock:
-            assert _handle_previous_results('/out', False, prompt) is False
+            assert _handle_previous_results('/out', False, prompt) == (False, 'd')
         del_mock.assert_called_once_with('/out')
 
     def test_append_choice_keeps_files_and_stays_off(self):
         prompt = MagicMock(return_value='a')
         with patch('spoonmap._previous_results_exist', return_value=True), \
              patch('spoonmap._delete_previous_results') as del_mock:
-            assert _handle_previous_results('/out', False, prompt) is False
+            assert _handle_previous_results('/out', False, prompt) == (False, 'a')
         del_mock.assert_not_called()
 
     def test_default_empty_input_is_append(self):
         prompt = MagicMock(return_value='')
         with patch('spoonmap._previous_results_exist', return_value=True), \
              patch('spoonmap._delete_previous_results') as del_mock:
-            assert _handle_previous_results('/out', False, prompt) is False
+            assert _handle_previous_results('/out', False, prompt) == (False, 'a')
         del_mock.assert_not_called()
 
     def test_invalid_input_reprompts_until_valid(self):
         prompt = MagicMock(side_effect=['x', 'nonsense', 'r'])
         with patch('spoonmap._previous_results_exist', return_value=True), \
              patch('spoonmap._delete_previous_results'):
-            assert _handle_previous_results('/out', False, prompt) is True
+            assert _handle_previous_results('/out', False, prompt) == (True, 'r')
         assert prompt.call_count == 3
+
+    def test_choice_distinguishes_delete_from_append(self):
+        """Both leave resume off, so main() needs the choice to know whether to
+        re-open the option prompts."""
+        with patch('spoonmap._previous_results_exist', return_value=True), \
+             patch('spoonmap._delete_previous_results'):
+            delete_resume, delete_choice = _handle_previous_results(
+                '/out', False, MagicMock(return_value='delete'))
+            append_resume, append_choice = _handle_previous_results(
+                '/out', False, MagicMock(return_value='append'))
+        assert delete_resume is append_resume is False
+        assert (delete_choice, append_choice) == ('d', 'a')
 
 
 # ── _cleanup_cmd ──────────────────────────────────────────────────────────────

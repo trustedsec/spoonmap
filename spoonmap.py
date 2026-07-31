@@ -3775,6 +3775,89 @@ def _filter_udp_live_hosts(output_path):
     return confirmed_counts
 
 
+# Marks a config.json this tool wrote from the prompts, as opposed to one a
+# user hand-authored from config.json.sample.  Only a generated config re-opens
+# the option prompts on a [d]elete/[a]ppend choice; a hand-written one keeps the
+# documented "skip all prompts" contract.  The note explains its own removal
+# because the file is the only place a user will see it.
+_CONFIG_GENERATED_KEY = '__generated_by_prompts__'
+_CONFIG_GENERATED_NOTE = (
+    "Written by SpooNMAP's interactive prompts. While this key is present, "
+    'choosing [d]elete or [a]ppend on a re-run re-asks the scan options using '
+    'the values below as defaults. Remove this key to keep these options fixed '
+    'and skip all prompts.'
+)
+
+# Field documentation written into a generated config.json, mirroring
+# config.json.sample so a config reached via the prompts explains itself the
+# same way.  Maps a real key -> [(doc_key, doc_text), ...]; each field's doc
+# entries are emitted immediately before the field itself.  TestConfigDocs
+# asserts this constant and config.json.sample stay in step — edit both together.
+_CONFIG_DOCS = {
+    'scan_categories': [
+        ('__scan_categories_choices__',
+         'All, Full, ' + ', '.join(SERVICE_CATEGORIES)),
+    ],
+    'dest_ports': [
+        ('__dest_ports_note__',
+         'Optional: overrides scan_categories with an explicit port list. '
+         'Use U: prefix for UDP (e.g. U:53).'),
+    ],
+    'banner_scan': [
+        ('__banner_scan_choices__', 'True, False'),
+        ('__banner_scan_udp_warning__',
+         'WARNING: When scanning UDP ports (U:* prefixed) with banner_scan=False, '
+         'hosts will not undergo NSE confirmation. All open|filtered UDP hosts '
+         '(typically the majority) will appear in output, inflating host counts '
+         'significantly. Enable banner_scan or script_scan when using UDP ports.'),
+    ],
+    'script_scan': [
+        ('__script_scan_choices__', 'True, False'),
+    ],
+    'host_discovery': [
+        ('__host_discovery_choices__', 'True, False'),
+        ('__host_discovery_note__',
+         'When False, no host discovery sweep runs and every target is port-scanned '
+         'directly. No source-port override is used in any phase. Independent of this '
+         'setting, the port scan always runs a rate-calibration probe on a few TCP '
+         'ports (max_rate, then half that rate) and drops to the reduced rate if the '
+         'slower pass finds more hosts. Internal discovery is always capped at 1000 pps '
+         'regardless of max_rate to protect enterprise firewall state tables '
+         '(~60K concurrent entries max).'),
+    ],
+    'resume': [
+        ('__resume_choices__', 'True, False'),
+    ],
+    'target_scan': [
+        ('__target_scan_choices__', 'External, Internal'),
+    ],
+    'max_rate': [
+        ('__max_rate_external_recommendation__',
+         'Default = 20000 (full port scan capped at 10000)'),
+        ('__max_rate_internal_recommendation__',
+         'Default = 2000 (full port scan capped at 1000)'),
+    ],
+    'nmap_threshold': [
+        ('__nmap_threshold_note__',
+         'Work-unit threshold (hosts × ports) for tool selection. When '
+         'effective_hosts × port_count <= this value, nmap is used for port discovery '
+         'instead of masscan. Nmap is more reliable and faster for small-to-medium '
+         'scans (internal masscan caps at 200 work-units/sec due to 1000 pps + 5 '
+         'retries; nmap -T4 does ~10,000/sec). Default: 5000000 (~76 hosts × full port '
+         'scan, or ~5000 hosts × 1000 targeted ports). Lower to ~500000 for high-rate '
+         'external setups (100k+ pps).'),
+    ],
+}
+
+# Canonical key order for a written config.json, matching config.json.sample.
+_CONFIG_FIELD_ORDER = (
+    'scan_categories', 'dest_ports', 'masscan_batch_size', 'banner_scan',
+    'script_scan', 'host_discovery', 'resume', 'target_scan', 'max_rate',
+    'nmap_threads', 'nmap_threshold', 'target_file', 'output_path',
+    'exclusions_file',
+)
+
+
 def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_scan,
                               script_scan, target_scan, max_rate, target_file,
                               output_path, exclusions_file, nmap_threads,
@@ -3787,8 +3870,14 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
     ``scan_categories``.  ``resume`` is written as ``"False"`` so a plain
     re-run still surfaces the delete/append prompt — resuming is opt-in via the
     ``--resume`` flag.
+
+    Keys are emitted in ``_CONFIG_FIELD_ORDER`` with their ``_CONFIG_DOCS``
+    entries interleaved, so the written file documents its editable fields the
+    way config.json.sample does.  Doc entries appear only for fields actually
+    written, so a custom-port config carries the ``dest_ports`` note and not the
+    ``scan_categories`` one.
     """
-    config = {
+    values = {
         'banner_scan': 'True' if banner_scan else 'False',
         'script_scan': 'True' if script_scan else 'False',
         'host_discovery': 'True' if host_discovery else 'False',
@@ -3803,21 +3892,46 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
         'exclusions_file': exclusions_file or '',
     }
     if scan_type == 'Custom':
-        config['dest_ports'] = list(dest_ports)
+        values['dest_ports'] = list(dest_ports)
     elif scan_categories is not None:
-        config['scan_categories'] = scan_categories
+        values['scan_categories'] = scan_categories
+
+    config = {_CONFIG_GENERATED_KEY: _CONFIG_GENERATED_NOTE}
+    for key in _CONFIG_FIELD_ORDER:
+        if key not in values:
+            continue
+        for doc_key, doc_text in _CONFIG_DOCS.get(key, ()):
+            config[doc_key] = doc_text
+        config[key] = values[key]
     return config
 
 
 def _write_interactive_config(config_path, config):
     """Write *config* to *config_path* as pretty JSON. Returns True on success.
 
+    Merges over any existing file rather than truncating it: keys *config* does
+    not define — a user's own ``__*__`` annotations, or fields added by a newer
+    version — are carried forward.  This matters because a re-prompted run
+    rewrites a config.json the user may have edited by hand.
+
     Never raises: a failed write only means resume via config.json is
     unavailable, which must not abort an otherwise-valid scan.
     """
+    merged = config
+    try:
+        with open(config_path) as fh:
+            existing = json.load(fh)
+    except (OSError, ValueError):
+        existing = None  # absent or unparseable — nothing worth preserving
+    if isinstance(existing, dict):
+        preserved = {k: v for k, v in existing.items() if k not in config}
+        if preserved:
+            merged = dict(config)
+            merged.update(preserved)
+
     try:
         with open(config_path, 'w') as fh:
-            json.dump(config, fh, indent=4)
+            json.dump(merged, fh, indent=4)
             fh.write('\n')
         return True
     except OSError as e:
@@ -3845,22 +3959,61 @@ def _prompt_yes_no(question, default, prompt_fn=input):
         print(_COLOR_ERROR + "Please answer 'y'/'yes' or 'n'/'no'." + _COLOR_RESET)
 
 
-def _handle_previous_results(output_path, resume, prompt_fn=input):
-    """Resolve what to do with pre-existing scan output; return the resume flag.
+def _prompt_int(question, default, minimum=1, prompt_fn=input):
+    """Prompt until a whole number >= *minimum* is given; return int.
 
-    If nothing pre-exists, ``resume`` is returned unchanged.  If a resume was
-    already requested (``--resume`` or config), no prompt is shown.  Otherwise
-    the user picks delete / append / resume:
+    Empty input selects *default*.  Non-numeric or out-of-range input is
+    rejected and re-prompted rather than silently coerced, matching
+    ``_prompt_yes_no``'s refusal to guess at a typo.
+    """
+    while True:
+        answer = prompt_fn(question).strip()
+        if not answer:
+            return int(default)
+        try:
+            value = int(answer)
+        except ValueError:
+            print(_COLOR_ERROR + 'Please enter a whole number.' + _COLOR_RESET)
+            continue
+        if value < minimum:
+            print(_COLOR_ERROR + f'Please enter a number of at least {minimum}.'
+                  + _COLOR_RESET)
+            continue
+        return value
+
+
+def _prior_default(prior, key, fallback):
+    """Prompt default: the previous run's value for *key*, else *fallback*.
+
+    Used when a [d]elete/[a]ppend choice re-opens the prompts on a generated
+    config, so each question offers what the last run used.  ``False`` is a real
+    answer and is returned as-is — only unset values (None, empty string, empty
+    list) fall back, which is why this is not a plain ``or``.
+    """
+    value = prior.get(key)
+    if value is None or value == '' or value == []:
+        return fallback
+    return value
+
+
+def _handle_previous_results(output_path, resume, prompt_fn=input):
+    """Resolve what to do with pre-existing scan output.
+
+    Returns ``(resume, choice)``.  *choice* is ``'d'``/``'a'``/``'r'`` for an
+    answered prompt, or ``'none'`` when no prompt was shown — nothing pre-existed,
+    or a resume was already requested via ``--resume``/config.  main() needs the
+    choice and not just the flag: delete and append both leave resume off but
+    re-open the option prompts, while resume must leave them alone.
       - delete  -> remove prior output, resume stays off
       - append  -> keep prior output, re-run (resume stays off)
       - resume  -> keep prior output and enable the same freshness-gated skip
                    logic as ``--resume`` (returns True)
     """
     if not _previous_results_exist(output_path):
-        return resume
+        return resume, 'none'
     if resume:
         print(_COLOR_INFO + 'Resuming previous scan...' + _COLOR_RESET)
-        return True
+        return True, 'none'
 
     print(_COLOR_INFO + '\nPrevious scan results detected in output directory.' + _COLOR_RESET)
     while True:
@@ -3873,12 +4026,12 @@ def _handle_previous_results(output_path, resume, prompt_fn=input):
     if choice[0] == 'd':
         _delete_previous_results(output_path)
         print(_COLOR_INFO + 'Previous results deleted.' + _COLOR_RESET)
-        return False
+        return False, 'd'
     if choice[0] == 'r':
         print(_COLOR_INFO + 'Resuming previous scan...' + _COLOR_RESET)
-        return True
+        return True, 'r'
     print(_COLOR_INFO + 'Appending to previous results.' + _COLOR_RESET)
-    return False
+    return False, 'a'
 
 
 # The Main Guts
@@ -3920,6 +4073,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             _cleanup_cmd(dir_path)  # prints result and exits
         resume = '--resume' in sys.argv
         config_loaded = False
+        config_generated = False
         if os.path.exists(f'{dir_path}/config.json'):
             config_loaded = True
             with open(f'{dir_path}/config.json') as config:
@@ -3958,12 +4112,13 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             # Absent or empty means "no exclusions" — normalize to None so it is
             # neither re-prompted nor passed as an empty --excludefile.
             exclusions_file = config_parser.get('exclusions_file') or None
-            nmap_threads = config_parser.get('nmap_threads', 5)
+            nmap_threads = int(config_parser.get('nmap_threads', 5))
             masscan_batch_size = int(config_parser.get('masscan_batch_size', 5))
             nmap_threshold = int(config_parser.get('nmap_threshold', 5_000_000))
             script_scan = config_parser.get('script_scan', 'False') == 'True'
             host_discovery = config_parser.get('host_discovery', 'True') == 'True'
             resume = resume or config_parser.get('resume', 'False').strip().lower() == 'true'
+            config_generated = bool(config_parser.get(_CONFIG_GENERATED_KEY))
 
             # Resolve relative paths in config relative to the script directory
             if target_file and not os.path.isabs(target_file):
@@ -3973,10 +4128,59 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             if exclusions_file and not os.path.isabs(exclusions_file):
                 exclusions_file = os.path.join(dir_path, exclusions_file)
 
+        # A config this tool wrote is a saved answer sheet, not a hand-authored
+        # one, so ask about pre-existing output *before* the prompts: [d]elete and
+        # [a]ppend then re-open every question with the saved values as defaults,
+        # which is otherwise impossible without deleting config.json.  Needs
+        # output_path, which only a loaded config supplies this early — the
+        # no-config path keeps the original check after the prompts.  A
+        # hand-written config has no marker key and keeps its documented
+        # "skip all prompts" contract.
+        prior = {}
+        checked_output_path = None
+        if config_loaded and config_generated:
+            resume, prior_choice = _handle_previous_results(output_path, resume)
+            checked_output_path = output_path
+            if prior_choice in ('d', 'a'):
+                prior = {
+                    'scan_categories': scan_categories,
+                    'dest_ports': list(dest_ports),
+                    'scan_type': scan_type,
+                    'banner_scan': banner_scan,
+                    'script_scan': script_scan,
+                    'target_scan': target_scan,
+                    'max_rate': max_rate,
+                    'target_file': target_file,
+                    'output_path': output_path,
+                    'exclusions_file': exclusions_file,
+                    'host_discovery': host_discovery,
+                }
+                # Reopen every gate below; _prior_default() feeds each prompt the
+                # captured value as its default so Enter-through reproduces the
+                # previous scan.  Clearing config_loaded also re-enables the
+                # exclusions prompt and the config rewrite.  nmap_threads,
+                # masscan_batch_size and nmap_threshold keep their loaded values:
+                # they are defaults for the advanced prompt, not gates.
+                scan_type = ''
+                scan_categories = None
+                dest_ports = []
+                banner_scan = ''
+                script_scan = ''
+                target_scan = ''
+                max_rate = ''
+                target_file = ''
+                output_path = ''
+                exclusions_file = ''
+                host_discovery = None
+                config_loaded = False
+
         if scan_type == '':
             category_names = list(SERVICE_CATEGORIES.keys())
+            prior_scan_type = prior.get('scan_type')
+            selection_hint = (f'keep current: {prior_scan_type}' if prior_scan_type
+                              else 'default: All')
             while True:
-                print('\nService Categories (comma-separated numbers, default: All)')
+                print(f'\nService Categories (comma-separated numbers, {selection_hint})')
                 for i, name in enumerate(category_names, 1):
                     ports = SERVICE_CATEGORIES[name]
                     print(f'\t({i}) {name}  [{", ".join(ports)}]')
@@ -3985,7 +4189,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 print(f'\t(c) Custom Port Scan  [enter your own comma-separated ports]')
 
                 selection = input(
-                    f'\nWhich categories would you like to scan (e.g. 1,3 — default: All)? '
+                    f'\nWhich categories would you like to scan (e.g. 1,3 — {selection_hint})? '
                 ).strip()
 
                 if selection in (str(full_n), 'full', 'f'):
@@ -4006,6 +4210,14 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                     break
 
                 if not selection:
+                    if prior_scan_type:
+                        # Re-prompt: keep the previous run's selection verbatim,
+                        # including a Custom port list (scan_categories is None
+                        # in that case, which round-trips back to dest_ports).
+                        scan_type = prior_scan_type
+                        scan_categories = prior.get('scan_categories')
+                        dest_ports = list(prior.get('dest_ports') or [])
+                        break
                     # Default: all categories
                     scan_type = 'All'
                     scan_categories = 'All'
@@ -4030,9 +4242,10 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 # Invalid input — loop again
 
         if banner_scan == '':
+            banner_default = _prior_default(prior, 'banner_scan', True)
             banner_scan = _prompt_yes_no(
                 '\nWould you like to enumerate service banners for any identified services '
-                '(default: Yes)? ', True)
+                f'(default: {"Yes" if banner_default else "No"})? ', banner_default)
             if not banner_scan:
                 # Warn if UDP ports are in scope — open|filtered won't be confirmed
                 udp_in_scope = any(p.startswith('U:') for p in dest_ports)
@@ -4045,9 +4258,10 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
 
         if script_scan == '':
             if banner_scan:
+                script_default = _prior_default(prior, 'script_scan', False)
                 script_scan = _prompt_yes_no(
                     '\nWould you like to run NSE security scripts on identified services '
-                    '(default: No)? ', False)
+                    f'(default: {"Yes" if script_default else "No"})? ', script_default)
             else:
                 script_scan = False
 
@@ -4056,14 +4270,15 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             banner_scan = True
 
         if not target_scan:
-            source_choice = '1'
+            target_scan_default = _prior_default(prior, 'target_scan', 'External')
+            source_choice = '2' if target_scan_default == 'Internal' else '1'
             while True:
                 print('\nTarget Scan')
                 print('\t(1) External')
                 print('\t(2) Internal')
                 source_choice = input(
                     f'\nIs this an internal or external scan '
-                    f'(default: External)? '
+                    f'(default: {target_scan_default})? '
                     ) or source_choice
                 if source_choice == '1':
                     target_scan = 'External'
@@ -4077,6 +4292,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 max_rate = '20000'
             else:
                 max_rate = '2000'
+            max_rate = str(_prior_default(prior, 'max_rate', max_rate))
             while True:
                 try:
                     rate_choice = input(f'\nHow fast would you like to scan '
@@ -4089,15 +4305,15 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                     pass
 
         if not output_path:
-            output_path = dir_path
+            output_path = _prior_default(prior, 'output_path', dir_path)
             with _path_completion():
                 output_path = input(f'\nPlease enter full path for output '
-                    f'(default: {dir_path}): '
+                    f'(default: {output_path}): '
                     ) or output_path
             os.makedirs(output_path, exist_ok=True)
 
         if not target_file:
-            target_file = output_path+"/ranges.txt"
+            target_file = _prior_default(prior, 'target_file', output_path+"/ranges.txt")
             while True:
                 print(target_file)
                 print('\nExample Target File')
@@ -4113,8 +4329,11 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                     break
 
         if not exclusions_file and not config_loaded:
-            if _prompt_yes_no('\nWould you like to exclude any hosts?  (default: No) ', False):
-                exclusions_file = f'{dir_path}/exclusions.txt'
+            prior_exclusions = prior.get('exclusions_file')
+            if _prompt_yes_no('\nWould you like to exclude any hosts?  (default: '
+                              f'{"Yes" if prior_exclusions else "No"}) ',
+                              bool(prior_exclusions)):
+                exclusions_file = prior_exclusions or f'{dir_path}/exclusions.txt'
                 while True:
                     print('\nExample Exclusions File')
                     print('One CIDR or IP Address per line\n')
@@ -4122,7 +4341,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                     print('\t192.168.1.23')
                     with _path_completion():
                         exclusions_file = input(f'\nPlease enter the full path for the file '
-                            f'containing excluded hosts if applicable (default: {dir_path}/{exclusions_file}): '
+                            f'containing excluded hosts if applicable (default: {exclusions_file}): '
                             ) or exclusions_file
 
                     if os.path.exists(exclusions_file):
@@ -4133,9 +4352,27 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 exclusions_file = None
 
         if host_discovery is None:
+            discovery_default = _prior_default(prior, 'host_discovery', True)
             host_discovery = _prompt_yes_no(
                 '\nRun host discovery (nmap -sn; masscan for large ranges) before scanning '
-                '(default: Yes)? ', True)
+                f'(default: {"Yes" if discovery_default else "No"})? ', discovery_default)
+
+        # Concurrency and tool-selection knobs are config-only by default; one
+        # opt-in question keeps them reachable without hand-editing JSON.  Skipped
+        # entirely on the config-driven path, like every other prompt.
+        if not config_loaded:
+            if _prompt_yes_no('\nTune advanced settings (nmap threads, masscan batch size, '
+                              'nmap work-unit threshold)?  (default: No) ', False):
+                nmap_threads = _prompt_int(
+                    f'\nConcurrent nmap processes (default: {nmap_threads}): ',
+                    nmap_threads)
+                masscan_batch_size = _prompt_int(
+                    f'Ports per masscan invocation (default: {masscan_batch_size}): ',
+                    masscan_batch_size)
+                nmap_threshold = _prompt_int(
+                    f'Work-unit threshold (hosts × ports) below which nmap replaces '
+                    f'masscan for port discovery (default: {nmap_threshold}): ',
+                    nmap_threshold)
 
         print(f'\nScan Type: {scan_type}')
         print(f'Target Ports: {dest_ports}')
@@ -4147,6 +4384,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         print(f'Exclusions File: {exclusions_file}')
         print(f'NMAP Concurrent Threads: {nmap_threads}')
         print(f'Masscan Batch Size: {masscan_batch_size}')
+        print(f'NMAP Work-Unit Threshold: {nmap_threshold:,}')
         print(f'Host Discovery:  {host_discovery}')
 
         target_count = _count_hosts_in_file(target_file)
@@ -4163,9 +4401,10 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
 
         # Persist interactively-collected settings to config.json so a later
         # `--resume` run reloads them and skips all prompts — giving console
-        # users the same resume support as config.json users.  Only written when
-        # no config.json was loaded this run (interactive path); the file is
-        # gitignored and absent in that case, so this never overwrites one.
+        # users the same resume support as config.json users.  Written whenever
+        # the prompts ran, which now includes a re-prompt triggered by
+        # [d]elete/[a]ppend; _write_interactive_config() merges rather than
+        # truncates, so anything the user added to the file by hand survives.
         if not config_loaded:
             interactive_config = _build_interactive_config(
                 scan_categories, dest_ports, scan_type, banner_scan, script_scan,
@@ -4176,13 +4415,17 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             if _write_interactive_config(config_json_path, interactive_config):
                 print(_COLOR_INFO
                       + f'Settings saved to {config_json_path} — re-run with '
-                      + '--resume to continue this scan; delete the file to be '
-                      + 'prompted again.'
+                      + '--resume to continue this scan, or pick [d]elete/[a]ppend '
+                      + 'on a re-run to change these options.'
                       + _COLOR_RESET)
             print()
 
-        # Detect previous scan results and ask whether to delete, append, or resume
-        resume = _handle_previous_results(output_path, resume)
+        # Detect previous scan results and ask whether to delete, append, or
+        # resume.  Skipped when already asked before the prompts, unless the user
+        # changed output_path there: that decision applied to the old directory,
+        # so the new one still needs checking.
+        if checked_output_path is None or output_path != checked_output_path:
+            resume, _ = _handle_previous_results(output_path, resume)
 
         scan_start_time = time.time()
 

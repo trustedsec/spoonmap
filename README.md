@@ -63,6 +63,8 @@ Please enter the full path for the file containing target hosts (default: /opt/s
 Would you like to exclude any hosts? (default: No)
 
 Run host discovery before port scanning (default: Yes)?
+
+Tune advanced settings (nmap threads, masscan batch size, nmap work-unit threshold)? (default: No)
 ```
 
 You can also create a `config.json` file (based on `config.json.sample`) to skip all prompts:
@@ -89,9 +91,13 @@ To scan all 65535 ports, set `"scan_categories": "Full"`.
 For a fully custom port list, omit `scan_categories` and use `"dest_ports": ["80","443","U:53"]` instead.
 UDP ports are specified with a `U:` prefix (e.g. `"U:53"`).
 
-When you answer the interactive prompts, the selected options are written to `config.json` before the scan begins (this file is created only when one does not already exist). This means an interrupted interactive scan can be resumed the same way as a config-driven one — just re-run with `--resume`, and all prompts are skipped. Delete `config.json` to be prompted again from scratch.
+When you answer the interactive prompts, the selected options are written to `config.json` before the scan begins. The generated file documents each editable field the same way `config.json.sample` does, and carries a `__generated_by_prompts__` marker key. This means an interrupted interactive scan can be resumed the same way as a config-driven one — just re-run with `--resume`, and all prompts are skipped.
 
 If a previous scan's output is detected in `output_path`, the tool offers three choices: **[d]elete** (remove the prior output and start fresh), **[a]ppend** (keep the prior output but re-run all phases), or **[r]esume** (keep the prior output and skip already-completed work, exactly as the `--resume` flag does).
+
+**Changing options on a re-run.** Picking **[d]elete** or **[a]ppend** re-asks every option, with the saved `config.json` values pre-filled as the defaults — so pressing Enter through the prompts reproduces the previous scan, and you can change just the ports, rate, or targets you care about. **[r]esume** skips the prompts, since it is continuing the same scan. The re-prompt applies only to a `config.json` the tool generated (one carrying `__generated_by_prompts__`); a config you wrote by hand keeps the strict skip-all-prompts behavior described above. Remove that key to opt out, or delete `config.json` entirely to start from scratch.
+
+Re-answering the prompts rewrites `config.json`, **merging** rather than overwriting: any keys you added to the file by hand are preserved.
 
 To resume an interrupted scan without any prompts, use the `--resume` flag:
 
@@ -143,10 +149,15 @@ git update-index --no-skip-worktree ranges.txt
 | `target_file` | Path | One IP, CIDR, or hostname per line; `ranges.txt` is committed as a blank placeholder (see below) |
 | `output_path` | Path | Directory for all output; relative paths resolve to script dir |
 | `exclusions_file` | Path | IPs/CIDRs to exclude; SpooNMAP pre-computes the set intersection with the target file and passes only the net target IPs to masscan (see below) |
-| `nmap_threads` | Integer | Concurrent nmap processes (default: 5) |
-| `masscan_batch_size` | Integer | Ports per masscan invocation (default: 5) |
-| `nmap_threshold` | Integer | Work-unit threshold for tool selection (default: 5,000,000 — see below) |
+| `nmap_threads` | Integer | Concurrent nmap processes (default: 5); prompted under "Tune advanced settings" |
+| `masscan_batch_size` | Integer | Ports per masscan invocation (default: 5); prompted under "Tune advanced settings" |
+| `nmap_threshold` | Integer | Work-unit threshold for tool selection (default: 5,000,000 — see below); prompted under "Tune advanced settings" |
 | `resume` | `"True"` / `"False"` | Skip completed port discovery on restart (default: False) |
+| `__generated_by_prompts__` | String | Present only in a config the prompts wrote. While it is present, **[d]elete**/**[a]ppend** re-ask the options using this file's values as defaults; remove it to keep them fixed |
+
+Keys beginning and ending with `__` are documentation and are ignored by the loader, so you can annotate the file freely — a re-prompted run preserves them.
+
+The three concurrency and tool-selection keys above are not asked about individually. The prompts end with a single **"Tune advanced settings?"** question (default: No); answering yes asks for all three, pre-filled with their current values.
 
 ### max_rate guidance
 Rates that are too high can create a denial-of-service condition — use caution.
