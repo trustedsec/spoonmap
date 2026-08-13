@@ -735,19 +735,25 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
         masscan_cmd.extend(['--excludefile', exclusions_file])
 
     term_state = save_terminal_state()
+    progress_thread = None
 
     try:
         masscan_process = subprocess.Popen(
             masscan_cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             preexec_fn=_raise_fd_limit,
         )
+        progress_thread = threading.Thread(target=_stream_masscan_progress, args=(masscan_process,), daemon=True)
+        progress_thread.start()
         masscan_process.wait()
+        progress_thread.join()
     except KeyboardInterrupt:
         print(f'Killing PID {str(masscan_process.pid)}...')
         masscan_process.kill()
         masscan_process.wait()
+        if progress_thread:
+            progress_thread.join()
         restore_terminal_state(term_state)
         raise
     except FileNotFoundError:

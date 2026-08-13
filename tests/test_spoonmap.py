@@ -5059,6 +5059,9 @@ class TestRunMasscanBatchWaitMinimum:
         mock_proc = MagicMock()
         mock_proc.wait.return_value = 0
         mock_proc.pid = 12345
+        # Finite stderr so _stream_masscan_progress()'s read(1) loop terminates;
+        # a bare MagicMock would return truthy bytes forever and hang the join.
+        mock_proc.stderr = io.BytesIO(b'')
         return mock_proc
 
     def _captured_wait_arg(self, mock_popen):
@@ -5116,6 +5119,9 @@ class TestRunMasscanBatchBehavior:
         mock_proc.wait.return_value = 0
         mock_proc.returncode = returncode
         mock_proc.pid = 12345
+        # Finite stderr so _stream_masscan_progress()'s read(1) loop terminates;
+        # a bare MagicMock would return truthy bytes forever and hang the join.
+        mock_proc.stderr = io.BytesIO(b'')
         return mock_proc
 
     def test_parses_tcp_and_udp_results(self, tmp_path):
