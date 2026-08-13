@@ -1117,6 +1117,40 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
     return status_summary
 
 
+def _flag_suspected_tarpits(port_ips, tcp_port_count):
+    """Return {ip: (open_count, tcp_port_count)} for hosts open on nearly every scanned TCP port.
+
+    Real hosts rarely have more than a handful of TCP ports listening; a host
+    that answers open on almost every probed port is characteristic of a
+    tarpit/decoy tool (e.g. LaBrea, portspoof) rather than a genuine service host.
+    """
+    if tcp_port_count < HONEYPOT_MIN_PORTS_SCANNED:
+        return {}
+    host_counts = {}
+    for port_key, ips in port_ips.items():
+        if port_key.startswith('U:'):
+            continue
+        for ip in ips:
+            host_counts[ip] = host_counts.get(ip, 0) + 1
+    threshold = max(HONEYPOT_MIN_PORTS_SCANNED, int(tcp_port_count * HONEYPOT_OPEN_PORT_FRACTION))
+    return {ip: (count, tcp_port_count) for ip, count in host_counts.items() if count >= threshold}
+
+
+def _report_suspected_tarpits(suspected, disc):
+    """Persist suspected-tarpit hosts to disc/suspected_tarpits.txt and warn on stdout."""
+    if not suspected:
+        return
+    tarpit_file = os.path.join(disc, 'suspected_tarpits.txt')
+    with open(tarpit_file, 'w') as fh:
+        for ip in sorted(suspected, key=lambda x: tuple(int(o) for o in x.split('.'))):
+            open_count, total = suspected[ip]
+            fh.write(f'{ip},{open_count},{total}\n')
+            print(_COLOR_ERROR
+                  + f'Warning: {ip} responded open on {open_count}/{total} scanned TCP ports '
+                  + '— likely a tarpit/decoy host, not a real service host.'
+                  + _COLOR_RESET)
+
+
 def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file, batch_size=1, resume=False, discovery_file=None, target_scan='Internal'):
     status_summary = '\nSummary'
 
@@ -1164,6 +1198,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                 and os.path.getmtime(output_file) >= full_targets_mtime):
             print(_COLOR_INFO + 'Resume: skipping completed Full port scan' + _COLOR_RESET)
             live_hosts_dir = f'{disc}/live_hosts'
+            full_results = {}
             if os.path.exists(live_hosts_dir):
                 for fname in sorted(os.listdir(live_hosts_dir)):
                     if not (fname.startswith('port') and fname.endswith('.txt')
@@ -1173,10 +1208,12 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                     with open(os.path.join(live_hosts_dir, fname)) as fh:
                         ips = {line.strip() for line in fh if line.strip()}
                     if ips:
+                        full_results[port_key] = ips
                         host_count = len(ips)
                         status_update = f'\nHosts Found on Port {port_key}: {host_count}'
                         status_summary += status_update
                         print(_COLOR_PROGRESS + status_update + _COLOR_RESET)
+            _report_suspected_tarpits(_flag_suspected_tarpits(full_results, 65535), disc)
             return status_summary
         print(_COLOR_INFO + 'Full port scan: running masscan 1-65535 (no probe)...' + _COLOR_RESET)
         full_results = _run_masscan_batch(['1-65535'], full_scan_rate, output_file,
@@ -1191,6 +1228,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             status_update = f'\nHosts Found on Port {port_key}: {host_count}'
             status_summary += status_update
             print(_COLOR_PROGRESS + status_update + _COLOR_RESET)
+        _report_suspected_tarpits(_flag_suspected_tarpits(full_results, 65535), disc)
         return status_summary
 
     probe_priority = EXTERNAL_PROBE_PORT_PRIORITY if scan_type == 'External' else PROBE_PORT_PRIORITY
@@ -1390,6 +1428,8 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                     print(_COLOR_PROGRESS + status_update + _COLOR_RESET)
 
             _print_completion_status('Masscan', batch_idx + 1, total_batches, scan_start_time)
+
+    _report_suspected_tarpits(_flag_suspected_tarpits(port_ips, len(tcp_ports)), disc)
 
     # ── SMB port coupling ─────────────────────────────────────────────────────
     smb_in_scope = [p for p in _SMB_COUPLED_PORTS if p in set(dest_ports)]
@@ -1787,6 +1827,18 @@ SLOW_PORTS = frozenset({
     '139', '445',                    # SMB — high-value, easily crowded out in multi-port batches
     '389', '636', '3268', '3269',    # LDAP / Global Catalog family
 })
+
+# Suspected honeypot/tarpit heuristics.
+# 1) Masscan side: a host that answers open on nearly every scanned TCP port
+#    (LaBrea, portspoof, and similar tarpits open everything) rather than the
+#    handful a real host would have listening.
+# 2) Nmap side: several open ports on one host whose -sV probe captured data
+#    that matched none of nmap's service signatures — consistent with decoys
+#    (e.g. Artillery) that hand back a random string on every full connect
+#    instead of speaking the expected protocol.
+HONEYPOT_MIN_PORTS_SCANNED = 10      # need enough sample size to trust the ratio
+HONEYPOT_OPEN_PORT_FRACTION = 0.9    # fraction of scanned TCP ports found open on one host
+HONEYPOT_MIN_UNMATCHED_PORTS = 3     # open ports with an unidentified (servicefp) response
 
 # Scripts run on EXTERNAL scans only
 EXTERNAL_PORT_SCRIPTS = {
@@ -2280,6 +2332,41 @@ def _classify_sql(hostname, ms_sql_output='', azure_output=''):
     return False, None, year
 
 
+def _count_unmatched_service_ports(output_path):
+    """Return {ip: count} of open TCP ports whose nmap -sV probe captured data
+    that matched none of nmap's service signatures.
+
+    nmap only sets the service element's servicefp attribute when it connected,
+    read data back, and failed to identify it against any known protocol —
+    a strong tell for decoy tools (e.g. Artillery) that hand back a random
+    string on every full connect instead of speaking a real protocol.
+    """
+    nmap_dir = f'{output_path}/nmap_results'
+    counts = {}
+    if not os.path.exists(nmap_dir):
+        return counts
+    for fname in sorted(os.listdir(nmap_dir)):
+        if not fname.endswith('.xml') or fname.startswith('portU_'):
+            continue
+        try:
+            root = etree.parse(f'{nmap_dir}/{fname}')
+        except etree.ParseError:
+            continue
+        for host in root.findall('host'):
+            addr_elem = host.find("address[@addrtype='ipv4']")
+            if addr_elem is None:
+                continue
+            ip = addr_elem.attrib['addr']
+            for port_elem in host.iter('port'):
+                state_elem = port_elem.find('state')
+                if state_elem is not None and state_elem.attrib.get('state') != 'open':
+                    continue
+                service_elem = port_elem.find('service')
+                if service_elem is not None and service_elem.attrib.get('servicefp'):
+                    counts[ip] = counts.get(ip, 0) + 1
+    return counts
+
+
 def generate_findings(output_path, target_scan, snmp_any_validated=None):
     """Parse nmap script output and write findings.txt and findings.md."""
     nmap_dir = f'{output_path}/nse_results'
@@ -2351,6 +2438,35 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                 ip = line.strip()
                 if ip:
                     printer_ips.add(ip)
+
+    # ── suspected honeypot / tarpit hosts ─────────────────────────────────────
+    tarpit_hosts = {}   # {ip: (open_count, total_scanned)}
+    tarpit_file = f'{_disc(output_path)}/suspected_tarpits.txt'
+    if os.path.exists(tarpit_file):
+        with open(tarpit_file) as fh:
+            for line in fh:
+                parts = line.strip().split(',')
+                if len(parts) == 3:
+                    ip, open_count, total = parts
+                    tarpit_hosts[ip] = (int(open_count), int(total))
+
+    unmatched_counts = _count_unmatched_service_ports(output_path)  # {ip: count}
+    unmatched_flagged = {ip for ip, count in unmatched_counts.items()
+                         if count >= HONEYPOT_MIN_UNMATCHED_PORTS}
+
+    for ip in sorted(set(tarpit_hosts) | unmatched_flagged):
+        reasons = []
+        if ip in tarpit_hosts:
+            open_count, total = tarpit_hosts[ip]
+            reasons.append(f'{open_count}/{total} scanned TCP ports responded open')
+        if ip in unmatched_flagged:
+            reasons.append(f'{unmatched_counts[ip]} open ports returned data matching '
+                            'no known service signature')
+        add('MEDIUM', ip, 'multiple', 'Likely Honeypot / Decoy Host',
+            '; '.join(reasons) + '. Consistent with tarpit/decoy tooling (e.g. LaBrea, '
+            'portspoof, Artillery) rather than a genuine service host. Recommend '
+            'deprioritizing further enumeration of this host and manually validating '
+            'before trusting other findings collected from it.')
 
     # ── parse every nmap XML result file ─────────────────────────────────────
     open_ports_by_host = {}  # {ip: [port_key, ...]} — for external exposure check
@@ -4192,11 +4308,20 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                     print(f'\t({i}) {name}  [{", ".join(ports)}]')
                 full_n = len(category_names) + 1
                 print(f'\t({full_n}) Full Port Scan  [1-65535]')
+                print(f'\t(a) All Categories  [{", ".join(category_names)}]')
                 print(f'\t(c) Custom Port Scan  [enter your own comma-separated ports]')
 
                 selection = input(
-                    f'\nWhich categories would you like to scan (e.g. 1,3 — {selection_hint})? '
+                    f'\nWhich categories would you like to scan (e.g. 1,3 / all / full / c — {selection_hint})? '
                 ).strip()
+
+                if selection.lower() in ('a', 'all'):
+                    scan_type = 'All'
+                    scan_categories = 'All'
+                    all_ports = [p for cat in SERVICE_CATEGORIES.values() for p in cat]
+                    dest_ports = [p for p in all_ports if not p.startswith('U:')] + \
+                                 [p for p in all_ports if p.startswith('U:')]
+                    break
 
                 if selection in (str(full_n), 'full', 'f'):
                     scan_type = 'Full'

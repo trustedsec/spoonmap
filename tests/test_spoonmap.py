@@ -22,6 +22,9 @@ from spoonmap import (
     EXTERNAL_PORT_SCRIPTS,
     EXTERNAL_PROBE_PORT_PRIORITY,
     EXTERNAL_SENSITIVE_PORTS,
+    HONEYPOT_MIN_PORTS_SCANNED,
+    HONEYPOT_MIN_UNMATCHED_PORTS,
+    HONEYPOT_OPEN_PORT_FRACTION,
     HOST_DISCOVERY_NMAP_THRESHOLD,
     INTERNAL_DISCOVERY_MAX_RATE,
     INTERNAL_DISCOVERY_STATE_CEILING,
@@ -35,6 +38,7 @@ from spoonmap import (
     _build_repro_cmd,
     _classify_sql,
     _count_hosts_in_file,
+    _count_unmatched_service_ports,
     _external_exposure_scripts,
     _format_eta,
     _raise_fd_limit,
@@ -53,7 +57,9 @@ from spoonmap import (
     _discover_external_masscan,
     _discover_internal_masscan,
     _external_host_discovery,
+    _flag_suspected_tarpits,
     _nmap_host_discovery,
+    _report_suspected_tarpits,
     _stream_masscan_progress,
     preprocess_targets,
     _discovery_wait,
@@ -1422,6 +1428,149 @@ class TestGenerateFindings:
         assert 'public' in content
 
 
+class TestCountUnmatchedServicePorts:
+    """Unit tests for _count_unmatched_service_ports()."""
+
+    def _xml(self, ip, port, protocol='tcp', state='open', service_attrs=None):
+        service_elem = ''
+        if service_attrs:
+            attrs = ' '.join(f'{k}="{v}"' for k, v in service_attrs.items())
+            service_elem = f'<service {attrs}/>'
+        return (
+            '<?xml version="1.0"?><nmaprun>'
+            f'<host><address addr="{ip}" addrtype="ipv4"/>'
+            f'<ports><port protocol="{protocol}" portid="{port}">'
+            f'<state state="{state}"/>{service_elem}'
+            '</port></ports></host></nmaprun>'
+        )
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert _count_unmatched_service_ports(str(tmp_path)) == {}
+
+    def test_unmatched_fingerprint_counted(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.1', '9999', service_attrs={
+            'name': 'unknown', 'servicefp': 'SF-Port9999-TCP:V=7.94%I=7%D=1/1%r(NULL,10,abc);',
+        })
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_unmatched_service_ports(str(tmp_path)) == {'10.0.0.1': 1}
+
+    def test_recognized_service_not_counted(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.1', '22', service_attrs={'name': 'ssh', 'product': 'OpenSSH'})
+        (nmap_results / 'port22.xml').write_text(xml)
+        assert _count_unmatched_service_ports(str(tmp_path)) == {}
+
+    def test_closed_port_not_counted_even_with_fingerprint(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.1', '9999', state='closed', service_attrs={
+            'name': 'unknown', 'servicefp': 'SF-Port9999-TCP:...',
+        })
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_unmatched_service_ports(str(tmp_path)) == {}
+
+    def test_udp_files_skipped(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.1', '53', protocol='udp', service_attrs={
+            'name': 'unknown', 'servicefp': 'SF-PortU53...',
+        })
+        (nmap_results / 'portU_53.xml').write_text(xml)
+        assert _count_unmatched_service_ports(str(tmp_path)) == {}
+
+    def test_multiple_ports_same_host_aggregate(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        for port in ('2222', '3333', '4444'):
+            xml = self._xml('10.0.0.1', port, service_attrs={
+                'name': 'unknown', 'servicefp': f'SF-Port{port}-TCP:...',
+            })
+            (nmap_results / f'port{port}.xml').write_text(xml)
+        assert _count_unmatched_service_ports(str(tmp_path)) == {'10.0.0.1': 3}
+
+    def test_malformed_xml_skipped(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        (nmap_results / 'port80.xml').write_text('<nmaprun><host>')
+        assert _count_unmatched_service_ports(str(tmp_path)) == {}
+
+    def test_host_without_ipv4_address_skipped(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="00:11:22:33:44:55" addrtype="mac"/>'
+            '<ports><port protocol="tcp" portid="9999">'
+            '<state state="open"/>'
+            '<service name="unknown" servicefp="SF-Port9999-TCP:..."/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_unmatched_service_ports(str(tmp_path)) == {}
+
+
+class TestGenerateFindingsHoneypot:
+    """generate_findings() 'Likely Honeypot / Decoy Host' finding."""
+
+    def _unmatched_xml(self, ip, port):
+        return (
+            '<?xml version="1.0"?><nmaprun>'
+            f'<host><address addr="{ip}" addrtype="ipv4"/>'
+            f'<ports><port protocol="tcp" portid="{port}">'
+            '<state state="open"/>'
+            f'<service name="unknown" servicefp="SF-Port{port}-TCP:..."/>'
+            '</port></ports></host></nmaprun>'
+        )
+
+    def test_tarpit_file_flags_host(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.1,19,20\n')
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert hp and hp[0]['severity'] == 'MEDIUM'
+        assert hp[0]['host'] == '10.0.0.1'
+        assert '19/20' in hp[0]['detail']
+
+    def test_unmatched_services_flag_host(self, nmap_dir):
+        nmap_results = nmap_dir / 'nmap_results'
+        nmap_results.mkdir()
+        for port in ('2222', '3333', '4444'):
+            (nmap_results / f'port{port}.xml').write_text(self._unmatched_xml('10.0.0.2', port))
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert hp and hp[0]['host'] == '10.0.0.2'
+        assert 'no known service signature' in hp[0]['detail']
+
+    def test_below_unmatched_threshold_not_flagged(self, nmap_dir):
+        nmap_results = nmap_dir / 'nmap_results'
+        nmap_results.mkdir()
+        for port in ('2222', '3333'):  # one short of HONEYPOT_MIN_UNMATCHED_PORTS
+            (nmap_results / f'port{port}.xml').write_text(self._unmatched_xml('10.0.0.3', port))
+        generate_findings(str(nmap_dir), 'Internal')
+        findings_file = nmap_dir / 'findings.txt'
+        if findings_file.exists():
+            assert 'Likely Honeypot' not in findings_file.read_text()
+
+    def test_both_signals_combine_in_one_finding(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.4,20,20\n')
+        nmap_results = nmap_dir / 'nmap_results'
+        nmap_results.mkdir()
+        for port in ('2222', '3333', '4444'):
+            (nmap_results / f'port{port}.xml').write_text(self._unmatched_xml('10.0.0.4', port))
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert len(hp) == 1
+        assert '20/20' in hp[0]['detail']
+        assert 'no known service signature' in hp[0]['detail']
+
+
 # ── _previous_results_exist / _delete_previous_results ───────────────────────
 
 class TestPreviousResults:
@@ -1614,6 +1763,77 @@ class TestFullPortScan:
 
         assert not mock_batch.called
         assert 'Hosts Found on Port 22: 2' in result
+
+    def test_full_scan_flags_suspected_tarpit(self, tmp_path, capsys):
+        spoonmap.output_path = str(tmp_path)
+        # 15 distinct open ports on one host trips the ratio once the fraction
+        # threshold is lowered — real full scans reaching 90% of 65535 is the
+        # realistic trigger, but that's impractical to construct in a test.
+        fake_results = {str(p): {'10.0.0.9'} for p in range(15)}
+        with patch('spoonmap._run_masscan_batch', return_value=fake_results), \
+             patch('spoonmap.HONEYPOT_OPEN_PORT_FRACTION', 0.0001):
+            mass_scan('Full', ['1-65535'], '53', '10000', '/fake/targets.txt', '')
+        tarpit_file = tmp_path / 'discovery' / 'suspected_tarpits.txt'
+        assert tarpit_file.exists()
+        assert '10.0.0.9' in tarpit_file.read_text()
+        assert 'tarpit' in capsys.readouterr().out.lower()
+
+    def test_full_scan_no_tarpit_flag_for_normal_host_count(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        fake_results = {'22': {'10.0.0.1'}, '80': {'10.0.0.1'}, '443': {'10.0.0.1'}}
+        with patch('spoonmap._run_masscan_batch', return_value=fake_results):
+            mass_scan('Full', ['1-65535'], '53', '10000', '/fake/targets.txt', '')
+        assert not (tmp_path / 'discovery' / 'suspected_tarpits.txt').exists()
+
+    def test_full_scan_resume_flags_suspected_tarpit(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        live_dir = disc / 'live_hosts'
+        live_dir.mkdir(parents=True)
+        (disc / 'masscan_results' / 'portFull.xml').write_text('<nmaprun/>')
+        for p in range(15):
+            (live_dir / f'port{p}.txt').write_text('10.0.0.9\n')
+
+        with patch('spoonmap._run_masscan_batch') as mock_batch, \
+             patch('spoonmap.HONEYPOT_OPEN_PORT_FRACTION', 0.0001):
+            mass_scan('Full', ['1-65535'], '53', '10000',
+                      '/fake/targets.txt', '', resume=True)
+
+        assert not mock_batch.called
+        tarpit_file = disc / 'suspected_tarpits.txt'
+        assert tarpit_file.exists()
+        assert '10.0.0.9' in tarpit_file.read_text()
+
+
+class TestMassScanTarpitFlag:
+    """mass_scan() batch-path wiring of the suspected-tarpit check (non-Full scans)."""
+
+    def test_batch_scan_flags_suspected_tarpit(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        # batch_size == len(tcp_ports) puts every port into the single
+        # two-call probe (fast + slow), so port_ips is fully populated with
+        # no further main-batch iterations needed.
+        tcp_ports = [str(2000 + i) for i in range(15)]
+        fast_response = {p: {'10.0.0.9'} for p in tcp_ports}
+        with patch('spoonmap._run_masscan_batch', side_effect=[fast_response, {}]):
+            mass_scan('All', tcp_ports, '88', '1000',
+                      '/fake/targets.txt', '', batch_size=len(tcp_ports))
+        tarpit_file = tmp_path / 'discovery' / 'suspected_tarpits.txt'
+        assert tarpit_file.exists()
+        assert '10.0.0.9' in tarpit_file.read_text()
+
+    def test_batch_scan_no_tarpit_flag_for_realistic_open_count(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        tcp_ports = [str(2000 + i) for i in range(15)]
+        fast_response = {tcp_ports[0]: {'10.0.0.9'},
+                         tcp_ports[1]: {'10.0.0.9'},
+                         tcp_ports[2]: {'10.0.0.9'}}
+        # Ports missed by the probe are re-queued into one main batch call.
+        with patch('spoonmap._run_masscan_batch', side_effect=[fast_response, {}, {}]):
+            mass_scan('All', tcp_ports, '88', '1000',
+                      '/fake/targets.txt', '', batch_size=len(tcp_ports))
+        assert not (tmp_path / 'discovery' / 'suspected_tarpits.txt').exists()
 
 
 # ── Config: Full scan_categories ──────────────────────────────────────────────
@@ -5234,6 +5454,68 @@ class TestRunMasscanBatchBehavior:
                 _run_masscan_batch(['445'], '1000', str(output_xml),
                                    '/fake/targets.txt', None, None)
         assert mock_proc.kill.called
+
+
+class TestFlagSuspectedTarpits:
+    """Unit tests for _flag_suspected_tarpits()."""
+
+    def test_host_open_on_all_ports_flagged(self):
+        tcp_ports = [str(p) for p in range(20)]
+        port_ips = {p: {'10.0.0.1'} for p in tcp_ports}
+        result = _flag_suspected_tarpits(port_ips, len(tcp_ports))
+        assert result == {'10.0.0.1': (20, 20)}
+
+    def test_host_open_on_few_ports_not_flagged(self):
+        tcp_ports = [str(p) for p in range(20)]
+        port_ips = {p: set() for p in tcp_ports}
+        port_ips['0'] = {'10.0.0.1'}
+        port_ips['1'] = {'10.0.0.1'}
+        result = _flag_suspected_tarpits(port_ips, len(tcp_ports))
+        assert result == {}
+
+    def test_below_minimum_ports_scanned_never_flags(self):
+        # Even a host open on every scanned port is not flagged when the sample
+        # size is too small to trust (HONEYPOT_MIN_PORTS_SCANNED not met).
+        tcp_port_count = HONEYPOT_MIN_PORTS_SCANNED - 1
+        port_ips = {str(p): {'10.0.0.1'} for p in range(tcp_port_count)}
+        result = _flag_suspected_tarpits(port_ips, tcp_port_count)
+        assert result == {}
+
+    def test_udp_ports_ignored(self):
+        tcp_port_count = HONEYPOT_MIN_PORTS_SCANNED
+        port_ips = {str(p): {'10.0.0.1'} for p in range(tcp_port_count)}
+        # A pile of UDP entries for the same host must not count toward the ratio.
+        port_ips.update({f'U:{p}': {'10.0.0.1'} for p in range(100)})
+        result = _flag_suspected_tarpits(port_ips, tcp_port_count)
+        assert result == {'10.0.0.1': (tcp_port_count, tcp_port_count)}
+
+    def test_fraction_boundary_just_under_threshold_not_flagged(self):
+        tcp_port_count = 100
+        open_count = int(tcp_port_count * HONEYPOT_OPEN_PORT_FRACTION) - 1
+        port_ips = {str(p): {'10.0.0.1'} for p in range(open_count)}
+        for p in range(open_count, tcp_port_count):
+            port_ips[str(p)] = set()
+        result = _flag_suspected_tarpits(port_ips, tcp_port_count)
+        assert result == {}
+
+
+class TestReportSuspectedTarpits:
+    """Unit tests for _report_suspected_tarpits()."""
+
+    def test_writes_file_and_warns(self, tmp_path, capsys):
+        suspected = {'10.0.0.1': (19, 20)}
+        _report_suspected_tarpits(suspected, str(tmp_path))
+        content = (tmp_path / 'suspected_tarpits.txt').read_text()
+        assert content.strip() == '10.0.0.1,19,20'
+        out = capsys.readouterr().out
+        assert '10.0.0.1' in out
+        assert '19/20' in out
+        assert 'tarpit' in out.lower()
+
+    def test_empty_suspected_writes_nothing(self, tmp_path, capsys):
+        _report_suspected_tarpits({}, str(tmp_path))
+        assert not (tmp_path / 'suspected_tarpits.txt').exists()
+        assert capsys.readouterr().out == ''
 
 
 # ── TestSMBCoupling ────────────────────────────────────────────────────────────
