@@ -2465,12 +2465,25 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
     tarpit_hosts = {}   # {ip: (open_count, total_scanned)}
     tarpit_file = f'{_disc(output_path)}/suspected_tarpits.txt'
     if os.path.exists(tarpit_file):
-        with open(tarpit_file) as fh:
-            for line in fh:
-                parts = line.strip().split(',')
-                if len(parts) == 3:
-                    ip, open_count, total = parts
-                    tarpit_hosts[ip] = (int(open_count), int(total))
+        # _report_suspected_tarpits() writes this file line by line, not
+        # atomically, so an interrupt or a full disk can leave a partial final
+        # line ('10.0.0.1,5,') that has three comma-separated parts but does
+        # not parse as two ints. A corrupt state file must degrade to "no
+        # tarpit data", never take down the findings phase — which is the last
+        # thing to run, so a crash here loses all three findings files and
+        # recurs on every later run until something rewrites the file.
+        try:
+            with open(tarpit_file) as fh:
+                for line in fh:
+                    parts = line.strip().split(',')
+                    if len(parts) == 3:
+                        ip, open_count, total = parts
+                        try:
+                            tarpit_hosts[ip] = (int(open_count), int(total))
+                        except ValueError:
+                            continue
+        except OSError:
+            tarpit_hosts = {}
 
     unmatched_counts = _count_unmatched_service_ports(output_path)  # {ip: count}
     unmatched_flagged = {ip for ip, count in unmatched_counts.items()

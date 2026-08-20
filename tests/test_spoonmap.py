@@ -1576,6 +1576,32 @@ class TestGenerateFindingsHoneypot:
         assert '20/20' in hp[0]['detail']
         assert 'no known service signature' in hp[0]['detail']
 
+    def test_truncated_tarpit_line_skipped_good_line_kept(self, nmap_dir):
+        # _report_suspected_tarpits() writes line by line, so an interrupt can
+        # leave a partial final line with three parts but empty numerics. That
+        # must not abort findings generation — the good line still counts.
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text(
+            '10.0.0.5,18,20\n10.0.0.6,5,\n10.0.0.7,,20\n')
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert [r['host'] for r in hp] == ['10.0.0.5']
+        assert '18/20' in hp[0]['detail']
+
+    def test_unreadable_tarpit_file_degrades_to_no_data(self, nmap_dir):
+        # os.path.exists() passes but open() raises (e.g. permissions, or the
+        # path is a directory) — findings must still be written.
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').mkdir(parents=True)
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        assert not [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+
+    def test_absent_tarpit_file_no_crash(self, nmap_dir):
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        assert not [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+
 
 # ── _previous_results_exist / _delete_previous_results ───────────────────────
 
