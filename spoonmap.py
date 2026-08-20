@@ -267,6 +267,51 @@ def _ip_in_ranges(value, merged_ranges):
     return start <= addr <= end
 
 
+def _report_out_of_scope_retained(port_ips, scope_ranges, target_file,
+                                  examples=3):
+    """Warn about retained hosts that fall outside the current target scope.
+
+    Cached ``live_hosts/portN.txt`` entries are unioned into this run's results
+    and are deliberately never deleted — losing a completed scan's output is this
+    tool's worst failure mode, so a narrowed ``ranges.txt`` does not prune them.
+    But ``all_live_hosts.txt`` and ``spoonmap_output.*`` feed engagement
+    deliverables, and a host outside the current scope sitting in those files is
+    a host the operator may report on or pivot to believing it was authorised for
+    this engagement.  Rules-of-engagement violations start exactly there, and it
+    used to be entirely silent.
+
+    So: disclose, never delete, and never filter what gets written.  This prints
+    and returns the offending set; it mutates nothing.  Anything that is not a
+    plain IPv4 address counts as out of scope, because it cannot be shown to be
+    inside it (see _ip_in_ranges).
+
+    An empty *scope_ranges* means there is no parseable authorisation to compare
+    against, so nothing is claimed either way.
+    """
+    if not scope_ranges:
+        return set()
+    stale = {ip
+             for ips in port_ips.values()
+             for ip in ips
+             if not _ip_in_ranges(ip, scope_ranges)}
+    if not stale:
+        return set()
+    shown = sorted(stale, key=_ip_sort_key)[:examples]
+    remainder = len(stale) - len(shown)
+    sample = ', '.join(shown) + (f' (+{remainder} more)' if remainder else '')
+    print(_COLOR_ERROR
+          + f'Warning: {len(stale)} retained host(s) are OUTSIDE the current '
+            f'target scope and were NOT scanned this run: {sample}. These are '
+            'cached results from an earlier run against a wider scope. '
+            'They are kept in live_hosts/ and all_live_hosts.txt on purpose — '
+            'completed scan results are never deleted — but they are not in '
+            f'{target_file}, and nothing was sent to them this run. Confirm they '
+            'are in scope for this engagement before reporting on or pivoting to '
+            'them.'
+          + _COLOR_RESET)
+    return stale
+
+
 def _build_discovery_target_file(target_file, exclusions_file, disc):
     """Pre-subtract exclusions from target ranges and write a masscan-ready file.
 
@@ -1490,6 +1535,12 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                     if (discovery_file and os.path.exists(discovery_file))
                     else target_file)
 
+    # The operator's current authorised scope, parsed once per call: used both to
+    # decide which cached hosts may be folded into the batch target and to
+    # disclose the ones that are retained but out of scope.  Empty when
+    # target_file is absent or holds nothing parseable, which disables both.
+    scope_ranges = _merge_ranges(_parse_target_ranges(target_file))
+
     # Full port scan: skip adaptive probe, run single masscan over 1-65535
     disc = _disc(output_path)
     if scan_type == 'Full':
@@ -1523,6 +1574,9 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                         status_summary += status_update
                         print(_COLOR_PROGRESS + status_update + _COLOR_RESET)
             _report_suspected_tarpits(_flag_suspected_tarpits(full_results, 65535), disc)
+            # This path's results are read straight back off disk, so it is the
+            # most exposed to a live_hosts/ directory left over from a wider scope.
+            _report_out_of_scope_retained(full_results, scope_ranges, target_file)
             return status_summary
         print(_COLOR_INFO + 'Full port scan: running masscan 1-65535 (no probe)...' + _COLOR_RESET)
         full_results = _run_masscan_batch(['1-65535'], full_scan_rate, output_file,
@@ -1678,13 +1732,12 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         # out-of-scope cached host keeps its place in live_hosts/portN.txt but
         # never becomes a target.  An unparseable target file yields no ranges
         # and folds nothing, which is the pre-existing behaviour.
-        _scope_ranges = _merge_ranges(_parse_target_ranges(target_file))
-        if _scope_ranges:
+        if scope_ranges:
             _cached_in_scope = {
                 ip
                 for port_key in probe_ports_used
                 for ip in port_ips.get(port_key, ())
-                if ip not in _combined_ips and _ip_in_ranges(ip, _scope_ranges)
+                if ip not in _combined_ips and _ip_in_ranges(ip, scope_ranges)
             }
             if _cached_in_scope:
                 _combined_ips.update(_cached_in_scope)
@@ -1844,6 +1897,11 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         else:
             print(_COLOR_INFO
                   + f'No hosts found on UDP port {udp_port[2:]}' + _COLOR_RESET)
+
+    # Last, so it covers everything retained — probe ports, batch ports (which
+    # union with their cached files too) and UDP — and so the warning is the final
+    # thing on screen rather than buried above the per-port counts.
+    _report_out_of_scope_retained(port_ips, scope_ranges, target_file)
 
     return status_summary
 

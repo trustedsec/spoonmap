@@ -4415,6 +4415,71 @@ class TestMassScanProbe:
         assert '10.99.0.7' in retained
         assert '9.1.1.1' in retained
 
+    def test_narrowed_scope_warns_about_retained_out_of_scope_hosts(self, tmp_path, capsys):
+        """A narrowed ranges.txt on a resumed run must *say* that cached hosts
+        outside the new scope are still in the output, and must still write them.
+
+        Both halves matter. all_live_hosts.txt and spoonmap_output.* feed
+        engagement deliverables, so an out-of-scope host sitting there unannounced
+        is one an operator may report on or pivot to believing it was authorised —
+        that is where a rules-of-engagement violation starts. But deleting
+        confirmed results is the failure mode this whole area exists to prevent,
+        so the fix is disclosure, never pruning.
+        """
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        # Four leftovers from a previous /8 engagement, one in the current scope.
+        (live_hosts / 'port443.txt').write_text(
+            '10.0.0.1\n10.99.0.7\n10.99.0.8\n10.99.0.9\n10.99.0.10\n')
+        target_file = self._write_scope(tmp_path, '10.0.0.0/24\n')
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      target_file, '', batch_size=1, resume=True)
+
+        out = capsys.readouterr().out
+        assert '4 retained host(s) are OUTSIDE the current target scope' in out
+        assert 'NOT scanned this run' in out
+        assert '10.99.0.7' in out          # a named example
+        assert '(+1 more)' in out          # 4 found, 3 shown
+
+        # ...and every one of them is still retained, per-port and in the
+        # combined deliverable.
+        retained = (live_hosts / 'port443.txt').read_text().split()
+        assert sorted(retained) == ['10.0.0.1', '10.99.0.10', '10.99.0.7',
+                                    '10.99.0.8', '10.99.0.9']
+        _combine_live_hosts(str(tmp_path / 'discovery'), str(tmp_path))
+        combined_output = (tmp_path / 'all_live_hosts.txt').read_text().split()
+        assert sorted(combined_output) == sorted(retained)
+        # But they were never handed to masscan as targets.
+        batch_target = (tmp_path / 'discovery' / 'live_hosts_combined.txt').read_text()
+        assert batch_target.split() == ['10.0.0.1']
+
+    def test_no_warning_when_every_retained_host_is_in_scope(self, tmp_path, capsys):
+        """The warning must not cry wolf on an ordinary resumed scan."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.0.0.2\n')
+        target_file = self._write_scope(tmp_path, '10.0.0.0/24\n')
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      target_file, '', batch_size=1, resume=True)
+
+        assert 'OUTSIDE the current target scope' not in capsys.readouterr().out
+
     def test_non_ipv4_cached_entry_is_not_folded_and_does_not_raise(self, tmp_path):
         """A hostname or IPv6 literal that leaked into a resume file must read as
         out of scope rather than crash the scope check."""
