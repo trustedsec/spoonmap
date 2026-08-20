@@ -267,6 +267,8 @@ def _ip_in_ranges(value, merged_ranges):
     return start <= addr <= end
 
 
+# Retained results are disclosed, never deleted; deletion is exclusively
+# operator-initiated via the [d]elete prompt or --cleanup flag.
 def _report_out_of_scope_retained(port_ips, scope_ranges, target_file,
                                   examples=3):
     """Warn about retained hosts that fall outside the current target scope.
@@ -307,7 +309,8 @@ def _report_out_of_scope_retained(port_ips, scope_ranges, target_file,
             'completed scan results are never deleted — but they are not in '
             f'{target_file}, and nothing was sent to them this run. Confirm they '
             'are in scope for this engagement before reporting on or pivoting to '
-            'them.'
+            'them. To clean them, re-run and select [d]elete at the prompt, '
+            'or use --cleanup.'
           + _COLOR_RESET)
     return stale
 

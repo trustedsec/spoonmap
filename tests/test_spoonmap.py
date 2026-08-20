@@ -4448,6 +4448,8 @@ class TestMassScanProbe:
         assert 'NOT scanned this run' in out
         assert '10.99.0.7' in out          # a named example
         assert '(+1 more)' in out          # 4 found, 3 shown
+        assert '[d]elete' in out           # operator's delete options
+        assert '--cleanup' in out
 
         # ...and every one of them is still retained, per-port and in the
         # combined deliverable.
