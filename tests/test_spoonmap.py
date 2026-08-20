@@ -5945,12 +5945,77 @@ class TestNmapWorker:
 
     def test_stderr_is_captured_not_discarded(self, tmp_path):
         """stderr must be piped (so failures are diagnosable) while stdout stays
-        DEVNULL, and start_new_session must survive the change."""
+        DEVNULL, and start_new_session must survive the change.
+
+        Piping alone is not enough — an undrained pipe is worse than DEVNULL —
+        so the behavioural half of this contract lives in
+        test_stderr_is_drained_while_the_worker_polls below.
+        """
         _, mock_popen, _, _, _ = self._run(tmp_path)
         kwargs = mock_popen.call_args[1]
         assert kwargs['stderr'] is spoonmap.subprocess.PIPE
         assert kwargs['stdout'] is spoonmap.subprocess.DEVNULL
         assert kwargs['start_new_session'] is True
+
+    def test_stderr_is_drained_while_the_worker_polls(self, tmp_path):
+        """Regression: the same deadlock as #25, reintroduced in nmap_worker.
+
+        Piping stderr without draining it means nmap blocks in write() once the
+        ~64 KB pipe buffer fills (a -sV pass against a few thousand hosts on a
+        filtered port emits one line per retransmission-cap hit). The worker's
+        poll() then never returns non-None and work_queue.join() in nmap_scan()
+        hangs forever — a scan that silently stops progressing. A MagicMock is
+        not a real pipe, so this models the kernel's behaviour instead: the
+        child cannot exit until a reader has arrived, i.e. poll() keeps
+        returning None until something consumes stderr. With the pre-fix code
+        (read only inside the failure path, after wait()) the worker never
+        leaves the poll loop and is still alive after the bounded join.
+        """
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/nmap_results', exist_ok=True)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts', exist_ok=True)
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n')
+
+        stderr_touched = threading.Event()
+
+        class _WatchedStderr(io.StringIO):
+            """Signals as soon as anything starts consuming the stream."""
+
+            def __iter__(self):
+                stderr_touched.set()
+                return io.StringIO.__iter__(self)
+
+            def read(self, *args, **kwargs):
+                stderr_touched.set()
+                return io.StringIO.read(self, *args, **kwargs)
+
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.wait.return_value = 0
+        proc.stderr = _WatchedStderr(
+            'nmap: giving up on port 445 after 10 retransmissions\n' * 1200)
+        proc.poll.side_effect = lambda: 0 if stderr_touched.is_set() else None
+
+        work_queue = Queue()
+        work_queue.put('port80.txt')
+        work_queue.put(None)
+        completed_count = [0]
+        interrupt_event = threading.Event()
+
+        def _run():
+            with patch('spoonmap._build_nmap_cmd', return_value=['nmap', 'fake']), \
+                 patch('spoonmap._get_scripts_for_port', return_value=''), \
+                 patch('spoonmap.subprocess.Popen', return_value=proc):
+                nmap_worker(work_queue, completed_count, 1, '88', threading.Lock(),
+                            interrupt_event, None)
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert stderr_touched.is_set()
+        assert completed_count[0] == 1
 
 
 def _fake_worker_drain(work_queue, completed_count, total_count, source_port, lock,

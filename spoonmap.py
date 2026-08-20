@@ -1153,6 +1153,30 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
     return ips
 
 
+def _start_stderr_reader(stderr_stream):
+    """Drain *stderr_stream* on a daemon thread; return ``(thread, lines)``.
+
+    Must run concurrently with the wait()/poll() that reaps the child: nmap
+    emits one stderr line per failed packet send, and if nobody drains the pipe
+    the child blocks in write() once the ~64 KB buffer fills — so wait() never
+    returns and poll() never stops returning None.  Callers join *thread* after
+    the child is reaped and then ``''.join(lines)`` for the full text.
+
+    One helper rather than a per-call-site closure: this exact deadlock has now
+    been introduced twice in this module (issues #25 and the nmap_worker
+    regression), so there is a single idiom to reuse.
+    """
+    lines = []
+
+    def _stderr_reader():
+        for line in stderr_stream:
+            lines.append(line)
+
+    thread = threading.Thread(target=_stderr_reader, daemon=True)
+    thread.start()
+    return thread, lines
+
+
 def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
                          scan_type='Full', resume=False, max_rate=None, total_hosts=None):
     """Run nmap -T4 port discovery in place of masscan for small target sets.
@@ -1251,15 +1275,6 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
             if re.search(r'About\s+[\d.]+%\s+done', line):
                 print(_COLOR_PROGRESS + f'  [nmap] {line}' + _COLOR_RESET, flush=True)
 
-    stderr_lines = []
-
-    def _stderr_reader(stderr_stream):
-        # Must run concurrently with proc.wait(): nmap emits one stderr line per
-        # failed packet send, and if nobody drains the pipe it blocks in write()
-        # once the ~64 KB buffer fills, so wait() would never return.
-        for line in stderr_stream:
-            stderr_lines.append(line)
-
     term_state = save_terminal_state()
     # SIGINT inside Popen() leaves proc unbound; a bare proc.kill() below then
     # raised UnboundLocalError in place of the KeyboardInterrupt.
@@ -1269,8 +1284,7 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
                                 stderr=subprocess.PIPE, text=True)
         _t = threading.Thread(target=_progress_reader, args=(proc.stdout,), daemon=True)
         _t.start()
-        _et = threading.Thread(target=_stderr_reader, args=(proc.stderr,), daemon=True)
-        _et.start()
+        _et, stderr_lines = _start_stderr_reader(proc.stderr)
         proc.wait()
         _t.join()
         _et.join()
@@ -1770,14 +1784,18 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 target_scan='Internal', start_time=None):
     """Worker thread function to process NMAP scans from queue"""
 
-    def _report_nmap_failure(pass_label, dest_port, proc):
+    def _report_nmap_failure(pass_label, dest_port, proc, stderr_output):
         """Print a diagnostic for a non-zero nmap exit that was not an interrupt.
 
         Callers must confirm interrupt_event is clear first: a deliberately
         killed nmap also exits non-zero, and reporting that as a failure would
         spam an error for every port on Ctrl-C.
+
+        *stderr_output* comes from the concurrent drain started at Popen() time,
+        never from a read() after the fact: reading only on the failure path
+        leaves the pipe unread while the worker polls, which deadlocks the whole
+        scan the moment nmap exceeds the pipe buffer (see _start_stderr_reader).
         """
-        stderr_output = proc.stderr.read() if proc.stderr is not None else ''
         with lock:
             print(_COLOR_ERROR
                   + f'Error: nmap {pass_label} for port {dest_port} exited with code '
@@ -1834,8 +1852,12 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 # between nmap and spoonmap in either direction, making external
                 # `kill <nmap_pid>` safe without stopping the overall scan.
                 # stderr is captured rather than discarded so a non-zero exit
-                # (bad port spec, missing privileges, disk full) is reportable;
-                # nmap's stderr is short, so buffering it is cheap.
+                # (bad port spec, missing privileges, disk full) is reportable.
+                # It MUST be drained concurrently: a -sV pass against a few
+                # thousand hosts on a filtered port emits a stderr line per
+                # retransmission-cap hit, and once that fills the ~64 KB pipe
+                # buffer nmap blocks in write() — poll() then never returns
+                # non-None and work_queue.join() in nmap_scan() hangs forever.
                 nmap_process = subprocess.Popen(
                     nmap_cmd,
                     stdout=subprocess.DEVNULL,
@@ -1843,6 +1865,7 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                     text=True,
                     start_new_session=True,
                 )
+                nmap_err_thread, nmap_err_lines = _start_stderr_reader(nmap_process.stderr)
 
                 # Poll process to allow interrupt checking; wake immediately on interrupt
                 while nmap_process.poll() is None and not interrupt_event.is_set():
@@ -1851,8 +1874,10 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 if interrupt_event.is_set() and nmap_process.poll() is None:
                     nmap_process.kill()
                     nmap_process.wait()
+                    nmap_err_thread.join()
                 else:
                     nmap_process.wait()
+                    nmap_err_thread.join()
 
                     if interrupt_event.is_set():
                         # Exited on its own during an interrupt — neither a
@@ -1862,7 +1887,8 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                         # Failed scan: leave completed_count alone so the
                         # progress percentage does not claim work that produced
                         # no (or truncated) XML.
-                        _report_nmap_failure('banner scan', dest_port, nmap_process)
+                        _report_nmap_failure('banner scan', dest_port, nmap_process,
+                                             ''.join(nmap_err_lines))
                     else:
                         with lock:
                             completed_count[0] += 1
@@ -1890,15 +1916,20 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                             text=True,
                             start_new_session=True,
                         )
+                        # Same concurrent drain as the banner pass: an NSE run
+                        # can be even chattier on stderr (per-script warnings).
+                        nse_err_thread, nse_err_lines = _start_stderr_reader(nse_process.stderr)
                         while nse_process.poll() is None and not interrupt_event.is_set():
                             interrupt_event.wait(0.1)
                         if interrupt_event.is_set() and nse_process.poll() is None:
                             nse_process.kill()
                         nse_process.wait()
+                        nse_err_thread.join()
                         # A killed process also exits non-zero, so only report
                         # when no interrupt is in flight.
                         if nse_process.returncode != 0 and not interrupt_event.is_set():
-                            _report_nmap_failure('NSE script pass', dest_port, nse_process)
+                            _report_nmap_failure('NSE script pass', dest_port, nse_process,
+                                                 ''.join(nse_err_lines))
 
             except FileNotFoundError:
                 with lock:
