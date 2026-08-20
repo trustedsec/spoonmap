@@ -1640,7 +1640,16 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                 _atomic_write(combined_path,
                               ''.join(ip + '\n' for ip in
                                       sorted(_combined_ips, key=_ip_sort_key)))
-            except OSError as e:
+            # `Exception`, not `OSError`: _atomic_write() cleans up and re-raises
+            # whatever it caught, so a non-OSError failure (a TypeError from a
+            # non-str entry that leaked into the set, a rename hook raising
+            # something else) still unwound mass_scan() and lost the whole run's
+            # aggregation — the very outcome the fallback was added to prevent.
+            # Deliberately not BaseException: a KeyboardInterrupt here means the
+            # operator wants the scan stopped, and swallowing it into "carry on
+            # with the full target file" would make Ctrl-C escalate the scan
+            # instead of ending it.
+            except Exception as e:
                 print(_COLOR_ERROR
                       + f'Warning: could not write combined target list ({e}); '
                         'falling back to the full target file for remaining batches.'

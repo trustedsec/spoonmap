@@ -4421,6 +4421,55 @@ class TestMassScanProbe:
         assert mock_b.call_args_list[1][0][3] == '/fake/targets.txt'
         assert 'could not write combined target list' in capsys.readouterr().out
 
+    def test_non_oserror_combined_target_write_failure_also_falls_back(self, tmp_path, capsys):
+        """_atomic_write() re-raises whatever it caught after cleaning up, so
+        narrowing this handler to OSError left any other failure unwinding
+        mass_scan() and losing the whole run's aggregation — exactly the outcome
+        the fallback exists to prevent."""
+        spoonmap.output_path = str(tmp_path)
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0 — hit
+            {},                       # main batch ['3306']
+        ]
+        real_atomic_write = spoonmap._atomic_write
+
+        def fail_only_combined(path, content):
+            if path.endswith('live_hosts_combined.txt'):
+                raise RuntimeError('rename hook exploded')
+            return real_atomic_write(path, content)
+
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)) as mock_b, \
+             patch('spoonmap._atomic_write', side_effect=fail_only_combined):
+            result = mass_scan('All', ['443', '3306'], '53', '10000',
+                               '/fake/targets.txt', '', batch_size=1)
+
+        assert 'Hosts Found on Port 443' in result
+        assert mock_b.call_args_list[1][0][3] == '/fake/targets.txt'
+        assert 'could not write combined target list' in capsys.readouterr().out
+
+    def test_keyboardinterrupt_during_combined_target_write_still_propagates(self, tmp_path):
+        """The widened handler must not swallow Ctrl-C: an interrupt here means
+        stop the scan, not carry on against the full (larger) target file."""
+        spoonmap.output_path = str(tmp_path)
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0 — hit
+            {},                       # main batch ['3306']
+        ]
+        real_atomic_write = spoonmap._atomic_write
+
+        def interrupt_only_combined(path, content):
+            if path.endswith('live_hosts_combined.txt'):
+                raise KeyboardInterrupt
+            return real_atomic_write(path, content)
+
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)), \
+             patch('spoonmap._atomic_write', side_effect=interrupt_only_combined):
+            with pytest.raises(KeyboardInterrupt):
+                mass_scan('All', ['443', '3306'], '53', '10000',
+                          '/fake/targets.txt', '', batch_size=1)
+
     # ── scan-type-aware probe port selection ─────────────────────────────────
 
     def test_external_scan_uses_web_probe_ports_only(self, tmp_path):
