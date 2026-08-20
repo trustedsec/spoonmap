@@ -3,6 +3,7 @@
 # Author: Spoonman (Larry.Spohn@TrustedSec.com)
 # QA and Personal Pythonian Consultant: Bandrel (Justin.Bollinger@TrustedSec.com)
 
+import collections
 import contextlib
 import datetime
 import glob as _glob
@@ -462,26 +463,36 @@ def _stream_masscan_progress(proc):
     until the process exits.  Reading byte-by-byte and splitting on \\r lets
     us display each update as it arrives.  Clears the line when done.
 
-    Returns the full captured stderr content for diagnostic reporting.
+    Returns the last ~2 KB of captured stderr content for diagnostic reporting
+    (the last 20 lines). On multi-hour scans, masscan emits continuous progress
+    updates, so the full stderr would grow without bound. We keep only the tail
+    since the diagnostic purpose is to show why the process exited, which appears
+    in the final lines. 20 lines (~50-100 bytes each) is sufficient for exit
+    diagnostics and bounds memory usage during long scans.
     """
     buf = b''
-    full_stderr = b''
+    stderr_lines = collections.deque(maxlen=20)  # Keep last 20 lines (~2 KB)
     while True:
         ch = proc.stderr.read(1)
         if not ch:
             break
-        full_stderr += ch
         if ch == b'\r':
             line = buf.decode('utf-8', errors='replace').strip()
             if line:
                 sys.stdout.write(f'\r  {line:<78}')
                 sys.stdout.flush()
+                stderr_lines.append(line.encode('utf-8'))
             buf = b''
         elif ch != b'\n':
             buf += ch
+    # Append any remaining buffered content
+    if buf:
+        line = buf.decode('utf-8', errors='replace').strip()
+        if line:
+            stderr_lines.append(line.encode('utf-8'))
     sys.stdout.write('\r' + ' ' * 80 + '\r')
     sys.stdout.flush()
-    return full_stderr
+    return b'\n'.join(stderr_lines)
 
 
 def _discover_external_masscan(target_file, disc, max_rate, exclusions_file, target_count):
