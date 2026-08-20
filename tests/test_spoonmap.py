@@ -2445,6 +2445,51 @@ class TestLoadConfig:
         assert cfg['masscan_batch_size'] == 5
         assert 'masscan_batch_size' in capsys.readouterr().out
 
+    # ---- numeric floors (the interactive twin _prompt_int has always enforced
+    # minimum=1; the config path enforced nothing) ---------------------------
+
+    def test_zero_nmap_threads_is_clamped_to_one(self, capsys):
+        # nmap_scan() does `for _ in range(max_threads)`, so 0 starts no workers
+        # and work_queue.join() hangs forever — after discovery already ran.
+        cfg = _load_config(_config_dict(nmap_threads=0), '/t')
+        assert cfg['nmap_threads'] == 1
+        out = capsys.readouterr().out
+        assert 'nmap_threads' in out
+        assert 'below the minimum' in out
+
+    def test_negative_masscan_batch_size_is_clamped_to_one(self, capsys):
+        # range(0, len(normal), 0) raises "range() arg 3 must not be zero",
+        # unwinding main() mid-scan.
+        cfg = _load_config(_config_dict(masscan_batch_size=-3), '/t')
+        assert cfg['masscan_batch_size'] == 1
+        assert 'masscan_batch_size' in capsys.readouterr().out
+
+    def test_zero_nmap_threshold_is_clamped_to_one(self, capsys):
+        cfg = _load_config(_config_dict(nmap_threshold=0), '/t')
+        assert cfg['nmap_threshold'] == 1
+        assert 'nmap_threshold' in capsys.readouterr().out
+
+    def test_null_max_rate_warns_instead_of_crashing_mid_scan(self, capsys):
+        # str(None) == 'None' used to reach int(max_rate) in
+        # _discover_internal_masscan() as a raw ValueError traceback.
+        cfg = _load_config(_config_dict(max_rate=None), '/t')
+        assert cfg['max_rate'] == '2000'
+        out = capsys.readouterr().out
+        assert 'max_rate' in out
+        assert 'not a number' in out
+
+    def test_null_max_rate_default_follows_target_scan(self, capsys):
+        cfg = _load_config(_config_dict(max_rate=None, target_scan='External'), '/t')
+        assert cfg['max_rate'] == '20000'
+        assert 'max_rate' in capsys.readouterr().out
+
+    def test_zero_max_rate_is_clamped_not_passed_to_masscan(self, capsys):
+        # '0' is truthy, so the `if not max_rate:` re-prompt never fired and
+        # masscan ran at --max-rate 0.
+        cfg = _load_config(_config_dict(max_rate=0), '/t')
+        assert cfg['max_rate'] == '1'
+        assert 'below the minimum' in capsys.readouterr().out
+
     # ---- required-key validation -------------------------------------------
 
     def test_missing_target_scan_reports_key_and_exits(self, capsys):
@@ -2465,6 +2510,33 @@ class TestLoadConfig:
         for key in ('banner_scan', 'max_rate', 'target_file', 'output_path'):
             assert key in out
         assert 'missing required keys' in out
+
+    # ---- target_scan validation --------------------------------------------
+
+    def test_lowercase_target_scan_is_normalised(self):
+        # Unvalidated, "internal" matched neither literal: the scan ran and
+        # looked normal while every target_scan == 'Internal' gated check (SMB
+        # security mode, MS17-010, LDAP signing/channel binding, ms-sql-info,
+        # the extra SQL port sweep) was silently skipped.
+        assert _load_config(_config_dict(target_scan='internal'),
+                            '/t')['target_scan'] == 'Internal'
+
+    def test_padded_mixed_case_target_scan_is_normalised(self):
+        assert _load_config(_config_dict(target_scan='  eXTERNAL '),
+                            '/t')['target_scan'] == 'External'
+
+    def test_unrecognised_target_scan_exits(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _load_config(_config_dict(target_scan='inernal'), '/t')
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert 'target_scan' in out
+        assert "'Internal' or 'External'" in out
+
+    def test_null_target_scan_exits_rather_than_scanning(self, capsys):
+        with pytest.raises(SystemExit):
+            _load_config(_config_dict(target_scan=None), '/t')
+        assert 'target_scan' in capsys.readouterr().out
 
 
 # ── Config: Full scan_categories ──────────────────────────────────────────────

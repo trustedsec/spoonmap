@@ -4714,6 +4714,8 @@ def _handle_previous_results(output_path, resume, prompt_fn=input):
 _CONFIG_REQUIRED_KEYS = ('banner_scan', 'target_scan', 'max_rate',
                          'target_file', 'output_path')
 
+_CONFIG_TARGET_SCANS = ('Internal', 'External')
+
 _CONFIG_TRUE_STRINGS = ('true', 'yes', 'on', '1')
 _CONFIG_FALSE_STRINGS = ('false', 'no', 'off', '0', '')
 
@@ -4741,18 +4743,58 @@ def _config_bool(key, value, default):
     return default
 
 
-def _config_int(key, value, default):
+def _config_int(key, value, default, minimum=1):
     """Coerce a config.json integer *value*, warning instead of crashing.
 
     A bare int() raised ValueError on a non-numeric string and TypeError on a
     JSON null, aborting the run before any scanning happened.
+
+    *minimum* mirrors _prompt_int()'s contract, which the interactive path has
+    always enforced while the config path enforced nothing.  A too-small value
+    is clamped rather than rejected, because the failures it produced all
+    surfaced *after* discovery had already run: nmap_threads=0 starts zero
+    workers and hangs forever in work_queue.join(), masscan_batch_size=0 raises
+    "range() arg 3 must not be zero" out of main() mid-scan, and max_rate=0
+    silently runs masscan at --max-rate 0.
     """
     try:
-        return int(value)
+        parsed = int(value)
     except (TypeError, ValueError):
         print(_COLOR_ERROR + f'Warning: config.json: {key} = {value!r} is not a '
                              f'number; using {default}.' + _COLOR_RESET)
         return default
+    if parsed < minimum:
+        print(_COLOR_ERROR + f'Warning: config.json: {key} = {value!r} is below the '
+                             f'minimum of {minimum}; using {minimum}.' + _COLOR_RESET)
+        return minimum
+    return parsed
+
+
+def _config_target_scan(value):
+    """Normalise config.json's *target_scan* to exactly 'Internal' or 'External'.
+
+    Roughly 25 sites compare target_scan against those two literals, so an
+    unrecognised spelling is not an inert typo: discovery falls into the
+    Internal-ish ``else`` branch, the scan runs and looks completely normal, but
+    every ``target_scan == 'Internal'`` gated check is skipped — SMB security
+    mode, MS17-010, LDAP signing and channel binding, ms-sql-info, the extra SQL
+    port sweep. The operator gets a clean report with ~20 internal checks
+    silently absent, from one lowercase letter. That is the worst failure mode
+    in this tool's threat model, so an unusable value exits rather than warns.
+
+    Case and surrounding whitespace are normalised rather than rejected:
+    "internal" is unambiguous, and accepting it removes the trap outright
+    instead of merely reporting it once the operator hits it.
+    """
+    text = str(value).strip().lower()
+    for valid in _CONFIG_TARGET_SCANS:
+        if text == valid.lower():
+            return valid
+    print(_COLOR_ERROR + f'ERROR: config.json: target_scan = {value!r} is not '
+                         "'Internal' or 'External'." + _COLOR_RESET)
+    print('See config.json.sample for the expected keys, or delete '
+          'config.json to be prompted instead.')
+    sys.exit(1)
 
 
 def _load_config(config_parser, dir_path, resume=False):
@@ -4799,11 +4841,17 @@ def _load_config(config_parser, dir_path, resume=False):
         dest_ports = config_parser['dest_ports']
         scan_type = 'Custom'
     banner_scan = _config_bool('banner_scan', config_parser['banner_scan'], False)
-    target_scan = config_parser['target_scan']
+    target_scan = _config_target_scan(config_parser['target_scan'])
     source_port = ''
     # Coerced to str here because _discover_external_masscan() passes max_rate
-    # straight to Popen(), which rejects an int with a bare TypeError.
-    max_rate = str(config_parser['max_rate'])
+    # straight to Popen(), which rejects an int with a bare TypeError.  It goes
+    # through _config_int() first because it was the one required numeric that
+    # only got str(): a JSON null became the string 'None' and blew up as a raw
+    # ValueError traceback out of int(max_rate) in _discover_internal_masscan(),
+    # and 0 is truthy as '0' so it skipped the re-prompt and scanned at
+    # --max-rate 0.  The fallbacks mirror the interactive prompt's defaults.
+    max_rate = str(_config_int('max_rate', config_parser['max_rate'],
+                               20000 if target_scan == 'External' else 2000))
     target_file = config_parser['target_file']
     output_path = config_parser['output_path']
     # Absent or empty means "no exclusions" — normalize to None so it is
