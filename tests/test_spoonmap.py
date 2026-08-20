@@ -5944,32 +5944,34 @@ class TestNmapPortDiscovery:
         return f'<?xml version="1.0"?><nmaprun>{hosts}</nmaprun>'
 
     def test_resume_reloads_from_live_hosts_dir(self, tmp_path):
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
         disc = tmp_path / 'discovery'
         (disc / 'masscan_results').mkdir(parents=True)
         (disc / 'live_hosts').mkdir(parents=True)
         (disc / 'masscan_results' / 'portDirect.xml').write_text('<nmaprun/>')
         (disc / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n10.0.0.2\n')
-        target = tmp_path / 'targets.txt'
-        target.write_text('10.0.0.1\n')
         spoonmap.output_path = str(tmp_path)
 
-        with patch('spoonmap.subprocess.Popen') as mock_popen:
+        with patch('spoonmap.subprocess.Popen') as mock_popen, \
+             patch('spoonmap.restore_terminal_state'):
             summary = _nmap_port_discovery(['80'], str(target), '', None, resume=True)
 
         assert not mock_popen.called
         assert 'Hosts Found on Port 80: 2' in summary
 
     def test_resume_skips_hostnames_file(self, tmp_path):
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
         disc = tmp_path / 'discovery'
         (disc / 'masscan_results').mkdir(parents=True)
         (disc / 'live_hosts').mkdir(parents=True)
         (disc / 'masscan_results' / 'portDirect.xml').write_text('<nmaprun/>')
         (disc / 'live_hosts' / 'port80_hostnames.txt').write_text('example.com\n')
-        target = tmp_path / 'targets.txt'
-        target.write_text('10.0.0.1\n')
         spoonmap.output_path = str(tmp_path)
 
-        with patch('spoonmap.subprocess.Popen') as mock_popen:
+        with patch('spoonmap.subprocess.Popen') as mock_popen, \
+             patch('spoonmap.restore_terminal_state'):
             summary = _nmap_port_discovery(['80'], str(target), '', None, resume=True)
 
         assert not mock_popen.called
