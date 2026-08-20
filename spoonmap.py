@@ -314,6 +314,28 @@ def _write_if_changed(path, content):
     return True
 
 
+def _atomic_write(path, content):
+    """Write *content* to *path* atomically (temp file in the same dir + os.replace).
+
+    The temp file is created in the same directory as *path* so os.replace()
+    never crosses a filesystem boundary and therefore stays atomic: readers
+    see either the old contents or the new ones, never a half-written file.
+    A failure part-way through leaves *path* untouched and removes the temp.
+    """
+    directory = os.path.dirname(path) or '.'
+    fd, tmp_path = tempfile.mkstemp(dir=directory,
+                                    prefix='.' + os.path.basename(path) + '.',
+                                    suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as fh:
+            fh.write(content)
+        os.replace(tmp_path, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
+
+
 def preprocess_targets(target_file, output_path):
     """
     Preprocess the target file to separate hostnames from IPs.
@@ -3803,6 +3825,42 @@ def _aggregate_result_dir(result_dir, ip_to_hostname):
     return hosts_json, xml_hosts
 
 
+def _combine_live_hosts(disc, output_path):
+    """Write output_path/all_live_hosts.txt from every file in disc/live_hosts.
+
+    Each per-port live-host file holds newline-terminated IPs; the union is
+    written back out as-is (lines keep their trailing newline), deduplicated
+    across ports.
+    """
+    all_ips = set()
+    host_files = os.listdir(f'{disc}/live_hosts')
+    for host_file in host_files:
+        with open(f'{disc}/live_hosts/{host_file}') as input_file:
+            for line in input_file:
+                all_ips.add(line)
+    with open(f'{output_path}/all_live_hosts.txt', 'w') as output_file:
+        for ip in all_ips:
+            output_file.write(ip)
+
+
+def _write_combined_results(output_path, hosts_json, xml_hosts):
+    """Write spoonmap_output.xml and spoonmap_output.json.
+
+    *xml_hosts* / *hosts_json* come from _aggregate_result_dir(); the XML is
+    the merged <host> elements wrapped in a minimal <nmaprun> document so the
+    result loads in tools that expect nmap output.
+    """
+    xml_result = '<?xml version="1.0"?>\n<!-- SpooNMAP -->\n<nmaprun>\n'
+    for host_elem in xml_hosts.values():
+        xml_result += etree.tostring(host_elem, encoding="unicode", method="xml")
+    xml_result += '</nmaprun>'
+    with open(f'{output_path}/spoonmap_output.xml', 'w+') as spoonmap_output:
+        spoonmap_output.write(xml_result)
+    with open(f'{output_path}/spoonmap_output.json', 'w') as f:
+        json.dump(hosts_json, f, indent=2)
+    print(_COLOR_RESULT + f'\nResults written to {output_path}/spoonmap_output.xml / .json' + _COLOR_RESET)
+
+
 def _cleanup_cmd(dir_path):
     """Handle --cleanup: remove prior scan output from output_path and exit."""
     idx = sys.argv.index('--cleanup')
@@ -4203,6 +4261,87 @@ def _handle_previous_results(output_path, resume, prompt_fn=input):
     return False, 'a'
 
 
+def _load_config(config_parser, dir_path, resume=False):
+    """Derive every scan setting from an already-parsed config.json dict.
+
+    *config_parser* is the JSON dict, *dir_path* the script directory that the
+    three relative path settings resolve against, and *resume* whatever the
+    --resume CLI flag already produced: the config's own 'resume' key is ORed
+    into it so the flag can never be turned back off by the file.  Returns the
+    derived settings as a dict; the caller assigns 'output_path' to the module
+    global of the same name.
+    """
+    scan_categories = config_parser.get('scan_categories', 'All')
+    if scan_categories == 'All' or scan_categories == ['All']:
+        scan_type = 'All'
+        all_ports = [p for cat in SERVICE_CATEGORIES.values() for p in cat]
+    elif scan_categories in ('Full', ['Full']):
+        scan_type = 'Full'
+        all_ports = ['1-65535']
+    elif isinstance(scan_categories, list):
+        valid = [c for c in scan_categories if c in SERVICE_CATEGORIES]
+        scan_type = ', '.join(valid)
+        all_ports = [p for name in valid for p in SERVICE_CATEGORIES[name]]
+    else:
+        scan_type = ''
+        all_ports = []
+    # UDP ports sorted to end of batch
+    dest_ports = [p for p in all_ports if not p.startswith('U:')] + \
+                 [p for p in all_ports if p.startswith('U:')]
+    # Allow dest_ports override for fully custom use
+    if config_parser.get('dest_ports'):
+        dest_ports = config_parser['dest_ports']
+        scan_type = 'Custom'
+    banner_scan = config_parser['banner_scan']
+    if banner_scan == 'True':
+        banner_scan = True
+    else:
+        banner_scan = False
+    target_scan = config_parser['target_scan']
+    source_port = ''
+    max_rate = config_parser['max_rate']
+    target_file = config_parser['target_file']
+    output_path = config_parser['output_path']
+    # Absent or empty means "no exclusions" — normalize to None so it is
+    # neither re-prompted nor passed as an empty --excludefile.
+    exclusions_file = config_parser.get('exclusions_file') or None
+    nmap_threads = int(config_parser.get('nmap_threads', 5))
+    masscan_batch_size = int(config_parser.get('masscan_batch_size', 5))
+    nmap_threshold = int(config_parser.get('nmap_threshold', 5_000_000))
+    script_scan = config_parser.get('script_scan', 'False') == 'True'
+    host_discovery = config_parser.get('host_discovery', 'True') == 'True'
+    resume = resume or config_parser.get('resume', 'False').strip().lower() == 'true'
+    config_generated = bool(config_parser.get(_CONFIG_GENERATED_KEY))
+
+    # Resolve relative paths in config relative to the script directory
+    if target_file and not os.path.isabs(target_file):
+        target_file = os.path.join(dir_path, target_file)
+    if output_path and not os.path.isabs(output_path):
+        output_path = os.path.join(dir_path, output_path)
+    if exclusions_file and not os.path.isabs(exclusions_file):
+        exclusions_file = os.path.join(dir_path, exclusions_file)
+
+    return {
+        'scan_categories': scan_categories,
+        'scan_type': scan_type,
+        'dest_ports': dest_ports,
+        'banner_scan': banner_scan,
+        'target_scan': target_scan,
+        'source_port': source_port,
+        'max_rate': max_rate,
+        'target_file': target_file,
+        'output_path': output_path,
+        'exclusions_file': exclusions_file,
+        'nmap_threads': nmap_threads,
+        'masscan_batch_size': masscan_batch_size,
+        'nmap_threshold': nmap_threshold,
+        'script_scan': script_scan,
+        'host_discovery': host_discovery,
+        'resume': resume,
+        'config_generated': config_generated,
+    }
+
+
 # The Main Guts
 def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
     # already-independently-tested functions behind input()-driven prompts,
@@ -4248,54 +4387,24 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             with open(f'{dir_path}/config.json') as config:
                 config_parser = json.load(config)
 
-            scan_categories = config_parser.get('scan_categories', 'All')
-            if scan_categories == 'All' or scan_categories == ['All']:
-                scan_type = 'All'
-                all_ports = [p for cat in SERVICE_CATEGORIES.values() for p in cat]
-            elif scan_categories in ('Full', ['Full']):
-                scan_type = 'Full'
-                all_ports = ['1-65535']
-            elif isinstance(scan_categories, list):
-                valid = [c for c in scan_categories if c in SERVICE_CATEGORIES]
-                scan_type = ', '.join(valid)
-                all_ports = [p for name in valid for p in SERVICE_CATEGORIES[name]]
-            else:
-                all_ports = []
-            # UDP ports sorted to end of batch
-            dest_ports = [p for p in all_ports if not p.startswith('U:')] + \
-                         [p for p in all_ports if p.startswith('U:')]
-            # Allow dest_ports override for fully custom use
-            if config_parser.get('dest_ports'):
-                dest_ports = config_parser['dest_ports']
-                scan_type = 'Custom'
-            banner_scan = config_parser['banner_scan']
-            if banner_scan == 'True':
-                banner_scan = True
-            else:
-                banner_scan = False
-            target_scan = config_parser['target_scan']
-            source_port = ''
-            max_rate = config_parser['max_rate']
-            target_file = config_parser['target_file']
-            output_path = config_parser['output_path']
-            # Absent or empty means "no exclusions" — normalize to None so it is
-            # neither re-prompted nor passed as an empty --excludefile.
-            exclusions_file = config_parser.get('exclusions_file') or None
-            nmap_threads = int(config_parser.get('nmap_threads', 5))
-            masscan_batch_size = int(config_parser.get('masscan_batch_size', 5))
-            nmap_threshold = int(config_parser.get('nmap_threshold', 5_000_000))
-            script_scan = config_parser.get('script_scan', 'False') == 'True'
-            host_discovery = config_parser.get('host_discovery', 'True') == 'True'
-            resume = resume or config_parser.get('resume', 'False').strip().lower() == 'true'
-            config_generated = bool(config_parser.get(_CONFIG_GENERATED_KEY))
-
-            # Resolve relative paths in config relative to the script directory
-            if target_file and not os.path.isabs(target_file):
-                target_file = os.path.join(dir_path, target_file)
-            if output_path and not os.path.isabs(output_path):
-                output_path = os.path.join(dir_path, output_path)
-            if exclusions_file and not os.path.isabs(exclusions_file):
-                exclusions_file = os.path.join(dir_path, exclusions_file)
+            cfg = _load_config(config_parser, dir_path, resume)
+            scan_categories    = cfg['scan_categories']
+            scan_type          = cfg['scan_type']
+            dest_ports         = cfg['dest_ports']
+            banner_scan        = cfg['banner_scan']
+            target_scan        = cfg['target_scan']
+            source_port        = cfg['source_port']
+            max_rate           = cfg['max_rate']
+            target_file        = cfg['target_file']
+            output_path        = cfg['output_path']
+            exclusions_file    = cfg['exclusions_file']
+            nmap_threads       = cfg['nmap_threads']
+            masscan_batch_size = cfg['masscan_batch_size']
+            nmap_threshold     = cfg['nmap_threshold']
+            script_scan        = cfg['script_scan']
+            host_discovery     = cfg['host_discovery']
+            resume             = cfg['resume']
+            config_generated   = cfg['config_generated']
 
         # A config this tool wrote is a saved answer sheet, not a hand-authored
         # one, so ask about pre-existing output *before* the prompts: [d]elete and
@@ -4699,16 +4808,8 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
 
         # Combine all live hosts into one file
         disc = _disc(output_path)
-        all_ips = set()
         if os.path.exists(f'{disc}/live_hosts'):
-            host_files = os.listdir(f'{disc}/live_hosts')
-            for host_file in host_files:
-                with open(f'{disc}/live_hosts/{host_file}') as input_file:
-                    for line in input_file:
-                        all_ips.add(line)
-            with open(f'{output_path}/all_live_hosts.txt', 'w') as output_file:
-                for ip in all_ips:
-                    output_file.write(ip)
+            _combine_live_hosts(disc, output_path)
 
             # Combine all XML results into one file
             if banner_scan or script_scan:
@@ -4716,15 +4817,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             else:
                 result_dir = f'{disc}/masscan_results/'
             hosts_json, xml_hosts = _aggregate_result_dir(result_dir, ip_to_hostname)
-            xml_result = '<?xml version="1.0"?>\n<!-- SpooNMAP -->\n<nmaprun>\n'
-            for host_elem in xml_hosts.values():
-                xml_result += etree.tostring(host_elem, encoding="unicode", method="xml")
-            xml_result += '</nmaprun>'
-            with open(f'{output_path}/spoonmap_output.xml', 'w+') as spoonmap_output:
-                spoonmap_output.write(xml_result)
-            with open(f'{output_path}/spoonmap_output.json', 'w') as f:
-                json.dump(hosts_json, f, indent=2)
-            print(_COLOR_RESULT + f'\nResults written to {output_path}/spoonmap_output.xml / .json' + _COLOR_RESET)
+            _write_combined_results(output_path, hosts_json, xml_hosts)
 
             if script_scan:
                 generate_findings(output_path, target_scan, snmp_any_validated=snmp_any_validated)
