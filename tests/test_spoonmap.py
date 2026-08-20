@@ -2095,6 +2095,34 @@ class TestFullPortScan:
         assert tarpit_file.exists()
         assert '10.0.0.9' in tarpit_file.read_text()
 
+    def test_full_scan_resume_normalises_udp_port_key(self, tmp_path):
+        """A resumed Full scan must convert 'portU_53.txt' to the 'U:53' port key.
+
+        The raw filename stem fails the port_key.startswith('U:') test in
+        _flag_suspected_tarpits(), so a UDP port was counted toward the TCP
+        open-port fraction.  Nine TCP ports sit one below the threshold of 10;
+        counting the UDP port as a tenth spuriously flags the host as a tarpit.
+        """
+        spoonmap.output_path = str(tmp_path)
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        live_dir = disc / 'live_hosts'
+        live_dir.mkdir(parents=True)
+        (disc / 'masscan_results' / 'portFull.xml').write_text('<nmaprun/>')
+        for p in range(9):
+            (live_dir / f'port{p}.txt').write_text('10.0.0.9\n')
+        (live_dir / 'portU_53.txt').write_text('10.0.0.9\n')
+
+        with patch('spoonmap._run_masscan_batch') as mock_batch, \
+             patch('spoonmap.HONEYPOT_OPEN_PORT_FRACTION', 0.0001):
+            result = mass_scan('Full', ['1-65535'], '53', '10000',
+                               '/fake/targets.txt', '', resume=True)
+
+        assert not mock_batch.called
+        assert 'Hosts Found on Port U:53: 1' in result
+        assert 'Hosts Found on Port U_53' not in result
+        assert not (disc / 'suspected_tarpits.txt').exists()
+
     def _setup_full_resume_cache(self, tmp_path, xml_text):
         spoonmap.output_path = str(tmp_path)
         disc = tmp_path / 'discovery'

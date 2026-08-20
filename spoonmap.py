@@ -1378,7 +1378,14 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                     if not (fname.startswith('port') and fname.endswith('.txt')
                             and not fname.endswith('_hostnames.txt')):
                         continue
-                    port_key = fname[4:-4]
+                    # Convert the filename stem back to a port key, as the two
+                    # structurally identical loops in _nmap_port_discovery() and
+                    # _filter_udp_live_hosts() already do.  The raw stem leaves a
+                    # UDP port as 'U_53', which fails the port_key.startswith('U:')
+                    # test in _flag_suspected_tarpits() — so a resumed Full scan
+                    # counted UDP ports toward the TCP open-port fraction and could
+                    # skew or spuriously trigger the honeypot/tarpit heuristic.
+                    port_key = _fname_port(fname[4:-4])
                     with open(os.path.join(live_hosts_dir, fname)) as fh:
                         ips = {line.strip() for line in fh if line.strip()}
                     if ips:
