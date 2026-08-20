@@ -1572,6 +1572,24 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 interrupt_event, ip_to_hostname, script_scan=False,
                 target_scan='Internal', start_time=None):
     """Worker thread function to process NMAP scans from queue"""
+
+    def _report_nmap_failure(pass_label, dest_port, proc):
+        """Print a diagnostic for a non-zero nmap exit that was not an interrupt.
+
+        Callers must confirm interrupt_event is clear first: a deliberately
+        killed nmap also exits non-zero, and reporting that as a failure would
+        spam an error for every port on Ctrl-C.
+        """
+        stderr_output = proc.stderr.read() if proc.stderr is not None else ''
+        with lock:
+            print(_COLOR_ERROR
+                  + f'Error: nmap {pass_label} for port {dest_port} exited with code '
+                    f'{proc.returncode} — results for this port may be missing or '
+                    f'incomplete and will NOT be retried on resume.'
+                  + _COLOR_RESET)
+            if stderr_output.strip():
+                print(_COLOR_ERROR + stderr_output.strip() + _COLOR_RESET)
+
     while not interrupt_event.is_set():
         try:
             # Get work item with timeout to check interrupt_event periodically
@@ -1608,10 +1626,14 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 # no controlling terminal — terminal signals cannot propagate
                 # between nmap and spoonmap in either direction, making external
                 # `kill <nmap_pid>` safe without stopping the overall scan.
+                # stderr is captured rather than discarded so a non-zero exit
+                # (bad port spec, missing privileges, disk full) is reportable;
+                # nmap's stderr is short, so buffering it is cheap.
                 nmap_process = subprocess.Popen(
                     nmap_cmd,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
                     start_new_session=True,
                 )
 
@@ -1625,12 +1647,22 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 else:
                     nmap_process.wait()
 
-                    with lock:
-                        completed_count[0] += 1
-                        _print_completion_status(
-                            'NMAP', completed_count[0], total_count,
-                            start_time if start_time is not None else time.time()
-                        )
+                    if interrupt_event.is_set():
+                        # Exited on its own during an interrupt — neither a
+                        # completion nor a failure worth reporting.
+                        pass
+                    elif nmap_process.returncode != 0:
+                        # Failed scan: leave completed_count alone so the
+                        # progress percentage does not claim work that produced
+                        # no (or truncated) XML.
+                        _report_nmap_failure('banner scan', dest_port, nmap_process)
+                    else:
+                        with lock:
+                            completed_count[0] += 1
+                            _print_completion_status(
+                                'NMAP', completed_count[0], total_count,
+                                start_time if start_time is not None else time.time()
+                            )
 
                 # Script pass — separate invocation writing to nse_results/
                 if script_scan and not interrupt_event.is_set():
@@ -1647,7 +1679,8 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                         nse_process = subprocess.Popen(
                             nse_cmd,
                             stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            text=True,
                             start_new_session=True,
                         )
                         while nse_process.poll() is None and not interrupt_event.is_set():
@@ -1655,6 +1688,10 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                         if interrupt_event.is_set() and nse_process.poll() is None:
                             nse_process.kill()
                         nse_process.wait()
+                        # A killed process also exits non-zero, so only report
+                        # when no interrupt is in flight.
+                        if nse_process.returncode != 0 and not interrupt_event.is_set():
+                            _report_nmap_failure('NSE script pass', dest_port, nse_process)
 
             except FileNotFoundError:
                 with lock:

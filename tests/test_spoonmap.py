@@ -4554,12 +4554,17 @@ class TestNmapWorker:
     `while not interrupt_event.is_set()` loop processes one item and returns.
     """
 
-    def _make_finished_proc(self, poll_side_effect=None):
+    def _make_finished_proc(self, poll_side_effect=None, returncode=0, stderr=''):
         proc = MagicMock()
         proc.poll.return_value = 0
         if poll_side_effect is not None:
             proc.poll.side_effect = poll_side_effect
         proc.wait.return_value = 0
+        # Real returncode/stderr: nmap_worker inspects both to decide whether a
+        # port actually completed. A bare MagicMock returncode would compare
+        # unequal to 0 and look like a failure on every happy-path test.
+        proc.returncode = returncode
+        proc.stderr = io.StringIO(stderr)
         return proc
 
     def _run(self, tmp_path, ip_to_hostname=None, script_scan=False,
@@ -4755,6 +4760,128 @@ class TestNmapWorker:
 
         assert len(created_procs) == 2
         assert created_procs[1].kill.called
+
+    def test_nonzero_exit_reports_failure_and_is_not_counted(self, tmp_path, capsys):
+        """A failed banner scan prints a diagnostic naming the port plus nmap's
+        stderr, and must not advance the completion counter."""
+        completed_count, _, _, _, _ = self._run(
+            tmp_path,
+            popen_side_effect=lambda *a, **k: self._make_finished_proc(
+                returncode=1, stderr='nmap: Illegal port specification\n'))
+        out = capsys.readouterr().out
+        assert 'port 80 exited with code 1' in out
+        assert 'Illegal port specification' in out
+        assert completed_count[0] == 0
+
+    def test_zero_exit_prints_no_failure_diagnostic(self, tmp_path, capsys):
+        """A clean exit counts as completed and prints no failure text."""
+        completed_count, _, _, _, _ = self._run(tmp_path)
+        assert 'exited with code' not in capsys.readouterr().out
+        assert completed_count[0] == 1
+
+    def test_interrupted_nonzero_exit_is_not_reported_as_failure(self, tmp_path, capsys):
+        """A process that exits non-zero because it was interrupted must not be
+        reported as an nmap failure — otherwise every Ctrl-C spams one error
+        per in-flight port."""
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/nmap_results', exist_ok=True)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts', exist_ok=True)
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n')
+        work_queue = Queue()
+        work_queue.put('port80.txt')
+        work_queue.put(None)
+        completed_count = [0]
+        lock = threading.Lock()
+        interrupt_event = threading.Event()
+        poll_calls = {'n': 0}
+
+        def poll_side_effect():
+            # Running on the first poll; by the second the interrupt has landed
+            # and the process is already gone (killed by signal → rc -9), so
+            # the worker takes the normal-exit branch with a non-zero rc.
+            poll_calls['n'] += 1
+            if poll_calls['n'] == 1:
+                return None
+            interrupt_event.set()
+            return -9
+
+        proc = self._make_finished_proc(poll_side_effect=poll_side_effect,
+                                        returncode=-9, stderr='')
+
+        with patch('spoonmap._build_nmap_cmd', return_value=['nmap', 'fake']), \
+             patch('spoonmap.subprocess.Popen', return_value=proc):
+            nmap_worker(work_queue, completed_count, 1, '88', lock, interrupt_event, None)
+
+        assert 'exited with code' not in capsys.readouterr().out
+        assert completed_count[0] == 0
+
+    def test_nse_nonzero_exit_reports_failure(self, tmp_path, capsys):
+        """The NSE pass gets the same diagnostic; the banner pass still counts."""
+        call_count = {'n': 0}
+
+        def fake_popen(*a, **k):
+            call_count['n'] += 1
+            if call_count['n'] == 1:
+                return self._make_finished_proc()
+            return self._make_finished_proc(
+                returncode=2, stderr="NSE: failed to initialize the script engine\n")
+
+        completed_count, _, _, _, _ = self._run(
+            tmp_path, script_scan=True, scripts_for_port='ftp-anon',
+            popen_side_effect=fake_popen)
+        out = capsys.readouterr().out
+        assert 'NSE script pass for port 80 exited with code 2' in out
+        assert 'failed to initialize the script engine' in out
+        assert completed_count[0] == 1
+
+    def test_interrupted_nse_nonzero_exit_is_not_reported_as_failure(self, tmp_path, capsys):
+        """A killed NSE process exits non-zero too — no failure diagnostic."""
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/nmap_results', exist_ok=True)
+        os.makedirs(f'{tmp_path}/nse_results', exist_ok=True)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts', exist_ok=True)
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n')
+        work_queue = Queue()
+        work_queue.put('port80.txt')
+        work_queue.put(None)
+        completed_count = [0]
+        lock = threading.Lock()
+        interrupt_event = threading.Event()
+        call_count = {'n': 0}
+        poll_calls = {'n': 0}
+
+        def fake_popen(*a, **k):
+            call_count['n'] += 1
+            if call_count['n'] == 1:
+                return self._make_finished_proc()
+
+            def poll_side_effect():
+                poll_calls['n'] += 1
+                if poll_calls['n'] == 1:
+                    return None
+                interrupt_event.set()
+                return -9
+
+            return self._make_finished_proc(poll_side_effect=poll_side_effect,
+                                            returncode=-9, stderr='')
+
+        with patch('spoonmap._build_nmap_cmd', return_value=['nmap', 'fake']), \
+             patch('spoonmap._get_scripts_for_port', return_value='ftp-anon'), \
+             patch('spoonmap.subprocess.Popen', side_effect=fake_popen):
+            nmap_worker(work_queue, completed_count, 1, '88', lock, interrupt_event, None,
+                       script_scan=True)
+
+        assert 'exited with code' not in capsys.readouterr().out
+        assert completed_count[0] == 1
+
+    def test_stderr_is_captured_not_discarded(self, tmp_path):
+        """stderr must be piped (so failures are diagnosable) while stdout stays
+        DEVNULL, and start_new_session must survive the change."""
+        _, mock_popen, _, _, _ = self._run(tmp_path)
+        kwargs = mock_popen.call_args[1]
+        assert kwargs['stderr'] is spoonmap.subprocess.PIPE
+        assert kwargs['stdout'] is spoonmap.subprocess.DEVNULL
+        assert kwargs['start_new_session'] is True
 
 
 def _fake_worker_drain(work_queue, completed_count, total_count, source_port, lock,
