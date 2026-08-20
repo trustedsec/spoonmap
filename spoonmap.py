@@ -3,6 +3,7 @@
 # Author: Spoonman (Larry.Spohn@TrustedSec.com)
 # QA and Personal Pythonian Consultant: Bandrel (Justin.Bollinger@TrustedSec.com)
 
+import collections
 import contextlib
 import datetime
 import glob as _glob
@@ -461,8 +462,16 @@ def _stream_masscan_progress(proc):
     Masscan emits status using bare \\r (no \\n), so readline() would stall
     until the process exits.  Reading byte-by-byte and splitting on \\r lets
     us display each update as it arrives.  Clears the line when done.
+
+    Returns the last ~2 KB of captured stderr content for diagnostic reporting
+    (the last 20 lines). On multi-hour scans, masscan emits continuous progress
+    updates, so the full stderr would grow without bound. We keep only the tail
+    since the diagnostic purpose is to show why the process exited, which appears
+    in the final lines. 20 lines (~50-100 bytes each) is sufficient for exit
+    diagnostics and bounds memory usage during long scans.
     """
     buf = b''
+    stderr_lines = collections.deque(maxlen=20)  # Keep last 20 lines (~2 KB)
     while True:
         ch = proc.stderr.read(1)
         if not ch:
@@ -472,11 +481,18 @@ def _stream_masscan_progress(proc):
             if line:
                 sys.stdout.write(f'\r  {line:<78}')
                 sys.stdout.flush()
+                stderr_lines.append(line.encode('utf-8'))
             buf = b''
         elif ch != b'\n':
             buf += ch
+    # Append any remaining buffered content
+    if buf:
+        line = buf.decode('utf-8', errors='replace').strip()
+        if line:
+            stderr_lines.append(line.encode('utf-8'))
     sys.stdout.write('\r' + ' ' * 80 + '\r')
     sys.stdout.flush()
+    return b'\n'.join(stderr_lines)
 
 
 def _discover_external_masscan(target_file, disc, max_rate, exclusions_file, target_count):
@@ -758,6 +774,10 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
 
     term_state = save_terminal_state()
     progress_thread = None
+    stderr_holder = []
+
+    def run_progress_and_capture(proc):
+        stderr_holder.append(_stream_masscan_progress(proc))
 
     try:
         masscan_process = subprocess.Popen(
@@ -766,7 +786,7 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
             stderr=subprocess.PIPE,
             preexec_fn=_raise_fd_limit,
         )
-        progress_thread = threading.Thread(target=_stream_masscan_progress, args=(masscan_process,), daemon=True)
+        progress_thread = threading.Thread(target=run_progress_and_capture, args=(masscan_process,), daemon=True)
         progress_thread.start()
         masscan_process.wait()
         progress_thread.join()
@@ -781,16 +801,21 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
     except FileNotFoundError:
         print(_COLOR_ERROR + 'Error: masscan not found. Please install masscan.' + _COLOR_RESET)
         restore_terminal_state(term_state)
-        quit(1)
+        sys.exit(1)
     except Exception as e:
         print(_COLOR_ERROR + f'Error running masscan: {e}' + _COLOR_RESET)
         restore_terminal_state(term_state)
-        quit(1)
+        sys.exit(1)
     finally:
         restore_terminal_state(term_state)
 
-    if masscan_process.returncode == 1:
-        quit(1)
+    if masscan_process.returncode != 0:
+        stderr_content = stderr_holder[0] if stderr_holder else b''
+        stderr_str = stderr_content.decode('utf-8', errors='replace') if stderr_content else '(no error output)'
+        print(_COLOR_ERROR + f'masscan exited with code {masscan_process.returncode}' + _COLOR_RESET)
+        if stderr_str and stderr_str.strip():
+            print(_COLOR_ERROR + f'Error output: {stderr_str}' + _COLOR_RESET)
+        sys.exit(1)
 
     if not os.path.exists(output_file) or os.stat(output_file).st_size == 0:
         return {}
