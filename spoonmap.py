@@ -606,6 +606,11 @@ def _discover_external_masscan(target_file, disc, max_rate, exclusions_file, tar
         masscan_cmd.extend(['--excludefile', exclusions_file])
     term_state = save_terminal_state()
     progress_thread = None
+    # Pre-initialised for the same reason progress_thread is: Ctrl-C during a
+    # scan is routine, and if SIGINT lands inside Popen() itself (the fork/exec
+    # window) the name is never bound, so a bare proc.kill() in the handler
+    # below replaced the KeyboardInterrupt with an UnboundLocalError.
+    proc = None
     try:
         proc = subprocess.Popen(masscan_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                 preexec_fn=_raise_fd_limit)
@@ -614,8 +619,9 @@ def _discover_external_masscan(target_file, disc, max_rate, exclusions_file, tar
         proc.wait()
         progress_thread.join()
     except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
+        if proc:
+            proc.kill()
+            proc.wait()
         if progress_thread:
             progress_thread.join()
         restore_terminal_state(term_state)
@@ -658,6 +664,11 @@ def _discover_internal_masscan(target_file, disc, max_rate, exclusions_file, tar
         masscan_cmd.extend(['--excludefile', exclusions_file])
     term_state = save_terminal_state()
     progress_thread = None
+    # Pre-initialised for the same reason progress_thread is: Ctrl-C during a
+    # scan is routine, and if SIGINT lands inside Popen() itself (the fork/exec
+    # window) the name is never bound, so a bare proc.kill() in the handler
+    # below replaced the KeyboardInterrupt with an UnboundLocalError.
+    proc = None
     try:
         proc = subprocess.Popen(masscan_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                 preexec_fn=_raise_fd_limit)
@@ -666,8 +677,9 @@ def _discover_internal_masscan(target_file, disc, max_rate, exclusions_file, tar
         proc.wait()
         progress_thread.join()
     except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
+        if proc:
+            proc.kill()
+            proc.wait()
         if progress_thread:
             progress_thread.join()
         restore_terminal_state(term_state)
@@ -815,12 +827,16 @@ def _nmap_host_discovery(target_file, disc, source_port, exclusions_file):
 
     print(_COLOR_INFO + 'Host discovery: running nmap -sn...' + _COLOR_RESET)
     term_state = save_terminal_state()
+    # SIGINT inside Popen() leaves proc unbound; a bare proc.kill() below then
+    # raised UnboundLocalError in place of the KeyboardInterrupt.
+    proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         proc.wait()
     except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
+        if proc:
+            proc.kill()
+            proc.wait()
         restore_terminal_state(term_state)
         raise
     except FileNotFoundError:
@@ -874,6 +890,11 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
 
     term_state = save_terminal_state()
     progress_thread = None
+    # Pre-initialised for the same reason progress_thread is: if SIGINT lands
+    # inside Popen() itself the name is never bound, and the handler's
+    # masscan_process.pid read raised UnboundLocalError instead of letting the
+    # KeyboardInterrupt through.
+    masscan_process = None
     stderr_holder = []
 
     def run_progress_and_capture(proc):
@@ -891,9 +912,10 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
         masscan_process.wait()
         progress_thread.join()
     except KeyboardInterrupt:
-        print(f'Killing PID {str(masscan_process.pid)}...')
-        masscan_process.kill()
-        masscan_process.wait()
+        if masscan_process:
+            print(f'Killing PID {str(masscan_process.pid)}...')
+            masscan_process.kill()
+            masscan_process.wait()
         if progress_thread:
             progress_thread.join()
         restore_terminal_state(term_state)
@@ -1089,12 +1111,16 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
     print(_COLOR_INFO + f'UDP discovery: scanning port {port_num} with nmap...' + _COLOR_RESET)
 
     term_state = save_terminal_state()
+    # SIGINT inside Popen() leaves proc unbound; a bare proc.kill() below then
+    # raised UnboundLocalError in place of the KeyboardInterrupt.
+    proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         proc.wait()
     except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
+        if proc:
+            proc.kill()
+            proc.wait()
         restore_terminal_state(term_state)
         raise
     except FileNotFoundError:
@@ -1235,6 +1261,9 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
             stderr_lines.append(line)
 
     term_state = save_terminal_state()
+    # SIGINT inside Popen() leaves proc unbound; a bare proc.kill() below then
+    # raised UnboundLocalError in place of the KeyboardInterrupt.
+    proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
@@ -1247,8 +1276,9 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
         _et.join()
         stderr_output = ''.join(stderr_lines)
     except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
+        if proc:
+            proc.kill()
+            proc.wait()
         restore_terminal_state(term_state)
         raise
     except FileNotFoundError:

@@ -7279,6 +7279,19 @@ class TestRunMasscanBatchBehavior:
                                    '/fake/targets.txt', None, None)
         assert mock_proc.kill.called
 
+    def test_interrupt_inside_popen_reraises_and_restores_terminal(self, tmp_path):
+        """SIGINT in the fork/exec window left masscan_process unbound, so the
+        handler's `Killing PID {masscan_process.pid}` read raised
+        UnboundLocalError in place of the KeyboardInterrupt."""
+        output_xml = tmp_path / 'out.xml'
+        with patch('spoonmap.subprocess.Popen', side_effect=KeyboardInterrupt), \
+             patch('spoonmap.save_terminal_state', return_value='TERM'), \
+             patch('spoonmap.restore_terminal_state') as mock_restore:
+            with pytest.raises(KeyboardInterrupt):
+                _run_masscan_batch(['445'], '1000', str(output_xml),
+                                   '/fake/targets.txt', None, None)
+        assert mock_restore.called
+
     def test_returncode_1_prints_diagnostic_with_stderr(self, tmp_path, capsys):
         output_xml = tmp_path / 'out.xml'
         mock_proc = self._make_mock_proc(returncode=1)
@@ -7842,6 +7855,18 @@ class TestNmapUdpDiscovery:
                 _nmap_udp_discovery('U:500', '/targets.txt', str(tmp_path), '53', '')
         assert mock_proc.kill.called
 
+    def test_interrupt_inside_popen_reraises_and_restores_terminal(self, tmp_path):
+        """SIGINT in the fork/exec window left proc unbound, so proc.kill() in the
+        handler raised UnboundLocalError instead of letting the interrupt out."""
+        (tmp_path / 'discovery' / 'masscan_results').mkdir(parents=True)
+        spoonmap.output_path = str(tmp_path)
+        with patch('spoonmap.subprocess.Popen', side_effect=KeyboardInterrupt), \
+             patch('spoonmap.save_terminal_state', return_value='TERM'), \
+             patch('spoonmap.restore_terminal_state') as mock_restore:
+            with pytest.raises(KeyboardInterrupt):
+                _nmap_udp_discovery('U:500', '/targets.txt', str(tmp_path), '53', '')
+        assert mock_restore.called
+
 
 class TestNmapPortDiscovery:
     """Unit tests for _nmap_port_discovery() — nmap-based port discovery
@@ -8136,6 +8161,21 @@ class TestNmapPortDiscovery:
                 _nmap_port_discovery(['80'], str(target), '', None, scan_type='Custom')
 
         assert mock_proc.kill.called
+
+    def test_interrupt_inside_popen_reraises_and_restores_terminal(self, tmp_path):
+        """SIGINT in the fork/exec window left proc unbound, so the handler's
+        proc.kill() raised UnboundLocalError in place of the interrupt."""
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
+        spoonmap.output_path = str(tmp_path)
+
+        with patch('spoonmap.subprocess.Popen', side_effect=KeyboardInterrupt), \
+             patch('spoonmap.save_terminal_state', return_value='TERM'), \
+             patch('spoonmap.restore_terminal_state') as mock_restore:
+            with pytest.raises(KeyboardInterrupt):
+                _nmap_port_discovery(['80'], str(target), '', None, scan_type='Custom')
+
+        assert mock_restore.called
 
     def test_nmap_not_found_returns_summary(self, tmp_path, capsys):
         target = tmp_path / 'targets.txt'
@@ -8993,6 +9033,23 @@ class TestDiscoverInternalMasscan:
 
         assert mock_proc.kill.called
 
+    def test_interrupt_inside_popen_reraises_and_restores_terminal(self, tmp_path):
+        """SIGINT in the fork/exec window left proc unbound, so the handler's
+        proc.kill() raised UnboundLocalError in place of the interrupt — while
+        the terminal still had to be restored out of masscan's raw mode."""
+        disc = tmp_path / 'discovery'
+        disc.mkdir()
+        targets = tmp_path / 'targets.txt'
+        targets.write_text('10.0.0.0/24\n')
+
+        with patch('spoonmap.subprocess.Popen', side_effect=KeyboardInterrupt), \
+             patch('spoonmap.save_terminal_state', return_value='TERM'), \
+             patch('spoonmap.restore_terminal_state') as mock_restore:
+            with pytest.raises(KeyboardInterrupt):
+                _discover_internal_masscan(str(targets), str(disc), '1000', None, 256)
+
+        assert mock_restore.called
+
 
 class TestStreamMasscanProgress:
     """Unit tests for _stream_masscan_progress()."""
@@ -9146,6 +9203,23 @@ class TestDiscoverExternalMasscan:
                 _discover_external_masscan(str(targets), str(disc), '10000', None, 256)
 
         assert mock_proc.kill.called
+
+    def test_interrupt_inside_popen_reraises_and_restores_terminal(self, tmp_path):
+        """SIGINT in the fork/exec window left proc unbound, so the handler's
+        proc.kill() raised UnboundLocalError in place of the interrupt — while
+        the terminal still had to be restored out of masscan's raw mode."""
+        disc = tmp_path / 'discovery'
+        disc.mkdir()
+        targets = tmp_path / 'targets.txt'
+        targets.write_text('1.2.3.0/24\n')
+
+        with patch('spoonmap.subprocess.Popen', side_effect=KeyboardInterrupt), \
+             patch('spoonmap.save_terminal_state', return_value='TERM'), \
+             patch('spoonmap.restore_terminal_state') as mock_restore:
+            with pytest.raises(KeyboardInterrupt):
+                _discover_external_masscan(str(targets), str(disc), '10000', None, 256)
+
+        assert mock_restore.called
 
 
 class TestExternalHostDiscovery:
@@ -9318,6 +9392,22 @@ class TestNmapHostDiscovery:
 
         assert ips == set()
         assert 'nmap not found' in capsys.readouterr().out
+
+    def test_interrupt_inside_popen_reraises_and_restores_terminal(self, tmp_path):
+        """SIGINT in the fork/exec window left proc unbound, so the handler's
+        proc.kill() raised UnboundLocalError in place of the interrupt."""
+        disc = tmp_path / 'discovery'
+        disc.mkdir()
+        targets = tmp_path / 'targets.txt'
+        targets.write_text('10.0.0.1\n')
+
+        with patch('spoonmap.subprocess.Popen', side_effect=KeyboardInterrupt), \
+             patch('spoonmap.save_terminal_state', return_value='TERM'), \
+             patch('spoonmap.restore_terminal_state') as mock_restore:
+            with pytest.raises(KeyboardInterrupt):
+                _nmap_host_discovery(str(targets), str(disc), '', None)
+
+        assert mock_restore.called
 
     def test_keyboard_interrupt_kills_proc_and_reraises(self, tmp_path):
         disc = tmp_path / 'discovery'
