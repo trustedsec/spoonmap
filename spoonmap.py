@@ -3861,6 +3861,33 @@ def _write_combined_results(output_path, hosts_json, xml_hosts):
     print(_COLOR_RESULT + f'\nResults written to {output_path}/spoonmap_output.xml / .json' + _COLOR_RESET)
 
 
+def _read_config_file(path):
+    """Parse *path* as a JSON object, or print a clear diagnostic and exit.
+
+    config.json is written non-atomically elsewhere, so an interrupted write can
+    leave it empty or truncated.  An unguarded json.load() then turns *both*
+    normal startup and --cleanup -- the documented recovery command -- into the
+    same raw traceback, which is the worst possible time to lose the error
+    message.  json.JSONDecodeError subclasses ValueError; OSError covers an
+    unreadable or root-owned file.
+    """
+    try:
+        with open(path) as fh:
+            config_parser = json.load(fh)
+    except ValueError as exc:
+        print(_COLOR_ERROR + f'ERROR: could not parse {path}: {exc}' + _COLOR_RESET)
+        print(f'Fix the JSON syntax in {path}, or delete it to be prompted instead.')
+        sys.exit(1)
+    except OSError as exc:
+        print(_COLOR_ERROR + f'ERROR: could not read {path}: {exc}' + _COLOR_RESET)
+        sys.exit(1)
+    if not isinstance(config_parser, dict):
+        print(_COLOR_ERROR + f'ERROR: {path} must contain a JSON object, '
+                             f'got {type(config_parser).__name__}.' + _COLOR_RESET)
+        sys.exit(1)
+    return config_parser
+
+
 def _cleanup_cmd(dir_path):
     """Handle --cleanup: remove prior scan output from output_path and exit."""
     idx = sys.argv.index('--cleanup')
@@ -3870,8 +3897,7 @@ def _cleanup_cmd(dir_path):
     else:
         cfg_file = os.path.join(dir_path, 'config.json')
         if os.path.exists(cfg_file):
-            with open(cfg_file) as fh:
-                cfg = json.load(fh)
+            cfg = _read_config_file(cfg_file)
             cleanup_path = cfg.get('output_path', '')
             if cleanup_path and not os.path.isabs(cleanup_path):
                 cleanup_path = os.path.join(dir_path, cleanup_path)
@@ -4261,6 +4287,52 @@ def _handle_previous_results(output_path, resume, prompt_fn=input):
     return False, 'a'
 
 
+# config.json keys that have no sane default: without them there is nothing to
+# scan, nowhere to write, and no way to guess what the operator meant.
+_CONFIG_REQUIRED_KEYS = ('banner_scan', 'target_scan', 'max_rate',
+                         'target_file', 'output_path')
+
+_CONFIG_TRUE_STRINGS = ('true', 'yes', 'on', '1')
+_CONFIG_FALSE_STRINGS = ('false', 'no', 'off', '0', '')
+
+
+def _config_bool(key, value, default):
+    """Coerce a config.json boolean-ish *value*, accepting both spellings.
+
+    config.json.sample quotes its booleans ("resume": "False") but leaves
+    integers bare, which invites JSON-native true/false.  The old code compared
+    == 'True', so a real JSON `true` evaluated to False: setting
+    "script_scan": true silently got you no script scan and no warning.  Legacy
+    "True"/"False" strings must keep working, so both forms are accepted here.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in _CONFIG_TRUE_STRINGS:
+        return True
+    if text in _CONFIG_FALSE_STRINGS:
+        return False
+    print(_COLOR_ERROR + f'Warning: config.json: {key} = {value!r} is not a '
+                         f'boolean; using {default}.' + _COLOR_RESET)
+    return default
+
+
+def _config_int(key, value, default):
+    """Coerce a config.json integer *value*, warning instead of crashing.
+
+    A bare int() raised ValueError on a non-numeric string and TypeError on a
+    JSON null, aborting the run before any scanning happened.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        print(_COLOR_ERROR + f'Warning: config.json: {key} = {value!r} is not a '
+                             f'number; using {default}.' + _COLOR_RESET)
+        return default
+
+
 def _load_config(config_parser, dir_path, resume=False):
     """Derive every scan setting from an already-parsed config.json dict.
 
@@ -4270,7 +4342,19 @@ def _load_config(config_parser, dir_path, resume=False):
     into it so the flag can never be turned back off by the file.  Returns the
     derived settings as a dict; the caller assigns 'output_path' to the module
     global of the same name.
+
+    Missing required keys are reported all at once and then exit: reporting them
+    one crash at a time made fixing a hand-written config a guessing game.
     """
+    missing = [k for k in _CONFIG_REQUIRED_KEYS if k not in config_parser]
+    if missing:
+        print(_COLOR_ERROR + 'ERROR: config.json is missing required '
+                             f'{"key" if len(missing) == 1 else "keys"}: '
+                             + ', '.join(missing) + _COLOR_RESET)
+        print('See config.json.sample for the expected keys, or delete '
+              'config.json to be prompted instead.')
+        sys.exit(1)
+
     scan_categories = config_parser.get('scan_categories', 'All')
     if scan_categories == 'All' or scan_categories == ['All']:
         scan_type = 'All'
@@ -4292,25 +4376,27 @@ def _load_config(config_parser, dir_path, resume=False):
     if config_parser.get('dest_ports'):
         dest_ports = config_parser['dest_ports']
         scan_type = 'Custom'
-    banner_scan = config_parser['banner_scan']
-    if banner_scan == 'True':
-        banner_scan = True
-    else:
-        banner_scan = False
+    banner_scan = _config_bool('banner_scan', config_parser['banner_scan'], False)
     target_scan = config_parser['target_scan']
     source_port = ''
-    max_rate = config_parser['max_rate']
+    # Coerced to str here because _discover_external_masscan() passes max_rate
+    # straight to Popen(), which rejects an int with a bare TypeError.
+    max_rate = str(config_parser['max_rate'])
     target_file = config_parser['target_file']
     output_path = config_parser['output_path']
     # Absent or empty means "no exclusions" — normalize to None so it is
     # neither re-prompted nor passed as an empty --excludefile.
     exclusions_file = config_parser.get('exclusions_file') or None
-    nmap_threads = int(config_parser.get('nmap_threads', 5))
-    masscan_batch_size = int(config_parser.get('masscan_batch_size', 5))
-    nmap_threshold = int(config_parser.get('nmap_threshold', 5_000_000))
-    script_scan = config_parser.get('script_scan', 'False') == 'True'
-    host_discovery = config_parser.get('host_discovery', 'True') == 'True'
-    resume = resume or config_parser.get('resume', 'False').strip().lower() == 'true'
+    nmap_threads = _config_int('nmap_threads', config_parser.get('nmap_threads', 5), 5)
+    masscan_batch_size = _config_int(
+        'masscan_batch_size', config_parser.get('masscan_batch_size', 5), 5)
+    nmap_threshold = _config_int(
+        'nmap_threshold', config_parser.get('nmap_threshold', 5_000_000), 5_000_000)
+    script_scan = _config_bool('script_scan', config_parser.get('script_scan'), False)
+    host_discovery = _config_bool(
+        'host_discovery', config_parser.get('host_discovery'), True)
+    # ORed, never overwritten: --resume can't be turned back off by the file.
+    resume = resume or _config_bool('resume', config_parser.get('resume'), False)
     config_generated = bool(config_parser.get(_CONFIG_GENERATED_KEY))
 
     # Resolve relative paths in config relative to the script directory
@@ -4384,8 +4470,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         config_generated = False
         if os.path.exists(f'{dir_path}/config.json'):
             config_loaded = True
-            with open(f'{dir_path}/config.json') as config:
-                config_parser = json.load(config)
+            config_parser = _read_config_file(f'{dir_path}/config.json')
 
             cfg = _load_config(config_parser, dir_path, resume)
             scan_categories    = cfg['scan_categories']

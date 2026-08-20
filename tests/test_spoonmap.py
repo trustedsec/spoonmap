@@ -55,6 +55,7 @@ from spoonmap import (
     _atomic_write,
     _combine_live_hosts,
     _load_config,
+    _read_config_file,
     _write_combined_results,
     _write_if_changed,
     _write_interactive_config,
@@ -1988,6 +1989,86 @@ class TestLoadConfig:
         assert cfg['max_rate'] == '20000'
         assert cfg['scan_categories'] == ['Web']
 
+    # ---- JSON-native booleans (config.json.sample quotes booleans but not
+    # ints, so operators reasonably write real JSON true/false) --------------
+
+    def test_json_native_true_enables_script_scan(self):
+        # Regression: == 'True' made a real JSON `true` evaluate to False, so
+        # "script_scan": true silently ran no script scan and warned nobody.
+        assert _load_config(_config_dict(script_scan=True), '/t')['script_scan'] is True
+
+    def test_json_native_false_disables_script_scan(self):
+        assert _load_config(_config_dict(script_scan=False), '/t')['script_scan'] is False
+
+    def test_json_native_true_enables_banner_scan(self):
+        assert _load_config(_config_dict(banner_scan=True), '/t')['banner_scan'] is True
+
+    def test_json_native_false_disables_host_discovery(self):
+        cfg = _load_config(_config_dict(host_discovery=False), '/t')
+        assert cfg['host_discovery'] is False
+
+    def test_json_native_false_resume_does_not_raise(self):
+        # .strip() on a bool raised AttributeError before the coercion helper.
+        assert _load_config(_config_dict(resume=False), '/t')['resume'] is False
+
+    def test_json_native_true_resume(self):
+        assert _load_config(_config_dict(resume=True), '/t')['resume'] is True
+
+    def test_legacy_string_resume_still_works(self):
+        assert _load_config(_config_dict(resume='False'), '/t')['resume'] is False
+
+    def test_null_boolean_falls_back_to_default(self):
+        cfg = _load_config(_config_dict(host_discovery=None, script_scan=None), '/t')
+        assert cfg['host_discovery'] is True
+        assert cfg['script_scan'] is False
+
+    def test_unparseable_boolean_warns_and_uses_default(self, capsys):
+        cfg = _load_config(_config_dict(host_discovery='maybe'), '/t')
+        assert cfg['host_discovery'] is True
+        out = capsys.readouterr().out
+        assert 'host_discovery' in out
+        assert 'not a boolean' in out
+
+    # ---- numeric coercion --------------------------------------------------
+
+    def test_max_rate_json_number_coerced_to_str(self):
+        # _discover_external_masscan passes max_rate straight to Popen(), which
+        # rejects an int with a bare TypeError.
+        assert _load_config(_config_dict(max_rate=2000), '/t')['max_rate'] == '2000'
+
+    def test_non_numeric_nmap_threads_warns_and_uses_default(self, capsys):
+        cfg = _load_config(_config_dict(nmap_threads='lots'), '/t')
+        assert cfg['nmap_threads'] == 5
+        out = capsys.readouterr().out
+        assert 'nmap_threads' in out
+        assert 'not a number' in out
+
+    def test_null_masscan_batch_size_warns_and_uses_default(self, capsys):
+        cfg = _load_config(_config_dict(masscan_batch_size=None), '/t')
+        assert cfg['masscan_batch_size'] == 5
+        assert 'masscan_batch_size' in capsys.readouterr().out
+
+    # ---- required-key validation -------------------------------------------
+
+    def test_missing_target_scan_reports_key_and_exits(self, capsys):
+        cfg = _config_dict()
+        del cfg['target_scan']
+        with pytest.raises(SystemExit) as exc:
+            _load_config(cfg, '/t')
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert 'target_scan' in out
+        assert 'missing required key' in out
+
+    def test_every_missing_key_named_in_one_message(self, capsys):
+        # Not one crash at a time: all missing keys in a single message.
+        with pytest.raises(SystemExit):
+            _load_config({'target_scan': 'Internal'}, '/t')
+        out = capsys.readouterr().out
+        for key in ('banner_scan', 'max_rate', 'target_file', 'output_path'):
+            assert key in out
+        assert 'missing required keys' in out
+
 
 # ── Config: Full scan_categories ──────────────────────────────────────────────
 
@@ -2680,6 +2761,55 @@ class TestHandlePreviousResults:
         assert (delete_choice, append_choice) == ('d', 'a')
 
 
+# ── _read_config_file ─────────────────────────────────────────────────────────
+
+class TestReadConfigFile:
+    """config.json is written non-atomically, so a truncated file must not
+    turn both normal startup and --cleanup into identical tracebacks."""
+
+    def test_valid_object_is_returned(self, tmp_path):
+        cfg = tmp_path / 'config.json'
+        cfg.write_text('{"output_path": "/out"}')
+        assert _read_config_file(str(cfg)) == {'output_path': '/out'}
+
+    def test_malformed_json_reports_path_and_exits(self, tmp_path, capsys):
+        cfg = tmp_path / 'config.json'
+        cfg.write_text('{"output_path": "/out",}')  # trailing comma
+        with pytest.raises(SystemExit) as exc:
+            _read_config_file(str(cfg))
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert 'could not parse' in out
+        assert str(cfg) in out
+
+    def test_empty_file_reports_path_and_exits(self, tmp_path, capsys):
+        cfg = tmp_path / 'config.json'
+        cfg.write_text('')
+        with pytest.raises(SystemExit) as exc:
+            _read_config_file(str(cfg))
+        assert exc.value.code == 1
+        assert 'could not parse' in capsys.readouterr().out
+
+    def test_unreadable_file_reports_path_and_exits(self, tmp_path, capsys):
+        cfg = str(tmp_path / 'config.json')
+        with patch('spoonmap.open', side_effect=PermissionError('Permission denied')):
+            with pytest.raises(SystemExit) as exc:
+                _read_config_file(cfg)
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert 'could not read' in out
+        assert cfg in out
+
+    def test_json_array_rejected_as_not_an_object(self, tmp_path, capsys):
+        # A list has no .get(), so this would be an AttributeError later.
+        cfg = tmp_path / 'config.json'
+        cfg.write_text('[]')
+        with pytest.raises(SystemExit) as exc:
+            _read_config_file(str(cfg))
+        assert exc.value.code == 1
+        assert 'must contain a JSON object' in capsys.readouterr().out
+
+
 # ── _cleanup_cmd ──────────────────────────────────────────────────────────────
 
 class TestCleanupCmd:
@@ -2724,6 +2854,16 @@ class TestCleanupCmd:
                 _cleanup_cmd(str(tmp_path))
         assert exc.value.code == 0
         assert not _previous_results_exist(str(out_dir))
+
+    def test_cleanup_with_malformed_config_reports_error(self, tmp_path, capsys):
+        # --cleanup is the documented recovery command; a truncated config.json
+        # must not make it fail with the same traceback as normal startup.
+        (tmp_path / 'config.json').write_text('{"output_path":')
+        with patch('sys.argv', ['spoonmap.py', '--cleanup']):
+            with pytest.raises(SystemExit) as exc:
+                _cleanup_cmd(str(tmp_path))
+        assert exc.value.code == 1
+        assert 'could not parse' in capsys.readouterr().out
 
     def test_cleanup_no_data_exits_cleanly(self, tmp_path, capsys):
         with patch('sys.argv', ['spoonmap.py', '--cleanup', str(tmp_path)]):
