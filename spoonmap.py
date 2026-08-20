@@ -2507,11 +2507,13 @@ def _scan_extra_sql_ports(output_path, source_port):
                 # <address> child, and KeyError on one with no addr=.  Both were
                 # swallowed by the broad guard below, which abandons the rest of
                 # the file — so one unusable host element lost every other SQL
-                # named instance in it.  Prefer the IPv4 address explicitly and
-                # skip the host when there is no usable identifier.
+                # named instance in it.  Require the IPv4 address and skip the
+                # host when there is none: the fallback to find('address') that
+                # used to sit here returned a MAC or an IPv6 literal on a
+                # dual-stacked host, and this ip becomes an nmap scan target
+                # below — a MAC address there is an unresolvable target, not a
+                # degraded one.
                 addr_elem = host.find("address[@addrtype='ipv4']")
-                if addr_elem is None:
-                    addr_elem = host.find('address')
                 ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
                 if not ip:
                     continue
@@ -2586,7 +2588,15 @@ def _validate_snmp_any_community(nmap_dir, scan_type):
         except Exception:
             continue
         for host_elem in tree.findall('.//host'):
-            addr = host_elem.find('address')
+            # addrtype="ipv4" filter, as every other parser in this module does.
+            # An unfiltered find('address') returns the first <address> child
+            # whatever its type, and on a dual-stacked or ARP-resolved host that
+            # is routinely the MAC or the IPv6 literal.  This ip is not just a
+            # label — it is handed straight to nmap below as the scan target, so
+            # the "confirm it accepts any community" re-scan aimed at a MAC
+            # address, failed to resolve, and the host was quietly dropped from
+            # validated{} instead of being reported as accepting any community.
+            addr = host_elem.find("address[@addrtype='ipv4']")
             if addr is None:
                 continue
             ip = addr.attrib.get('addr', '')

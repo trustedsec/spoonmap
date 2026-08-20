@@ -3814,6 +3814,53 @@ class TestValidateSnmpAnyCommunity:
         assert '10.0.0.12' in output
         assert 'validation skipped' in output
 
+    def test_mac_address_is_not_used_as_the_scan_target(self, tmp_path):
+        """The unfiltered find('address') took the first <address> child whatever
+        its type.  On an ARP-resolved internal host that is the MAC, and this ip
+        goes straight to nmap as a scan target — so the follow-up probe aimed at
+        a MAC address.  The ipv4 child must win regardless of document order."""
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun><host>'
+            '<address addr="AA:BB:CC:DD:EE:FF" addrtype="mac"/>'
+            '<address addr="10.0.0.21" addrtype="ipv4"/>'
+            '<ports><port protocol="udp" portid="161">'
+            '<script id="snmp-brute" output="a - Valid credentials\nb - Valid credentials'
+            '\nc - Valid credentials\nd - Valid credentials\ne - Valid credentials"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nmap_results / 'port161.xml').write_text(xml)
+
+        mock_result = MagicMock()
+        mock_result.stdout = 'Valid credentials'
+        with patch('spoonmap.subprocess.run', return_value=mock_result) as mock_run:
+            validated = _validate_snmp_any_community(str(tmp_path), 'Internal')
+
+        assert validated == {'10.0.0.21': True}
+        assert mock_run.call_args[0][0][-1] == '10.0.0.21'
+
+    def test_host_with_no_ipv4_address_is_skipped(self, tmp_path):
+        """An IPv6-only <host> has no usable IPv4 target, so it must be skipped
+        rather than handing nmap a v6 literal this IPv4-only tool cannot scan."""
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun><host>'
+            '<address addr="fe80::1" addrtype="ipv6"/>'
+            '<ports><port protocol="udp" portid="161">'
+            '<script id="snmp-brute" output="a - Valid credentials\nb - Valid credentials'
+            '\nc - Valid credentials\nd - Valid credentials\ne - Valid credentials"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nmap_results / 'port161.xml').write_text(xml)
+
+        with patch('spoonmap.subprocess.run') as mock_run:
+            validated = _validate_snmp_any_community(str(tmp_path), 'Internal')
+
+        assert validated == {}
+        assert not mock_run.called
+
 
 # ── SNMP severity and detail tests ───────────────────────────────────────────
 
@@ -5138,6 +5185,77 @@ class TestScanExtraSqlPorts:
         commands = [c[0][0] for c in mock_popen.call_args_list]
         assert commands, 'the third host\'s named instance must still be scanned'
         assert all('51234' in cmd for cmd in commands)
+
+    def test_mac_address_is_not_used_as_the_scan_target(self, tmp_path):
+        """ip becomes an nmap scan target, so it must be the IPv4 address and not
+        whichever <address> child came first — an ARP-resolved internal host
+        lists its MAC there, and a MAC is an unresolvable target."""
+        xml = textwrap.dedent("""\
+            <?xml version="1.0"?>
+            <nmaprun>
+              <host>
+                <address addr="AA:BB:CC:DD:EE:FF" addrtype="mac"/>
+                <address addr="192.168.1.10" addrtype="ipv4"/>
+                <ports>
+                  <port protocol="udp" portid="1434">
+                    <script id="ms-sql-info" output="SQL Server Express">
+                      <table key="192.168.1.10\\SQLEXPRESS">
+                        <elem key="TCP port">51234</elem>
+                      </table>
+                    </script>
+                  </port>
+                </ports>
+              </host>
+            </nmaprun>
+        """)
+        nse_dir = tmp_path / 'nse_results'
+        nse_dir.mkdir()
+        (nse_dir / 'portU_1434.xml').write_text(xml)
+
+        with patch('spoonmap.subprocess.Popen') as mock_popen, \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            mock_proc = MagicMock()
+            mock_proc.wait.return_value = 0
+            mock_popen.return_value = mock_proc
+            _scan_extra_sql_ports(str(tmp_path), '88')
+
+        commands = [c[0][0] for c in mock_popen.call_args_list]
+        assert commands
+        for cmd in commands:
+            assert '192.168.1.10' in cmd
+            assert 'AA:BB:CC:DD:EE:FF' not in cmd
+
+    def test_host_with_only_a_non_ipv4_address_is_skipped(self, tmp_path):
+        """No IPv4 child means no scannable target: skip the host rather than
+        handing nmap an IPv6 literal this IPv4-only tool cannot scan."""
+        xml = textwrap.dedent("""\
+            <?xml version="1.0"?>
+            <nmaprun>
+              <host>
+                <address addr="fe80::1" addrtype="ipv6"/>
+                <ports>
+                  <port protocol="udp" portid="1434">
+                    <script id="ms-sql-info" output="SQL Server Express">
+                      <table key="HOST\\SQLEXPRESS">
+                        <elem key="TCP port">51234</elem>
+                      </table>
+                    </script>
+                  </port>
+                </ports>
+              </host>
+            </nmaprun>
+        """)
+        nse_dir = tmp_path / 'nse_results'
+        nse_dir.mkdir()
+        (nse_dir / 'portU_1434.xml').write_text(xml)
+
+        with patch('spoonmap.subprocess.Popen') as mock_popen, \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            _scan_extra_sql_ports(str(tmp_path), '88')
+
+        assert not mock_popen.called
 
     def test_malformed_xml_logged_and_skipped(self, tmp_path, capsys):
         nse_dir = tmp_path / 'nse_results'
