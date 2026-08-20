@@ -337,6 +337,48 @@ def _atomic_write(path, content):
         raise
 
 
+def _safe_mtime(path):
+    """Return *path*'s mtime, or 0 if it cannot be read.
+
+    Closes the exists()/getmtime() race in the resume gates: a file removed by
+    another process between the two calls must read as stale (0) rather than
+    raising FileNotFoundError and aborting a scan mid-run.
+    """
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
+
+
+def _resume_cache_usable(output_file, baseline_mtime, description, is_xml=True):
+    """True when cached *output_file* may satisfy a resume gate.
+
+    Existence plus freshness is not enough.  A scan that was killed, or that
+    died before writing anything, leaves a zero-length or truncated output file
+    behind; a gate that only checks existence treats that emptiness as
+    "already done" forever, silently under-scanning with no warning.  So the
+    file must also hold usable content: XML outputs have to parse (via
+    _parse_result_xml, which rejects empty and unterminated files), while a
+    plain-text host list only has to be non-empty.
+
+    *baseline_mtime* keeps the separate, still-valid freshness concern: a target
+    list edited after the cache was written must force the work to be redone.
+    Pass 0 for gates with no target-file baseline.
+    """
+    if not os.path.exists(output_file):
+        return False
+    if _safe_mtime(output_file) < baseline_mtime:
+        return False
+    if is_xml:
+        usable = _parse_result_xml(output_file) is not None
+    else:
+        usable = os.path.isfile(output_file) and os.path.getsize(output_file) > 0
+    if not usable:
+        print(_COLOR_INFO + f're-running {description}: cached result was empty '
+                            'or unreadable' + _COLOR_RESET)
+    return usable
+
+
 def preprocess_targets(target_file, output_path):
     """
     Preprocess the target file to separate hostnames from IPs.
@@ -658,10 +700,9 @@ def _host_discovery(target_file, output_path, max_rate, exclusions_file,
     # Resume: reuse cached discovery only if it is newer than the target file.
     # If the target set changed since the cache was written, re-discover so
     # newly added ranges are not silently skipped.
-    targets_mtime = os.path.getmtime(target_file) if os.path.exists(target_file) else 0
-    if (resume
-            and os.path.exists(discovery_file)
-            and os.path.getmtime(discovery_file) >= targets_mtime):
+    targets_mtime = _safe_mtime(target_file)
+    if resume and _resume_cache_usable(discovery_file, targets_mtime,
+                                       'host discovery', is_xml=False):
         with open(discovery_file) as fh:
             count = sum(1 for line in fh if line.strip())
         print(_COLOR_INFO + f'Resume: skipping host discovery ({count} hosts cached)' + _COLOR_RESET)
@@ -943,10 +984,9 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
 
     # Resume: reuse cached UDP results only if newer than the target file, so a
     # changed target set forces a re-scan rather than reusing stale hosts.
-    targets_mtime = os.path.getmtime(target_file) if os.path.exists(target_file) else 0
-    if (resume
-            and os.path.exists(output_file)
-            and os.path.getmtime(output_file) >= targets_mtime):
+    targets_mtime = _safe_mtime(target_file)
+    if resume and _resume_cache_usable(output_file, targets_mtime,
+                                       f'UDP port {port_num} discovery'):
         live_file = f'{_disc(output_path)}/live_hosts/port{_port_fname(udp_port)}.txt'
         if os.path.exists(live_file):
             with open(live_file) as fh:
@@ -1017,14 +1057,14 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
     os.makedirs(f'{disc}/live_hosts', exist_ok=True)
 
     output_file = f'{disc}/masscan_results/portDirect.xml'
-    targets_mtime = os.path.getmtime(target_file) if os.path.exists(target_file) else 0
+    targets_mtime = _safe_mtime(target_file)
 
     status_summary = '\nSummary'
 
-    # Resume: if output already exists and is newer than the targets file, reload from live_hosts/
-    if (resume
-            and os.path.exists(output_file)
-            and os.path.getmtime(output_file) >= targets_mtime):
+    # Resume: if output already exists, is newer than the targets file, and holds
+    # usable results, reload from live_hosts/
+    if resume and _resume_cache_usable(output_file, targets_mtime,
+                                       'nmap port discovery'):
         print(_COLOR_INFO + 'Resume: skipping completed nmap port discovery' + _COLOR_RESET)
         live_hosts_dir = f'{disc}/live_hosts'
         if os.path.exists(live_hosts_dir):
@@ -1254,10 +1294,9 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
     if scan_type == 'Full':
         output_file = f'{disc}/masscan_results/portFull.xml'
         full_targets_file = f'{disc}/resolved_targets.txt'
-        full_targets_mtime = os.path.getmtime(full_targets_file) if os.path.exists(full_targets_file) else 0
-        if (resume
-                and os.path.exists(output_file)
-                and os.path.getmtime(output_file) >= full_targets_mtime):
+        full_targets_mtime = _safe_mtime(full_targets_file)
+        if resume and _resume_cache_usable(output_file, full_targets_mtime,
+                                          'Full port scan'):
             print(_COLOR_INFO + 'Resume: skipping completed Full port scan' + _COLOR_RESET)
             live_hosts_dir = f'{disc}/live_hosts'
             full_results = {}
@@ -1425,15 +1464,15 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
     scan_start_time = time.time()
 
     targets_file = f'{disc}/resolved_targets.txt'
-    targets_mtime = os.path.getmtime(targets_file) if os.path.exists(targets_file) else 0
+    targets_mtime = _safe_mtime(targets_file)
 
     for batch_idx, batch in enumerate(batches):
         batch_label = ', '.join(batch)
         output_file = f'{disc}/masscan_results/batch_{batch_idx}.xml'
 
-        if (resume
-                and os.path.exists(output_file)
-                and os.path.getmtime(output_file) >= targets_mtime):
+        if resume and _resume_cache_usable(
+                output_file, targets_mtime,
+                f'batch {batch_idx + 1}/{total_batches} ({batch_label})'):
             print(_COLOR_INFO +
                   f'Resume: skipping completed batch {batch_idx + 1}/{total_batches} '
                   f'({batch_label})' + _COLOR_RESET)
@@ -1776,7 +1815,12 @@ def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
                     and not host_file.endswith('_hostnames.txt')):
                 continue
             dest_port = _fname_port((host_file.split('.')[0])[4:])
-            banner_done = os.path.exists(f'{output_path}/nmap_results/port{_port_fname(dest_port)}.xml')
+            # An nmap killed part-way through leaves a zero-length or truncated
+            # portN.xml; require parseable content so that port is rescanned
+            # instead of being treated as banner-grabbed forever.
+            banner_done = _resume_cache_usable(
+                f'{output_path}/nmap_results/port{_port_fname(dest_port)}.xml',
+                0, f'port {dest_port} banner scan')
             scripts_exist = _get_scripts_for_port(dest_port, target_scan)
             script_done = (not script_scan or not scripts_exist or
                            os.path.exists(f'{output_path}/nse_results/port{_port_fname(dest_port)}.xml'))

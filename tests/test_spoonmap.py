@@ -81,6 +81,8 @@ from spoonmap import (
     _aggregate_result_dir,
     _path_completion,
     _run_masscan_batch,
+    _resume_cache_usable,
+    _safe_mtime,
     _scan_extra_sql_ports,
     _validate_snmp_any_community,
     _SMB_COUPLED_PORTS,
@@ -2008,6 +2010,68 @@ class TestFullPortScan:
         assert tarpit_file.exists()
         assert '10.0.0.9' in tarpit_file.read_text()
 
+    def _setup_full_resume_cache(self, tmp_path, xml_text):
+        spoonmap.output_path = str(tmp_path)
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        (disc / 'live_hosts').mkdir(parents=True)
+        targets = disc / 'resolved_targets.txt'
+        targets.write_text('10.0.0.1\n')
+        cached = disc / 'masscan_results' / 'portFull.xml'
+        cached.write_text(xml_text)
+        (disc / 'live_hosts' / 'port22.txt').write_text('10.0.0.1\n10.0.0.2\n')
+        os.utime(str(targets), (1000, 1000))
+        os.utime(str(cached), (2000, 2000))  # fresh mtime
+        return disc, targets
+
+    def test_full_scan_resume_reruns_on_zero_length_xml(self, tmp_path, capsys):
+        # A masscan killed mid-run leaves an empty portFull.xml; resume must
+        # redo the scan instead of trusting the (fresh) mtime.
+        disc, targets = self._setup_full_resume_cache(tmp_path, '')
+        with patch('spoonmap._run_masscan_batch',
+                   return_value={'443': {'10.0.0.3'}}) as mock_batch:
+            result = mass_scan('Full', ['1-65535'], '53', '10000',
+                               str(targets), '', resume=True)
+
+        assert mock_batch.called
+        out = capsys.readouterr().out
+        assert 're-running Full port scan' in out
+        assert 'skipping completed Full port scan' not in out
+        assert 'Hosts Found on Port 443: 1' in result
+
+    def test_full_scan_resume_reruns_on_unparseable_xml(self, tmp_path, capsys):
+        disc, targets = self._setup_full_resume_cache(tmp_path, '<nmaprun><host>')
+        with patch('spoonmap._run_masscan_batch',
+                   return_value={'443': {'10.0.0.3'}}) as mock_batch:
+            result = mass_scan('Full', ['1-65535'], '53', '10000',
+                               str(targets), '', resume=True)
+
+        assert mock_batch.called
+        assert 're-running Full port scan' in capsys.readouterr().out
+        assert 'Hosts Found on Port 443: 1' in result
+
+    def test_full_scan_resume_reruns_on_stale_xml(self, tmp_path):
+        disc, targets = self._setup_full_resume_cache(tmp_path, '<nmaprun/>')
+        os.utime(str(targets), (3000, 3000))  # targets newer → stale cache
+        with patch('spoonmap._run_masscan_batch',
+                   return_value={'443': {'10.0.0.3'}}) as mock_batch:
+            result = mass_scan('Full', ['1-65535'], '53', '10000',
+                               str(targets), '', resume=True)
+
+        assert mock_batch.called
+        assert 'Hosts Found on Port 443: 1' in result
+
+    def test_full_scan_resume_still_skips_valid_fresh_xml(self, tmp_path, capsys):
+        # Load-bearing direction: a completed Full scan must stay skipped.
+        disc, targets = self._setup_full_resume_cache(tmp_path, '<nmaprun/>')
+        with patch('spoonmap._run_masscan_batch') as mock_batch:
+            result = mass_scan('Full', ['1-65535'], '53', '10000',
+                               str(targets), '', resume=True)
+
+        assert not mock_batch.called
+        assert 'skipping completed Full port scan' in capsys.readouterr().out
+        assert 'Hosts Found on Port 22: 2' in result
+
 
 class TestMassScanTarpitFlag:
     """mass_scan() batch-path wiring of the suspected-tarpit check (non-Full scans)."""
@@ -2608,6 +2672,69 @@ class TestAtomicWrite:
 
 # ── resume freshness (idempotent target write + staleness gates) ──────────────
 
+class TestSafeMtime:
+    def test_returns_mtime_of_existing_file(self, tmp_path):
+        p = tmp_path / 'f.txt'
+        p.write_text('x')
+        os.utime(str(p), (1000, 1000))
+        assert _safe_mtime(str(p)) == 1000
+
+    def test_missing_file_reads_as_zero(self, tmp_path):
+        # Also covers the TOCTOU case: a file removed between exists() and
+        # getmtime() must read as stale instead of raising FileNotFoundError.
+        assert _safe_mtime(str(tmp_path / 'gone.txt')) == 0
+
+
+class TestResumeCacheUsable:
+    def test_missing_output_is_not_usable(self, tmp_path):
+        assert _resume_cache_usable(str(tmp_path / 'none.xml'), 0, 'thing') is False
+
+    def test_fresh_parseable_xml_is_usable(self, tmp_path):
+        p = tmp_path / 'out.xml'
+        p.write_text('<nmaprun/>')
+        os.utime(str(p), (2000, 2000))
+        assert _resume_cache_usable(str(p), 1000, 'thing') is True
+
+    def test_stale_xml_is_not_usable(self, tmp_path, capsys):
+        p = tmp_path / 'out.xml'
+        p.write_text('<nmaprun/>')
+        os.utime(str(p), (1000, 1000))
+        assert _resume_cache_usable(str(p), 2000, 'thing') is False
+        # Staleness is not an "unusable content" condition — no content warning.
+        assert 'cached result was empty' not in capsys.readouterr().out
+
+    def test_zero_length_xml_is_not_usable(self, tmp_path, capsys):
+        p = tmp_path / 'out.xml'
+        p.write_text('')
+        assert _resume_cache_usable(str(p), 0, 'port 445 discovery') is False
+        assert 're-running port 445 discovery' in capsys.readouterr().out
+
+    def test_unparseable_xml_is_not_usable(self, tmp_path, capsys):
+        p = tmp_path / 'out.xml'
+        p.write_text('<nmaprun><host>')  # unclosed tags
+        assert _resume_cache_usable(str(p), 0, 'port 445 discovery') is False
+        assert 'cached result was empty' in capsys.readouterr().out
+
+    def test_nonempty_text_output_is_usable(self, tmp_path):
+        p = tmp_path / 'hosts.txt'
+        p.write_text('10.0.0.1\n')
+        assert _resume_cache_usable(str(p), 0, 'thing', is_xml=False) is True
+
+    def test_empty_text_output_is_not_usable(self, tmp_path, capsys):
+        p = tmp_path / 'hosts.txt'
+        p.write_text('')
+        assert _resume_cache_usable(str(p), 0, 'host discovery', is_xml=False) is False
+        assert 're-running host discovery' in capsys.readouterr().out
+
+    def test_text_predicate_not_applied_as_xml(self, tmp_path):
+        # A .txt host list would always fail _parse_result_xml's suffix check;
+        # is_xml=False must use the non-empty predicate instead.
+        p = tmp_path / 'hosts.txt'
+        p.write_text('10.0.0.1\n')
+        assert _parse_result_xml(str(p)) is None
+        assert _resume_cache_usable(str(p), 0, 'thing', is_xml=False) is True
+
+
 class TestWriteIfChanged:
     def test_creates_missing_file(self, tmp_path):
         p = tmp_path / 'f.txt'
@@ -2727,6 +2854,49 @@ class TestHostDiscoveryResumeFreshness:
         assert result == str(cache)
         assert '10.9.9.9' in cache.read_text()
 
+    def test_empty_cache_triggers_rediscovery(self, tmp_path, capsys):
+        # A discovery run that died before writing any host leaves a
+        # zero-length live_hosts_discovery.txt; a fresh mtime must not make
+        # that count as "discovery already done".
+        out, target, cache = self._setup(tmp_path)
+        cache.write_text('')
+        os.utime(str(target), (1000, 1000))
+        os.utime(str(cache), (2000, 2000))  # fresh, but empty
+        with patch('spoonmap._build_discovery_target_file',
+                   return_value=(str(target), 1)), \
+             patch('spoonmap._internal_host_discovery',
+                   return_value={'10.9.9.9'}) as m:
+            result = _host_discovery(str(target), str(out), '1000', None,
+                                     scan_type='Internal', resume=True)
+        assert m.called
+        assert result == str(cache)
+        assert '10.9.9.9' in cache.read_text()
+        assert 're-running host discovery' in capsys.readouterr().out
+
+    def test_cache_deleted_after_exists_check_is_not_reused(self, tmp_path):
+        # TOCTOU: the file vanishes between exists() and getmtime(); the gate
+        # must treat it as stale rather than raising FileNotFoundError.
+        out, target, cache = self._setup(tmp_path)
+        os.utime(str(target), (1000, 1000))
+        os.utime(str(cache), (2000, 2000))
+        real_exists = os.path.exists
+
+        def vanishing_exists(path):
+            if path == str(cache) and os.path.lexists(path):
+                os.unlink(path)
+                return True
+            return real_exists(path)
+
+        with patch('spoonmap.os.path.exists', side_effect=vanishing_exists), \
+             patch('spoonmap._build_discovery_target_file',
+                   return_value=(str(target), 1)), \
+             patch('spoonmap._internal_host_discovery',
+                   return_value={'10.9.9.9'}) as m:
+            result = _host_discovery(str(target), str(out), '1000', None,
+                                     scan_type='Internal', resume=True)
+        assert m.called
+        assert result == str(cache)
+
 
 class TestHostDiscoveryBranches:
     """_host_discovery() branches not covered by the resume-freshness tests."""
@@ -2813,6 +2983,58 @@ class TestNmapUdpDiscoveryResumeFreshness:
                 'U:53', str(target), str(tmp_path), '', None, resume=True)
         assert mock_popen.called
         assert result == {'10.0.0.9'}
+
+    _RESCAN_XML = (
+        '<?xml version="1.0"?>'
+        '<nmaprun><host>'
+        '<address addr="10.0.0.9" addrtype="ipv4"/>'
+        '<ports><port protocol="udp" portid="53">'
+        '<state state="open"/></port></ports>'
+        '</host></nmaprun>'
+    )
+
+    def _fake_popen_writing_results(self):
+        def fake_popen(cmd, *args, **kwargs):
+            with open(cmd[cmd.index('-oX') + 1], 'w') as fh:
+                fh.write(self._RESCAN_XML)
+            proc = MagicMock()
+            proc.wait.return_value = 0
+            return proc
+        return fake_popen
+
+    def test_zero_length_cached_xml_triggers_rescan(self, tmp_path, capsys):
+        # An nmap killed before it flushed anything leaves an empty portU_53.xml;
+        # a fresh mtime must not make that count as a completed UDP scan.
+        target, xml, live = self._setup(tmp_path)
+        xml.write_text('')
+        os.utime(str(target), (1000, 1000))
+        os.utime(str(xml), (2000, 2000))  # fresh, but empty
+        spoonmap.output_path = str(tmp_path)
+        with patch('spoonmap.subprocess.Popen',
+                   side_effect=self._fake_popen_writing_results()) as mock_popen, \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            result = spoonmap._nmap_udp_discovery(
+                'U:53', str(target), str(tmp_path), '', None, resume=True)
+        assert mock_popen.called
+        assert result == {'10.0.0.9'}
+        assert 're-running UDP port 53 discovery' in capsys.readouterr().out
+
+    def test_unparseable_cached_xml_triggers_rescan(self, tmp_path, capsys):
+        target, xml, live = self._setup(tmp_path)
+        xml.write_text('<nmaprun><host>')  # unclosed tags
+        os.utime(str(target), (1000, 1000))
+        os.utime(str(xml), (2000, 2000))
+        spoonmap.output_path = str(tmp_path)
+        with patch('spoonmap.subprocess.Popen',
+                   side_effect=self._fake_popen_writing_results()) as mock_popen, \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            result = spoonmap._nmap_udp_discovery(
+                'U:53', str(target), str(tmp_path), '', None, resume=True)
+        assert mock_popen.called
+        assert result == {'10.0.0.9'}
+        assert 're-running UDP port 53 discovery' in capsys.readouterr().out
 
 
 # ── _handle_previous_results (delete / append / resume prompt) ────────────────
@@ -4026,6 +4248,57 @@ class TestMassScanResume:
             if 'probe_fast' not in c[0][2] and 'probe_slow' not in c[0][2]
         ]
         assert len(main_calls) >= 1, 'Batch must re-run when targets file is newer'
+
+    def _setup_batch_cache(self, tmp_path, xml_text):
+        """Fresh-mtime batch_0.xml holding *xml_text*, plus a targets file."""
+        spoonmap.output_path = str(tmp_path)
+        batch_xml = tmp_path / 'discovery' / 'masscan_results' / 'batch_0.xml'
+        batch_xml.parent.mkdir(parents=True)
+        batch_xml.write_text(xml_text)
+        targets_file = tmp_path / 'discovery' / 'resolved_targets.txt'
+        targets_file.write_text('10.0.0.1\n')
+        os.utime(str(targets_file), (1000, 1000))
+        os.utime(str(batch_xml), (2000, 2000))  # fresh mtime
+        return batch_xml, targets_file
+
+    @staticmethod
+    def _main_batch_calls(mock_b):
+        return [c for c in mock_b.call_args_list
+                if 'probe_fast' not in c[0][2] and 'probe_slow' not in c[0][2]]
+
+    def test_batch_rerun_when_cached_xml_is_zero_length(self, tmp_path, capsys):
+        """An empty batch_0.xml (masscan killed mid-batch) must not be trusted."""
+        self._setup_batch_cache(tmp_path, '')
+
+        with patch('spoonmap._run_masscan_batch', return_value={}) as mock_b:
+            mass_scan('All', ['80', '443'], '53', '10000',
+                      '/fake/targets.txt', '', batch_size=10, resume=True)
+
+        assert len(self._main_batch_calls(mock_b)) >= 1
+        out = capsys.readouterr().out
+        assert 're-running batch 1/' in out
+        assert 'skipping completed batch' not in out
+
+    def test_batch_rerun_when_cached_xml_is_unparseable(self, tmp_path, capsys):
+        self._setup_batch_cache(tmp_path, '<nmaprun><host>')  # unclosed tags
+
+        with patch('spoonmap._run_masscan_batch', return_value={}) as mock_b:
+            mass_scan('All', ['80', '443'], '53', '10000',
+                      '/fake/targets.txt', '', batch_size=10, resume=True)
+
+        assert len(self._main_batch_calls(mock_b)) >= 1
+        assert 're-running batch 1/' in capsys.readouterr().out
+
+    def test_batch_still_skipped_when_cached_xml_is_valid_and_fresh(self, tmp_path, capsys):
+        """Load-bearing direction: a genuinely completed batch stays skipped."""
+        self._setup_batch_cache(tmp_path, '<?xml version="1.0"?><nmaprun></nmaprun>')
+
+        with patch('spoonmap._run_masscan_batch', return_value={}) as mock_b:
+            mass_scan('All', ['80', '443'], '53', '10000',
+                      '/fake/targets.txt', '', batch_size=10, resume=True)
+
+        assert self._main_batch_calls(mock_b) == []
+        assert 'skipping completed batch' in capsys.readouterr().out
 
     def test_leftover_live_hosts_file_merged_into_fresh_batch_results(self, tmp_path):
         """A pre-existing live_hosts file for a port (e.g. left over from an
@@ -5387,6 +5660,39 @@ class TestNmapScan:
 
         assert not mock_worker.called
         assert 'already been scanned' in capsys.readouterr().out
+
+    def _setup_banner_cache(self, tmp_path, xml_text):
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts')
+        os.makedirs(f'{tmp_path}/nmap_results')
+        os.makedirs(f'{tmp_path}/nse_results')
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n')
+        (Path(tmp_path) / 'nmap_results' / 'port80.xml').write_text(xml_text)
+
+    def test_zero_length_banner_xml_is_rescanned(self, tmp_path, capsys):
+        # nmap_worker's own docstring notes an individual nmap PID can be killed
+        # externally; that leaves a zero-length portN.xml which the old
+        # existence-only check treated as done forever.
+        self._setup_banner_cache(tmp_path, '')
+
+        with patch('spoonmap.nmap_worker', side_effect=_fake_worker_drain) as mock_worker:
+            nmap_scan('88', max_threads=2, script_scan=False)
+
+        assert mock_worker.called
+        out = capsys.readouterr().out
+        assert 're-running port 80 banner scan' in out
+        assert 'already been scanned' not in out
+
+    def test_unparseable_banner_xml_is_rescanned(self, tmp_path, capsys):
+        self._setup_banner_cache(tmp_path, '<nmaprun><host>')  # unclosed tags
+
+        with patch('spoonmap.nmap_worker', side_effect=_fake_worker_drain) as mock_worker:
+            nmap_scan('88', max_threads=2, script_scan=False)
+
+        assert mock_worker.called
+        out = capsys.readouterr().out
+        assert 're-running port 80 banner scan' in out
+        assert 'already been scanned' not in out
 
     def test_unscanned_ports_dispatched_to_workers(self, tmp_path):
         spoonmap.output_path = str(tmp_path)
@@ -7072,6 +7378,80 @@ class TestNmapPortDiscovery:
 
         assert not mock_popen.called
         assert 'hostnames' not in summary
+
+    def _setup_resume_cache(self, tmp_path, xml_text):
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        (disc / 'live_hosts').mkdir(parents=True)
+        cached = disc / 'masscan_results' / 'portDirect.xml'
+        cached.write_text(xml_text)
+        (disc / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n10.0.0.2\n')
+        os.utime(str(target), (1000, 1000))
+        os.utime(str(cached), (2000, 2000))  # fresh mtime
+        spoonmap.output_path = str(tmp_path)
+        return target
+
+    def _fake_popen_writing_results(self):
+        def fake_popen(cmd, **kwargs):
+            Path(cmd[cmd.index('-oX') + 1]).write_text(self._xml_with_open_ports(
+                ('10.0.0.7', 'tcp', '80', 'open'),
+            ))
+            return self._make_mock_proc()
+        return fake_popen
+
+    def test_zero_length_cached_xml_reruns_discovery(self, tmp_path, capsys):
+        # A killed nmap leaves an empty portDirect.xml; a fresh mtime must not
+        # make that count as completed discovery.
+        target = self._setup_resume_cache(tmp_path, '')
+        with patch('spoonmap.subprocess.Popen',
+                   side_effect=self._fake_popen_writing_results()) as mock_popen, \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            summary = _nmap_port_discovery(['80'], str(target), '', None, resume=True)
+
+        assert mock_popen.called
+        out = capsys.readouterr().out
+        assert 're-running nmap port discovery' in out
+        assert 'skipping completed nmap port discovery' not in out
+        assert 'Hosts Found on Port 80: 1' in summary
+
+    def test_unparseable_cached_xml_reruns_discovery(self, tmp_path, capsys):
+        target = self._setup_resume_cache(tmp_path, '<nmaprun><host>')  # unclosed tags
+        with patch('spoonmap.subprocess.Popen',
+                   side_effect=self._fake_popen_writing_results()) as mock_popen, \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            summary = _nmap_port_discovery(['80'], str(target), '', None, resume=True)
+
+        assert mock_popen.called
+        assert 're-running nmap port discovery' in capsys.readouterr().out
+        assert 'Hosts Found on Port 80: 1' in summary
+
+    def test_stale_cached_xml_reruns_discovery(self, tmp_path):
+        target = self._setup_resume_cache(tmp_path, '<nmaprun/>')
+        os.utime(str(target), (3000, 3000))  # targets newer than cache → stale
+        with patch('spoonmap.subprocess.Popen',
+                   side_effect=self._fake_popen_writing_results()) as mock_popen, \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            summary = _nmap_port_discovery(['80'], str(target), '', None, resume=True)
+
+        assert mock_popen.called
+        assert 'Hosts Found on Port 80: 1' in summary
+
+    def test_valid_fresh_cached_xml_still_skips_discovery(self, tmp_path, capsys):
+        # The load-bearing direction: resume must keep working, or an operator
+        # re-scans everything on a resumed engagement.
+        target = self._setup_resume_cache(tmp_path, '<nmaprun/>')
+        with patch('spoonmap.subprocess.Popen') as mock_popen, \
+             patch('spoonmap.restore_terminal_state'):
+            summary = _nmap_port_discovery(['80'], str(target), '', None, resume=True)
+
+        assert not mock_popen.called
+        assert 'skipping completed nmap port discovery' in capsys.readouterr().out
+        assert 'Hosts Found on Port 80: 2' in summary
 
     def test_full_scan_uses_full_port_range(self, tmp_path):
         target = tmp_path / 'targets.txt'
