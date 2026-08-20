@@ -1779,12 +1779,41 @@ def _build_nmap_cmd(dest_port, input_file, output_file, source_port,
     return cmd
 
 
+def _quarantine_failed_output(output_file):
+    """Rename a failed pass's XML to ``<name>.xml.failed``; return the new path.
+
+    A non-zero nmap exit can still leave a perfectly *valid* XML behind holding
+    zero or partial hosts (whole-target resolution failure, missing privileges
+    for the requested scan type).  _resume_cache_usable() only rejects files
+    that fail to parse, so such a file satisfies the resume gate forever and the
+    port is treated as scanned when it never was — an "appears scanned but
+    wasn't", the worst failure mode this tool has.  Renaming makes the gate
+    reject it while leaving the data on disk for inspection.
+
+    The '.xml.failed' suffix is chosen so no consumer can pick it up: every
+    aggregation and post-processing pass requires an '.xml' extension (or an
+    exact filename), and the live_hosts filters only match 'port*.txt'.
+
+    Returns None when there was nothing to rename or the rename failed — a
+    missing output file already fails the gate, so either way the port is
+    re-scanned.
+    """
+    if not os.path.exists(output_file):
+        return None
+    failed_path = output_file + '.failed'
+    try:
+        os.replace(output_file, failed_path)
+    except OSError:
+        return None
+    return failed_path
+
+
 def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 interrupt_event, ip_to_hostname, script_scan=False,
                 target_scan='Internal', start_time=None):
     """Worker thread function to process NMAP scans from queue"""
 
-    def _report_nmap_failure(pass_label, dest_port, proc, stderr_output):
+    def _report_nmap_failure(pass_label, dest_port, proc, stderr_output, output_file):
         """Print a diagnostic for a non-zero nmap exit that was not an interrupt.
 
         Callers must confirm interrupt_event is clear first: a deliberately
@@ -1795,13 +1824,25 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
         never from a read() after the fact: reading only on the failure path
         leaves the pipe unread while the worker polls, which deadlocks the whole
         scan the moment nmap exceeds the pipe buffer (see _start_stderr_reader).
+
+        The partial output is quarantined before the message is printed so the
+        claim about resume is unconditionally true: this used to promise the port
+        would NOT be retried, which stopped being accurate once the resume gate
+        started accepting any *parseable* XML — a valid, hostless XML from a
+        failed run satisfied the gate and stranded that port permanently.
         """
+        failed_path = _quarantine_failed_output(output_file)
         with lock:
             print(_COLOR_ERROR
                   + f'Error: nmap {pass_label} for port {dest_port} exited with code '
-                    f'{proc.returncode} — results for this port may be missing or '
-                    f'incomplete and will NOT be retried on resume.'
+                    f'{proc.returncode} — results for this port are missing or '
+                    f'incomplete, so this port WILL be re-scanned on resume.'
                   + _COLOR_RESET)
+            if failed_path:
+                print(_COLOR_ERROR
+                      + f'Partial output kept for inspection: '
+                        f'{os.path.basename(failed_path)}'
+                      + _COLOR_RESET)
             if stderr_output.strip():
                 print(_COLOR_ERROR + stderr_output.strip() + _COLOR_RESET)
 
@@ -1888,7 +1929,7 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                         # progress percentage does not claim work that produced
                         # no (or truncated) XML.
                         _report_nmap_failure('banner scan', dest_port, nmap_process,
-                                             ''.join(nmap_err_lines))
+                                             ''.join(nmap_err_lines), output_file)
                     else:
                         with lock:
                             completed_count[0] += 1
@@ -1929,7 +1970,7 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                         # when no interrupt is in flight.
                         if nse_process.returncode != 0 and not interrupt_event.is_set():
                             _report_nmap_failure('NSE script pass', dest_port, nse_process,
-                                                 ''.join(nse_err_lines))
+                                                 ''.join(nse_err_lines), nse_output)
 
             except FileNotFoundError:
                 with lock:

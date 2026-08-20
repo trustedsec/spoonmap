@@ -79,6 +79,7 @@ from spoonmap import (
     _parse_masscan_ping_xml,
     _parse_nmap_sn_xml,
     _parse_result_xml,
+    _quarantine_failed_output,
     _aggregate_result_dir,
     _path_completion,
     _run_masscan_batch,
@@ -5536,6 +5537,45 @@ class TestCreateHostnameTargetFile:
         assert hostname_file.read_text() == '10.0.0.5\n'
 
 
+class TestQuarantineFailedOutput:
+    """_quarantine_failed_output() renames a failed pass's XML out of the way."""
+
+    def test_existing_output_is_renamed_and_rejected_by_the_resume_gate(self, tmp_path):
+        # A failed nmap can still leave a valid, hostless XML: parseable, so the
+        # gate accepted it and the port was never re-scanned.
+        out = tmp_path / 'port80.xml'
+        out.write_text('<nmaprun/>')
+        assert _resume_cache_usable(str(out), 0, 'port 80 banner scan') is True
+
+        failed = _quarantine_failed_output(str(out))
+
+        assert failed == str(out) + '.failed'
+        assert not out.exists()
+        assert (tmp_path / 'port80.xml.failed').read_text() == '<nmaprun/>'
+        assert _resume_cache_usable(str(out), 0, 'port 80 banner scan') is False
+
+    def test_quarantined_name_is_invisible_to_result_parsing(self, tmp_path):
+        # The suffix must not end in .xml, or aggregation would pick the failed
+        # run's partial hosts back up.
+        out = tmp_path / 'port80.xml'
+        out.write_text('<nmaprun/>')
+        failed = _quarantine_failed_output(str(out))
+        assert _parse_result_xml(failed) is None
+
+    def test_missing_output_returns_none(self, tmp_path):
+        # nmap exiting before it created any file at all — already fails the gate.
+        assert _quarantine_failed_output(str(tmp_path / 'gone.xml')) is None
+
+    def test_rename_failure_is_swallowed(self, tmp_path):
+        """A read-only output dir must not turn a reportable nmap failure into
+        an exception that takes down the worker thread."""
+        out = tmp_path / 'port80.xml'
+        out.write_text('<nmaprun/>')
+        with patch('spoonmap.os.replace', side_effect=OSError('read-only')):
+            assert _quarantine_failed_output(str(out)) is None
+        assert out.exists()
+
+
 class TestNmapWorker:
     """Unit tests for nmap_worker() — the per-port scan worker thread function.
 
@@ -5841,6 +5881,46 @@ class TestNmapWorker:
         assert 'port 80 exited with code 1' in out
         assert 'Illegal port specification' in out
         assert completed_count[0] == 0
+
+    def test_failed_banner_pass_quarantines_its_xml_for_resume(self, tmp_path, capsys):
+        """A non-zero banner pass that still finalised a valid XML must not
+        satisfy the resume gate: nmap exiting non-zero after writing a hostless
+        but parseable file (target resolution failure, missing privileges) left
+        that port looking scanned forever."""
+        def fake_popen(*a, **k):
+            # nmap finalises the XML, then exits non-zero.
+            Path(f'{tmp_path}/nmap_results/port80.xml').write_text('<nmaprun/>')
+            return self._make_finished_proc(returncode=1, stderr='QUITTING!\n')
+
+        self._run(tmp_path, popen_side_effect=fake_popen)
+
+        banner_xml = f'{tmp_path}/nmap_results/port80.xml'
+        assert not os.path.exists(banner_xml)
+        assert Path(banner_xml + '.failed').read_text() == '<nmaprun/>'
+        assert _resume_cache_usable(banner_xml, 0, 'port 80 banner scan') is False
+        out = capsys.readouterr().out
+        assert 'WILL be re-scanned on resume' in out
+        assert 'port80.xml.failed' in out
+
+    def test_failed_nse_pass_quarantines_its_own_xml(self, tmp_path):
+        """The NSE pass quarantines nse_results/, not the banner output."""
+        call_count = {'n': 0}
+
+        def fake_popen(*a, **k):
+            call_count['n'] += 1
+            if call_count['n'] == 1:
+                Path(f'{tmp_path}/nmap_results/port80.xml').write_text('<nmaprun/>')
+                return self._make_finished_proc()
+            Path(f'{tmp_path}/nse_results/port80.xml').write_text('<nmaprun/>')
+            return self._make_finished_proc(returncode=2, stderr='NSE failed\n')
+
+        self._run(tmp_path, script_scan=True, scripts_for_port='ftp-anon',
+                  popen_side_effect=fake_popen)
+
+        # Banner pass succeeded, so its XML stays put.
+        assert os.path.exists(f'{tmp_path}/nmap_results/port80.xml')
+        assert not os.path.exists(f'{tmp_path}/nse_results/port80.xml')
+        assert os.path.exists(f'{tmp_path}/nse_results/port80.xml.failed')
 
     def test_zero_exit_prints_no_failure_diagnostic(self, tmp_path, capsys):
         """A clean exit counts as completed and prints no failure text."""
