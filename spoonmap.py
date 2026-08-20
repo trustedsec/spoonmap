@@ -481,15 +481,21 @@ def _get_scripts_for_port(dest_port, target_scan):
 
 
 def _parse_masscan_ping_xml(xml_file):
-    """Return set of IPs from a masscan --ping XML output file."""
+    """Return set of IPv4 addresses from a masscan --ping XML output file.
+
+    Filters on addrtype="ipv4" to match what the nmap parsers already do.  The
+    first <address> child is not necessarily the IPv4 one, and this tool is
+    IPv4-only: an IPv6 or MAC string admitted here flows straight into
+    live_ips/port_ips and on into the address sort keys and masscan -iL files.
+    """
     ips = set()
     if not os.path.exists(xml_file) or os.stat(xml_file).st_size == 0:
         return ips
     try:
         root = etree.parse(xml_file)
         for host in root.findall('host'):
-            addr_elem = host.find('address')
-            if addr_elem is not None:
+            addr_elem = host.find("address[@addrtype='ipv4']")
+            if addr_elem is not None and addr_elem.attrib.get('addr'):
                 ips.add(addr_elem.attrib['addr'])
     except etree.ParseError:
         pass
@@ -497,7 +503,13 @@ def _parse_masscan_ping_xml(xml_file):
 
 
 def _parse_nmap_sn_xml(xml_file):
-    """Return set of IPs from a nmap -sn XML output where status is 'up'."""
+    """Return set of IPv4 addresses from a nmap -sn XML output where status is 'up'.
+
+    Same addrtype="ipv4" filter as _parse_masscan_ping_xml: an -sn sweep of a
+    dual-stacked host can report a MAC or IPv6 <address> first, and this set is
+    unioned with the masscan discovery set before being sorted and written to a
+    target file that only IPv4 tooling reads.
+    """
     ips = set()
     if not os.path.exists(xml_file) or os.stat(xml_file).st_size == 0:
         return ips
@@ -506,8 +518,8 @@ def _parse_nmap_sn_xml(xml_file):
         for host in root.findall('host'):
             status = host.find('status')
             if status is not None and status.attrib.get('state') == 'up':
-                addr_elem = host.find('address')
-                if addr_elem is not None:
+                addr_elem = host.find("address[@addrtype='ipv4']")
+                if addr_elem is not None and addr_elem.attrib.get('addr'):
                     ips.add(addr_elem.attrib['addr'])
     except etree.ParseError:
         pass
@@ -901,7 +913,16 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
     try:
         root = etree.parse(output_file)
         for host in root.findall('host'):
-            ip_address = host.findall('address')[0].attrib['addr']
+            # Select the IPv4 <address> explicitly rather than trusting the
+            # first child.  findall(...)[0] raised IndexError on an <host> with
+            # no <address> at all (killing the whole batch's results, not just
+            # that host), and on a dual-stacked host it could hand back an IPv6
+            # or MAC string that then propagated into live_hosts/portNN.txt and
+            # became a masscan -iL target this IPv4-only tool cannot scan.
+            addr_elem = host.find("address[@addrtype='ipv4']")
+            if addr_elem is None or not addr_elem.attrib.get('addr'):
+                continue
+            ip_address = addr_elem.attrib['addr']
             ports_elem = host.find('ports')
             if ports_elem is not None:
                 port_elem = ports_elem.find('port')

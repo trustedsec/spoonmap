@@ -6551,6 +6551,37 @@ class TestParseMasscanPingXml:
         f.write_text('<nmaprun><host>')  # unclosed tags
         assert _parse_masscan_ping_xml(str(f)) == set()
 
+    def test_ipv6_host_excluded(self, tmp_path):
+        """An IPv6 address admitted here reached the address sort keys and the
+        masscan -iL target file, neither of which handles IPv6."""
+        f = tmp_path / 'ping.xml'
+        f.write_text(
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="fe80::1" addrtype="ipv6"/></host>'
+            '<host><address addr="10.0.0.1" addrtype="ipv4"/></host>'
+            '</nmaprun>'
+        )
+        assert _parse_masscan_ping_xml(str(f)) == {'10.0.0.1'}
+
+    def test_ipv6_listed_first_does_not_shadow_ipv4(self, tmp_path):
+        f = tmp_path / 'ping.xml'
+        f.write_text(
+            '<?xml version="1.0"?><nmaprun><host>'
+            '<address addr="fe80::1" addrtype="ipv6"/>'
+            '<address addr="10.0.0.1" addrtype="ipv4"/>'
+            '</host></nmaprun>'
+        )
+        assert _parse_masscan_ping_xml(str(f)) == {'10.0.0.1'}
+
+    def test_address_without_addr_attribute_skipped(self, tmp_path):
+        f = tmp_path / 'ping.xml'
+        f.write_text(
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4"/></host>'
+            '</nmaprun>'
+        )
+        assert _parse_masscan_ping_xml(str(f)) == set()
+
 
 # ── _parse_nmap_sn_xml ────────────────────────────────────────────────────────
 
@@ -6585,6 +6616,36 @@ class TestParseNmapSnXml:
     def test_malformed_xml_returns_empty_set(self, tmp_path):
         f = tmp_path / 'sn.xml'
         f.write_text('<nmaprun><host>')  # unclosed tags
+        assert _parse_nmap_sn_xml(str(f)) == set()
+
+    def test_ipv6_up_host_excluded(self, tmp_path):
+        f = tmp_path / 'sn.xml'
+        f.write_text(
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><status state="up"/><address addr="fe80::1" addrtype="ipv6"/></host>'
+            '<host><status state="up"/><address addr="10.0.0.1" addrtype="ipv4"/></host>'
+            '</nmaprun>'
+        )
+        assert _parse_nmap_sn_xml(str(f)) == {'10.0.0.1'}
+
+    def test_mac_address_first_does_not_shadow_ipv4(self, tmp_path):
+        """An -sn sweep on the local segment emits <address addrtype="mac"> too."""
+        f = tmp_path / 'sn.xml'
+        f.write_text(
+            '<?xml version="1.0"?><nmaprun><host><status state="up"/>'
+            '<address addr="AA:BB:CC:DD:EE:FF" addrtype="mac"/>'
+            '<address addr="10.0.0.1" addrtype="ipv4"/>'
+            '</host></nmaprun>'
+        )
+        assert _parse_nmap_sn_xml(str(f)) == {'10.0.0.1'}
+
+    def test_up_host_with_no_ipv4_address_skipped(self, tmp_path):
+        f = tmp_path / 'sn.xml'
+        f.write_text(
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><status state="up"/><address addrtype="ipv4"/></host>'
+            '</nmaprun>'
+        )
         assert _parse_nmap_sn_xml(str(f)) == set()
 
 
@@ -6973,6 +7034,55 @@ class TestRunMasscanBatchBehavior:
 
         assert results == {}
         assert 'Error parsing masscan XML' in capsys.readouterr().out
+
+    def test_ipv6_host_excluded_from_results(self, tmp_path):
+        """findall('address')[0] took whatever address came first, so an IPv6
+        host became a live_hosts entry and then a masscan -iL target."""
+        output_xml = tmp_path / 'out.xml'
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="fe80::1" addrtype="ipv6"/>'
+            '<ports><port protocol="tcp" portid="445"/></ports></host>'
+            '<host><address addr="10.0.0.1" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="445"/></ports></host>'
+            '</nmaprun>'
+        )
+
+        def fake_popen(cmd, **kwargs):
+            output_xml.write_text(xml)
+            return self._make_mock_proc()
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            results = _run_masscan_batch(['445'], '1000', str(output_xml),
+                                         '/fake/targets.txt', None, None)
+
+        assert results == {'445': {'10.0.0.1'}}
+
+    def test_host_with_no_address_element_does_not_discard_batch(self, tmp_path):
+        """findall('address')[0] raised IndexError outside the parse guard, so a
+        single malformed <host> threw away every other host's open ports."""
+        output_xml = tmp_path / 'out.xml'
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><ports><port protocol="tcp" portid="445"/></ports></host>'
+            '<host><address addr="10.0.0.2" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="445"/></ports></host>'
+            '</nmaprun>'
+        )
+
+        def fake_popen(cmd, **kwargs):
+            output_xml.write_text(xml)
+            return self._make_mock_proc()
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            results = _run_masscan_batch(['445'], '1000', str(output_xml),
+                                         '/fake/targets.txt', None, None)
+
+        assert results == {'445': {'10.0.0.2'}}
 
     def test_returncode_1_exits(self, tmp_path):
         output_xml = tmp_path / 'out.xml'
