@@ -52,6 +52,10 @@ from spoonmap import (
     _CONFIG_FIELD_ORDER,
     _CONFIG_GENERATED_KEY,
     _host_discovery,
+    _atomic_write,
+    _combine_live_hosts,
+    _load_config,
+    _write_combined_results,
     _write_if_changed,
     _write_interactive_config,
     _discover_external_masscan,
@@ -1838,26 +1842,160 @@ class TestMassScanTarpitFlag:
         assert not (tmp_path / 'discovery' / 'suspected_tarpits.txt').exists()
 
 
+# ── _load_config ──────────────────────────────────────────────────────────────
+
+def _config_dict(**overrides):
+    """A minimal config.json dict for _load_config(), with *overrides* applied.
+
+    Covers only the keys _load_config() indexes unconditionally; everything
+    else is optional and left to the loader's own defaults.
+    """
+    cfg = {
+        'banner_scan': 'True',
+        'target_scan': 'Internal',
+        'max_rate': '2000',
+        'target_file': '/t/ranges.txt',
+        'output_path': '/t/out',
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+class TestLoadConfig:
+    """_load_config() derives every scan setting from a parsed config.json."""
+
+    def test_all_string_expands_every_category(self):
+        cfg = _load_config(_config_dict(scan_categories='All'), '/t')
+        expected = [p for cat in SERVICE_CATEGORIES.values() for p in cat]
+        assert cfg['scan_type'] == 'All'
+        assert sorted(cfg['dest_ports']) == sorted(expected)
+
+    def test_all_list_matches_all_string(self):
+        as_list = _load_config(_config_dict(scan_categories=['All']), '/t')
+        as_str = _load_config(_config_dict(scan_categories='All'), '/t')
+        assert as_list['scan_type'] == 'All'
+        assert as_list['dest_ports'] == as_str['dest_ports']
+
+    def test_missing_scan_categories_defaults_to_all(self):
+        assert _load_config(_config_dict(), '/t')['scan_type'] == 'All'
+
+    def test_category_list_uses_only_valid_names(self):
+        cfg = _load_config(
+            _config_dict(scan_categories=['Web', 'NotACategory']), '/t')
+        assert cfg['scan_type'] == 'Web'
+        assert cfg['dest_ports'] == list(SERVICE_CATEGORIES['Web'])
+
+    def test_unknown_scalar_scan_categories_yields_no_ports(self):
+        cfg = _load_config(_config_dict(scan_categories='Bogus'), '/t')
+        assert cfg['scan_type'] == ''
+        assert cfg['dest_ports'] == []
+
+    def test_udp_ports_sort_to_end(self):
+        cfg = _load_config(_config_dict(scan_categories='All'), '/t')
+        udp = [i for i, p in enumerate(cfg['dest_ports']) if p.startswith('U:')]
+        tcp = [i for i, p in enumerate(cfg['dest_ports']) if not p.startswith('U:')]
+        assert udp and tcp
+        assert min(udp) > max(tcp)
+
+    def test_dest_ports_override_forces_custom_scan_type(self):
+        cfg = _load_config(
+            _config_dict(scan_categories='All', dest_ports=['80', 'U:53']), '/t')
+        assert cfg['scan_type'] == 'Custom'
+        assert cfg['dest_ports'] == ['80', 'U:53']
+
+    def test_empty_dest_ports_does_not_override(self):
+        cfg = _load_config(_config_dict(scan_categories='Full', dest_ports=[]), '/t')
+        assert cfg['scan_type'] == 'Full'
+        assert cfg['dest_ports'] == ['1-65535']
+
+    def test_banner_scan_true_string_becomes_bool(self):
+        assert _load_config(_config_dict(banner_scan='True'), '/t')['banner_scan'] is True
+
+    def test_banner_scan_other_string_becomes_false(self):
+        assert _load_config(_config_dict(banner_scan='False'), '/t')['banner_scan'] is False
+
+    def test_script_scan_and_host_discovery_string_to_bool(self):
+        cfg = _load_config(
+            _config_dict(script_scan='True', host_discovery='False'), '/t')
+        assert cfg['script_scan'] is True
+        assert cfg['host_discovery'] is False
+
+    def test_script_scan_defaults_false_host_discovery_defaults_true(self):
+        cfg = _load_config(_config_dict(), '/t')
+        assert cfg['script_scan'] is False
+        assert cfg['host_discovery'] is True
+
+    def test_numeric_settings_coerced_to_int(self):
+        cfg = _load_config(
+            _config_dict(nmap_threads='9', masscan_batch_size='3',
+                         nmap_threshold='1000'), '/t')
+        assert cfg['nmap_threads'] == 9
+        assert cfg['masscan_batch_size'] == 3
+        assert cfg['nmap_threshold'] == 1000
+
+    def test_numeric_settings_defaults(self):
+        cfg = _load_config(_config_dict(), '/t')
+        assert cfg['nmap_threads'] == 5
+        assert cfg['masscan_batch_size'] == 5
+        assert cfg['nmap_threshold'] == 5_000_000
+
+    def test_relative_paths_resolve_against_dir_path(self):
+        cfg = _load_config(
+            _config_dict(target_file='ranges.txt', output_path='out',
+                         exclusions_file='excl.txt'), '/opt/spoonmap')
+        assert cfg['target_file'] == os.path.join('/opt/spoonmap', 'ranges.txt')
+        assert cfg['output_path'] == os.path.join('/opt/spoonmap', 'out')
+        assert cfg['exclusions_file'] == os.path.join('/opt/spoonmap', 'excl.txt')
+
+    def test_absolute_paths_left_alone(self):
+        cfg = _load_config(
+            _config_dict(target_file='/abs/ranges.txt', output_path='/abs/out',
+                         exclusions_file='/abs/excl.txt'), '/opt/spoonmap')
+        assert cfg['target_file'] == '/abs/ranges.txt'
+        assert cfg['output_path'] == '/abs/out'
+        assert cfg['exclusions_file'] == '/abs/excl.txt'
+
+    def test_empty_exclusions_file_normalizes_to_none(self):
+        assert _load_config(_config_dict(exclusions_file=''), '/t')['exclusions_file'] is None
+
+    def test_missing_exclusions_file_normalizes_to_none(self):
+        assert _load_config(_config_dict(), '/t')['exclusions_file'] is None
+
+    def test_resume_flag_is_ored_with_config_value(self):
+        assert _load_config(_config_dict(resume='False'), '/t', True)['resume'] is True
+
+    def test_config_resume_true_without_flag(self):
+        assert _load_config(_config_dict(resume=' TRUE '), '/t')['resume'] is True
+
+    def test_resume_defaults_false(self):
+        assert _load_config(_config_dict(), '/t')['resume'] is False
+
+    def test_generated_marker_detected(self):
+        cfg = _load_config(_config_dict(**{_CONFIG_GENERATED_KEY: 'note'}), '/t')
+        assert cfg['config_generated'] is True
+
+    def test_hand_written_config_not_marked_generated(self):
+        assert _load_config(_config_dict(), '/t')['config_generated'] is False
+
+    def test_source_port_is_always_empty(self):
+        assert _load_config(_config_dict(), '/t')['source_port'] == ''
+
+    def test_passthrough_values(self):
+        cfg = _load_config(
+            _config_dict(target_scan='External', max_rate='20000',
+                         scan_categories=['Web']), '/t')
+        assert cfg['target_scan'] == 'External'
+        assert cfg['max_rate'] == '20000'
+        assert cfg['scan_categories'] == ['Web']
+
+
 # ── Config: Full scan_categories ──────────────────────────────────────────────
 
 class TestConfigFullScanCategory:
     def _resolve(self, scan_categories):
-        """Replicate the config-loading branch logic for scan_categories."""
-        all_ports = []
-        scan_type = ''
-        if scan_categories == 'All' or scan_categories == ['All']:
-            scan_type = 'All'
-            all_ports = [p for cat in SERVICE_CATEGORIES.values() for p in cat]
-        elif scan_categories in ('Full', ['Full']):
-            scan_type = 'Full'
-            all_ports = ['1-65535']
-        elif isinstance(scan_categories, list):
-            valid = [c for c in scan_categories if c in SERVICE_CATEGORIES]
-            scan_type = ', '.join(valid)
-            all_ports = [p for name in valid for p in SERVICE_CATEGORIES[name]]
-        dest_ports = [p for p in all_ports if not p.startswith('U:')] + \
-                     [p for p in all_ports if p.startswith('U:')]
-        return scan_type, dest_ports
+        """Derive scan_type/dest_ports through the real config loader."""
+        cfg = _load_config(_config_dict(scan_categories=scan_categories), '/t')
+        return cfg['scan_type'], cfg['dest_ports']
 
     def test_full_string_sets_scan_type_and_ports(self):
         scan_type, dest_ports = self._resolve('Full')
@@ -1878,17 +2016,21 @@ class TestConfigFullScanCategory:
 # ── config source port derivation ────────────────────────────────────────────
 
 class TestConfigSourcePort:
-    """Config-file branch must derive source_port from target_scan."""
+    """Config-file branch leaves source_port empty for either target_scan.
+
+    The old '88' internal / '53' external source-port bypass is gone; the
+    loader hardcodes '' so no --source-port is passed.
+    """
 
     def _source_port_for(self, target_scan_value):
-        """Replicate the config-branch source_port logic."""
-        return '53' if target_scan_value == 'External' else '88'
+        """Read source_port out of the real config loader."""
+        return _load_config(_config_dict(target_scan=target_scan_value), '/t')['source_port']
 
-    def test_internal_scan_uses_source_port_88(self):
-        assert self._source_port_for('Internal') == '88'
+    def test_internal_scan_uses_no_source_port(self):
+        assert self._source_port_for('Internal') == ''
 
-    def test_external_scan_uses_source_port_53(self):
-        assert self._source_port_for('External') == '53'
+    def test_external_scan_uses_no_source_port(self):
+        assert self._source_port_for('External') == ''
 
 
 # ── interactive config persistence ───────────────────────────────────────────
@@ -1897,26 +2039,9 @@ class TestBuildInteractiveConfig:
     """_build_interactive_config output must round-trip through the loader."""
 
     def _resolve(self, config):
-        """Replicate main()'s config loader for scan_type/dest_ports derivation."""
-        scan_categories = config.get('scan_categories', 'All')
-        all_ports = []
-        scan_type = ''
-        if scan_categories == 'All' or scan_categories == ['All']:
-            scan_type = 'All'
-            all_ports = [p for cat in SERVICE_CATEGORIES.values() for p in cat]
-        elif scan_categories in ('Full', ['Full']):
-            scan_type = 'Full'
-            all_ports = ['1-65535']
-        elif isinstance(scan_categories, list):
-            valid = [c for c in scan_categories if c in SERVICE_CATEGORIES]
-            scan_type = ', '.join(valid)
-            all_ports = [p for name in valid for p in SERVICE_CATEGORIES[name]]
-        dest_ports = [p for p in all_ports if not p.startswith('U:')] + \
-                     [p for p in all_ports if p.startswith('U:')]
-        if config.get('dest_ports'):
-            dest_ports = config['dest_ports']
-            scan_type = 'Custom'
-        return scan_type, dest_ports
+        """Round-trip a written config through the real loader."""
+        cfg = _load_config(config, '/t')
+        return cfg['scan_type'], cfg['dest_ports']
 
     def _dest_ports_for(self, categories):
         all_ports = [p for name in categories for p in SERVICE_CATEGORIES[name]]
@@ -2148,6 +2273,60 @@ class TestWriteInteractiveConfig:
         assert _write_interactive_config(path, {'banner_scan': 'True'}) is True
         with open(path) as fh:
             assert json.load(fh) == {'banner_scan': 'True'}
+
+
+# ── _atomic_write ─────────────────────────────────────────────────────────────
+
+class TestAtomicWrite:
+    """_atomic_write() replaces a file in one step, leaving no temp behind."""
+
+    def test_creates_missing_file(self, tmp_path):
+        p = tmp_path / 'f.txt'
+        _atomic_write(str(p), 'hello')
+        assert p.read_text() == 'hello'
+
+    def test_overwrites_existing_file(self, tmp_path):
+        p = tmp_path / 'f.txt'
+        p.write_text('old')
+        _atomic_write(str(p), 'new')
+        assert p.read_text() == 'new'
+
+    def test_no_temp_file_left_behind(self, tmp_path):
+        p = tmp_path / 'f.txt'
+        _atomic_write(str(p), 'data')
+        assert [q.name for q in tmp_path.iterdir()] == ['f.txt']
+
+    def test_temp_file_lands_in_same_directory(self, tmp_path):
+        p = tmp_path / 'sub' / 'f.txt'
+        p.parent.mkdir()
+        seen = {}
+        real_mkstemp = spoonmap.tempfile.mkstemp
+
+        def _spy(**kwargs):
+            seen['dir'] = kwargs['dir']
+            return real_mkstemp(**kwargs)
+
+        with patch('spoonmap.tempfile.mkstemp', side_effect=_spy):
+            _atomic_write(str(p), 'data')
+        assert seen['dir'] == str(tmp_path / 'sub')
+
+    def test_bare_filename_writes_to_cwd(self, tmp_path):
+        cwd = os.getcwd()
+        os.chdir(str(tmp_path))
+        try:
+            _atomic_write('bare.txt', 'data')
+        finally:
+            os.chdir(cwd)
+        assert (tmp_path / 'bare.txt').read_text() == 'data'
+
+    def test_failed_replace_removes_temp_and_keeps_original(self, tmp_path):
+        p = tmp_path / 'f.txt'
+        p.write_text('old')
+        with patch('spoonmap.os.replace', side_effect=OSError('boom')):
+            with pytest.raises(OSError):
+                _atomic_write(str(p), 'new')
+        assert p.read_text() == 'old'
+        assert [q.name for q in tmp_path.iterdir()] == ['f.txt']
 
 
 # ── resume freshness (idempotent target write + staleness gates) ──────────────
@@ -5356,6 +5535,65 @@ class TestAggregateResultDir:
         (tmp_path / 'batch_0.xml').write_text(_result_xml('10.0.0.5'))
         _, xml_hosts = _aggregate_result_dir(str(tmp_path) + os.sep, {})
         assert list(xml_hosts) == ['10.0.0.5']
+
+
+# ── _combine_live_hosts ───────────────────────────────────────────────────────
+
+class TestCombineLiveHosts:
+    """_combine_live_hosts() unions every per-port live-host file."""
+
+    def _make_live_hosts(self, tmp_path, files):
+        disc = tmp_path / 'discovery'
+        (disc / 'live_hosts').mkdir(parents=True)
+        for name, body in files.items():
+            (disc / 'live_hosts' / name).write_text(body)
+        return str(disc)
+
+    def test_unions_and_deduplicates_across_files(self, tmp_path):
+        disc = self._make_live_hosts(tmp_path, {
+            'port80.txt': '10.0.0.1\n10.0.0.2\n',
+            'port443.txt': '10.0.0.2\n10.0.0.3\n',
+        })
+        _combine_live_hosts(disc, str(tmp_path))
+        written = (tmp_path / 'all_live_hosts.txt').read_text()
+        assert sorted(written.split()) == ['10.0.0.1', '10.0.0.2', '10.0.0.3']
+
+    def test_empty_live_hosts_dir_writes_empty_file(self, tmp_path):
+        disc = self._make_live_hosts(tmp_path, {})
+        _combine_live_hosts(disc, str(tmp_path))
+        assert (tmp_path / 'all_live_hosts.txt').read_text() == ''
+
+
+# ── _write_combined_results ───────────────────────────────────────────────────
+
+class TestWriteCombinedResults:
+    """_write_combined_results() writes the merged XML and JSON output."""
+
+    def test_writes_xml_and_json(self, tmp_path, capsys):
+        host = etree.fromstring('<host><address addr="10.0.0.1"/></host>')
+        hosts_json = [{'ip': '10.0.0.1', 'ports': [], 'hostscripts': {}}]
+        _write_combined_results(str(tmp_path), hosts_json, {'10.0.0.1': host})
+        xml_text = (tmp_path / 'spoonmap_output.xml').read_text()
+        assert xml_text.startswith('<?xml version="1.0"?>\n<!-- SpooNMAP -->\n<nmaprun>\n')
+        assert xml_text.endswith('</nmaprun>')
+        assert '10.0.0.1' in xml_text
+        with open(str(tmp_path / 'spoonmap_output.json')) as fh:
+            assert json.load(fh) == hosts_json
+        assert 'Results written to' in capsys.readouterr().out
+
+    def test_no_hosts_writes_empty_document(self, tmp_path):
+        _write_combined_results(str(tmp_path), [], {})
+        assert (tmp_path / 'spoonmap_output.xml').read_text() == (
+            '<?xml version="1.0"?>\n<!-- SpooNMAP -->\n<nmaprun>\n</nmaprun>')
+        with open(str(tmp_path / 'spoonmap_output.json')) as fh:
+            assert json.load(fh) == []
+
+    def test_output_is_reparseable_with_every_host(self, tmp_path):
+        hosts = {ip: etree.fromstring(f'<host><address addr="{ip}"/></host>')
+                 for ip in ('10.0.0.1', '10.0.0.2')}
+        _write_combined_results(str(tmp_path), [], hosts)
+        root = etree.parse(str(tmp_path / 'spoonmap_output.xml')).getroot()
+        assert {h.find('address').get('addr') for h in root.findall('host')} == set(hosts)
 
 
 # ── TestRunMasscanBatchWaitMinimum ─────────────────────────────────────────────
