@@ -1200,14 +1200,17 @@ def _report_suspected_tarpits(suspected, disc):
     if not suspected:
         return
     tarpit_file = os.path.join(disc, 'suspected_tarpits.txt')
-    with open(tarpit_file, 'w') as fh:
-        for ip in sorted(suspected, key=lambda x: tuple(int(o) for o in x.split('.'))):
-            open_count, total = suspected[ip]
-            fh.write(f'{ip},{open_count},{total}\n')
-            print(_COLOR_ERROR
-                  + f'Warning: {ip} responded open on {open_count}/{total} scanned TCP ports '
-                  + '— likely a tarpit/decoy host, not a real service host.'
-                  + _COLOR_RESET)
+    lines = []
+    for ip in sorted(suspected, key=lambda x: tuple(int(o) for o in x.split('.'))):
+        open_count, total = suspected[ip]
+        lines.append(f'{ip},{open_count},{total}\n')
+        print(_COLOR_ERROR
+              + f'Warning: {ip} responded open on {open_count}/{total} scanned TCP ports '
+              + '— likely a tarpit/decoy host, not a real service host.'
+              + _COLOR_RESET)
+    # Atomic: an interrupt or ENOSPC part-way through must not leave a partial
+    # last line for generate_findings() to read back.
+    _atomic_write(tarpit_file, ''.join(lines))
 
 
 def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file, batch_size=1, resume=False, discovery_file=None, target_scan='Internal'):
@@ -1280,9 +1283,8 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                                           wait_secs=wait_secs)
         os.makedirs(f'{disc}/live_hosts', exist_ok=True)
         for port_key, ips in full_results.items():
-            with open(f'{disc}/live_hosts/port{_port_fname(port_key)}.txt', 'w') as f:
-                for ip in sorted(ips):
-                    f.write(f'{ip}\n')
+            _atomic_write(f'{disc}/live_hosts/port{_port_fname(port_key)}.txt',
+                          ''.join(f'{ip}\n' for ip in sorted(ips)))
             host_count = len(ips)
             status_update = f'\nHosts Found on Port {port_key}: {host_count}'
             status_summary += status_update
@@ -1357,9 +1359,8 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             combined = fast_results.get(port_key, set()) | slow_results.get(port_key, set())
             if combined:
                 port_ips[port_key] = combined
-                with open(f'{disc}/live_hosts/port{_port_fname(port_key)}.txt', 'w') as f:
-                    for ip in sorted(combined):
-                        f.write(f'{ip}\n')
+                _atomic_write(f'{disc}/live_hosts/port{_port_fname(port_key)}.txt',
+                              ''.join(f'{ip}\n' for ip in sorted(combined)))
                 if port_key not in SLOW_PORTS:
                     # SLOW_PORTS are always re-queued for a solo batch scan;
                     # their summary is emitted once from that batch phase.
@@ -1478,9 +1479,9 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             os.makedirs(f'{disc}/live_hosts', exist_ok=True)
             for dest_port in batch:
                 if port_ips.get(dest_port):
-                    with open(f'{disc}/live_hosts/port{_port_fname(dest_port)}.txt', 'w') as file:
-                        for ip in sorted(port_ips[dest_port]):
-                            file.write(f'{ip}\n')
+                    _atomic_write(
+                        f'{disc}/live_hosts/port{_port_fname(dest_port)}.txt',
+                        ''.join(f'{ip}\n' for ip in sorted(port_ips[dest_port])))
                     host_count = len(port_ips[dest_port])
                     status_update = f'\nHosts Found on Port {dest_port}: {host_count}'
                     status_summary += status_update
@@ -1499,9 +1500,8 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                 added = merged_smb - port_ips.get(smb_port, set())
                 if added:
                     port_ips[smb_port] = merged_smb
-                    with open(f'{disc}/live_hosts/port{_port_fname(smb_port)}.txt', 'w') as _f:
-                        for _ip in sorted(merged_smb):
-                            _f.write(_ip + '\n')
+                    _atomic_write(f'{disc}/live_hosts/port{_port_fname(smb_port)}.txt',
+                                  ''.join(_ip + '\n' for _ip in sorted(merged_smb)))
                     partner = '445' if smb_port == '139' else '139'
                     print(_COLOR_INFO
                           + f'SMB coupling: added {len(added)} host(s) to port {smb_port} '
@@ -1518,9 +1518,8 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         )
         if ips:
             port_ips[udp_port] = ips
-            with open(f'{disc}/live_hosts/port{_port_fname(udp_port)}.txt', 'w') as f:
-                for ip in sorted(ips):
-                    f.write(f'{ip}\n')
+            _atomic_write(f'{disc}/live_hosts/port{_port_fname(udp_port)}.txt',
+                          ''.join(f'{ip}\n' for ip in sorted(ips)))
             host_count = len(ips)
             status_update = f'\nHosts Found on Port {udp_port}: {host_count}'
             status_summary += status_update
@@ -4153,19 +4152,17 @@ def _filter_udp_live_hosts(output_path):
         confirmed_counts[port_key] = len(confirmed)
 
         # Rewrite live_hosts file
-        with open(live_file, 'w') as fh:
-            for ip in sorted(confirmed):
-                fh.write(ip + '\n')
+        _atomic_write(live_file, ''.join(ip + '\n' for ip in sorted(confirmed)))
 
         # Rewrite nmap XML — remove open|filtered host entries so spoonmap_output.* is clean.
         # Write prologue first so Metasploit's importer sees <?xml?> + <!DOCTYPE nmaprun>.
+        # Atomic: this rewrites a file nmap already finished, so a failure mid-write
+        # would otherwise leave truncated XML that breaks aggregation permanently.
         for host in root_elem.findall('host'):
             addr = host.find('address[@addrtype="ipv4"]')
             if addr is None or addr.attrib['addr'] not in confirmed:
                 root_elem.remove(host)
-        with open(nmap_xml, 'w') as fh:
-            fh.write(prologue)
-            tree.write(fh, encoding='unicode')
+        _atomic_write(nmap_xml, prologue + etree.tostring(root_elem, encoding='unicode'))
 
     return confirmed_counts
 

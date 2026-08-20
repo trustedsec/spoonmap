@@ -1930,6 +1930,26 @@ class TestFullPortScan:
         assert live_file.exists()
         assert '10.0.0.5' in live_file.read_text()
         assert '10.0.0.6' in live_file.read_text()
+        # The atomic write must not leave its temp file where the resume path
+        # and _combine_live_hosts() enumerate this directory.
+        assert [p.name for p in live_file.parent.iterdir()] == ['port22.txt']
+
+    def test_full_scan_live_hosts_write_failure_keeps_prior_file(self, tmp_path):
+        """A failed live_hosts write must leave the previous host list complete.
+
+        Truncating this file makes a later resume scan that port against fewer
+        hosts, silently, with no error anywhere in the output.
+        """
+        spoonmap.output_path = str(tmp_path)
+        live_dir = tmp_path / 'discovery' / 'live_hosts'
+        live_dir.mkdir(parents=True)
+        (live_dir / 'port22.txt').write_text('10.0.0.1\n10.0.0.2\n')
+        with patch('spoonmap._run_masscan_batch', return_value={'22': {'10.0.0.5'}}), \
+             patch('spoonmap.os.replace', side_effect=OSError('ENOSPC')):
+            with pytest.raises(OSError):
+                mass_scan('Full', ['1-65535'], '53', '10000', '/fake/targets.txt', '')
+        assert (live_dir / 'port22.txt').read_text() == '10.0.0.1\n10.0.0.2\n'
+        assert [p.name for p in live_dir.iterdir()] == ['port22.txt']
 
     def test_full_scan_resume_reloads_from_live_hosts(self, tmp_path):
         spoonmap.output_path = str(tmp_path)
@@ -4037,6 +4057,51 @@ class TestMassScanResume:
         content = (live_dir / 'port3306.txt').read_text()
         assert '10.0.0.100' in content  # preserved from the leftover file
         assert '10.0.0.200' in content  # from this run's fresh batch result
+
+    def test_probe_and_batch_writes_leave_no_temp_files(self, tmp_path):
+        """Neither the probe nor the main-batch live_hosts write may leave a temp file.
+
+        The resume path and _combine_live_hosts() both enumerate live_hosts/,
+        so a stray temp file there would be read as a port's host list.
+        """
+        spoonmap.output_path = str(tmp_path)
+        responses = iter([
+            {'443': {'10.0.0.1'}},           # probe_fast(443) — hit, stops probing
+            {'3306': {'10.0.0.2'}},          # main batch (3306)
+        ])
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=lambda *a, **k: next(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      '/fake/targets.txt', '', batch_size=1, resume=False)
+
+        live_dir = tmp_path / 'discovery' / 'live_hosts'
+        assert sorted(p.name for p in live_dir.iterdir()) == ['port3306.txt', 'port443.txt']
+
+    def test_failed_batch_write_keeps_prior_live_hosts_file(self, tmp_path):
+        """A failed main-batch live_hosts write leaves the prior host list complete.
+
+        Truncation here makes the next resume run scan that port against fewer
+        hosts with no visible error.
+        """
+        spoonmap.output_path = str(tmp_path)
+        live_dir = tmp_path / 'discovery' / 'live_hosts'
+        live_dir.mkdir(parents=True)
+        (live_dir / 'port3306.txt').write_text('10.0.0.100\n10.0.0.101\n')
+
+        responses = iter([
+            {},                              # probe_fast(443) — miss
+            {},                              # probe_slow(443) — miss
+            {'3306': {'10.0.0.200'}},        # main batch (3306)
+        ])
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=lambda *a, **k: next(responses)), \
+             patch('spoonmap.os.replace', side_effect=OSError('ENOSPC')):
+            with pytest.raises(OSError):
+                mass_scan('All', ['443', '3306'], '53', '10000',
+                          '/fake/targets.txt', '', batch_size=1, resume=False)
+
+        assert (live_dir / 'port3306.txt').read_text() == '10.0.0.100\n10.0.0.101\n'
+        assert [p.name for p in live_dir.iterdir()] == ['port3306.txt']
 
 
 # ── _merge_host_xml ───────────────────────────────────────────────────────────
@@ -6610,6 +6675,25 @@ class TestReportSuspectedTarpits:
         assert not (tmp_path / 'suspected_tarpits.txt').exists()
         assert capsys.readouterr().out == ''
 
+    def test_write_leaves_no_temp_file_behind(self, tmp_path):
+        """The atomic write must not leave its temp file in the discovery dir."""
+        _report_suspected_tarpits({'10.0.0.1': (19, 20)}, str(tmp_path))
+        assert [p.name for p in tmp_path.iterdir()] == ['suspected_tarpits.txt']
+
+    def test_failed_write_keeps_previous_file_intact(self, tmp_path):
+        """A mid-write failure must leave the prior report readable, not truncated.
+
+        generate_findings() reads this file back; a truncated last line used to
+        crash it, so the write has to be all-or-nothing.
+        """
+        tarpit_file = tmp_path / 'suspected_tarpits.txt'
+        tarpit_file.write_text('10.0.0.1,19,20\n')
+        with patch('spoonmap.os.replace', side_effect=OSError('ENOSPC')):
+            with pytest.raises(OSError):
+                _report_suspected_tarpits({'10.0.0.2': (18, 20)}, str(tmp_path))
+        assert tarpit_file.read_text() == '10.0.0.1,19,20\n'
+        assert [p.name for p in tmp_path.iterdir()] == ['suspected_tarpits.txt']
+
 
 # ── TestSMBCoupling ────────────────────────────────────────────────────────────
 
@@ -7313,6 +7397,7 @@ class TestMassScanUdp:
         assert live_file.exists()
         assert '10.0.0.5' in live_file.read_text()
         assert '10.0.0.6' in live_file.read_text()
+        assert [p.name for p in live_file.parent.iterdir()] == ['portU_500.txt']
 
     def test_udp_uses_discovery_file_when_available(self, tmp_path):
         """UDP discovery uses discovery_file (live hosts) when it exists, not full target list."""
@@ -7439,6 +7524,66 @@ class TestFilterUdpLiveHosts:
         assert '10.0.0.10' in remaining_ips
         assert '10.0.0.20' not in remaining_ips
         assert result == {'U:500': 1}
+
+    def test_rewrites_leave_no_temp_files_behind(self, tmp_path):
+        """Both atomic rewrites must clean up their temp files."""
+        nmap_dir  = tmp_path / 'nmap_results'
+        live_dir  = tmp_path / 'discovery' / 'live_hosts'
+        nmap_dir.mkdir()
+        live_dir.mkdir(parents=True)
+        (nmap_dir / 'portU_500.xml').write_text(self._make_nmap_xml('10.0.0.1', '500', 'open'))
+        (live_dir / 'portU_500.txt').write_text('10.0.0.1\n')
+
+        _filter_udp_live_hosts(str(tmp_path))
+
+        assert [p.name for p in nmap_dir.iterdir()] == ['portU_500.xml']
+        assert [p.name for p in live_dir.iterdir()] == ['portU_500.txt']
+
+    def test_failed_xml_rewrite_keeps_original_xml_intact(self, tmp_path):
+        """A failure rewriting the nmap XML must leave the completed scan's XML parseable.
+
+        This file is nmap's own output; truncating it loses the port/script data
+        permanently and breaks every later aggregation.
+        """
+        nmap_dir  = tmp_path / 'nmap_results'
+        live_dir  = tmp_path / 'discovery' / 'live_hosts'
+        nmap_dir.mkdir()
+        live_dir.mkdir(parents=True)
+        original = self._make_nmap_xml('10.0.0.1', '500', 'open')
+        nmap_xml = nmap_dir / 'portU_500.xml'
+        nmap_xml.write_text(original)
+        (live_dir / 'portU_500.txt').write_text('10.0.0.1\n')
+
+        real_replace = spoonmap.os.replace
+
+        def _replace(src, dst):
+            if str(dst).endswith('.xml'):
+                raise OSError('ENOSPC')
+            return real_replace(src, dst)
+
+        with patch('spoonmap.os.replace', side_effect=_replace):
+            with pytest.raises(OSError):
+                _filter_udp_live_hosts(str(tmp_path))
+
+        assert nmap_xml.read_text() == original
+        assert [p.name for p in nmap_dir.iterdir()] == ['portU_500.xml']
+
+    def test_failed_live_hosts_rewrite_keeps_original_list_intact(self, tmp_path):
+        """A failure rewriting live_hosts must not truncate the host list."""
+        nmap_dir  = tmp_path / 'nmap_results'
+        live_dir  = tmp_path / 'discovery' / 'live_hosts'
+        nmap_dir.mkdir()
+        live_dir.mkdir(parents=True)
+        (nmap_dir / 'portU_500.xml').write_text(self._make_nmap_xml('10.0.0.1', '500', 'open'))
+        live_file = live_dir / 'portU_500.txt'
+        live_file.write_text('10.0.0.1\n10.0.0.2\n')
+
+        with patch('spoonmap.os.replace', side_effect=OSError('ENOSPC')):
+            with pytest.raises(OSError):
+                _filter_udp_live_hosts(str(tmp_path))
+
+        assert live_file.read_text() == '10.0.0.1\n10.0.0.2\n'
+        assert [p.name for p in live_dir.iterdir()] == ['portU_500.txt']
 
     def test_summary_updated_after_filter(self, tmp_path):
         """status_summary lines for UDP ports reflect post-filter confirmed count."""
