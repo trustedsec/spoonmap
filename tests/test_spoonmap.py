@@ -4907,6 +4907,105 @@ class TestNmapScan:
 
         assert captured_event['event'].is_set()
 
+    def test_hostnames_txt_file_filtered_out(self, tmp_path):
+        """port80_hostnames.txt should not be queued; only port80.txt should be."""
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts')
+        os.makedirs(f'{tmp_path}/nmap_results')
+        os.makedirs(f'{tmp_path}/nse_results')
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n')
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80_hostnames.txt').write_text('host1.internal\n')
+
+        queued_files = []
+
+        def fake_worker_capture(work_queue, completed_count, total_count, source_port, lock,
+                                interrupt_event, ip_to_hostname, script_scan, target_scan, start_time):
+            while True:
+                item = work_queue.get()
+                if item is None:
+                    work_queue.task_done()
+                    break
+                queued_files.append(item)
+                completed_count[0] += 1
+                work_queue.task_done()
+
+        with patch('spoonmap.nmap_worker', side_effect=fake_worker_capture):
+            nmap_scan('88', max_threads=2, script_scan=False)
+
+        assert queued_files == ['port80.txt']
+        assert 'port80_hostnames.txt' not in queued_files
+
+    def test_udp_port_with_hostnames_filtered(self, tmp_path):
+        """portU_500.txt should queue U:500; portU_500_hostnames.txt should not."""
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts')
+        os.makedirs(f'{tmp_path}/nmap_results')
+        os.makedirs(f'{tmp_path}/nse_results')
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'portU_500.txt').write_text('10.0.0.2\n')
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'portU_500_hostnames.txt').write_text('host2.internal\n')
+
+        queued_files = []
+
+        def fake_worker_capture(work_queue, completed_count, total_count, source_port, lock,
+                                interrupt_event, ip_to_hostname, script_scan, target_scan, start_time):
+            while True:
+                item = work_queue.get()
+                if item is None:
+                    work_queue.task_done()
+                    break
+                queued_files.append(item)
+                completed_count[0] += 1
+                work_queue.task_done()
+
+        with patch('spoonmap.nmap_worker', side_effect=fake_worker_capture):
+            nmap_scan('88', max_threads=2, script_scan=False)
+
+        assert queued_files == ['portU_500.txt']
+        assert 'portU_500_hostnames.txt' not in queued_files
+
+    def test_stray_ds_store_filtered_out(self, tmp_path):
+        """Stray .DS_Store file should not be queued."""
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts')
+        os.makedirs(f'{tmp_path}/nmap_results')
+        os.makedirs(f'{tmp_path}/nse_results')
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt').write_text('10.0.0.3\n')
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / '.DS_Store').write_text('junk\n')
+
+        queued_files = []
+
+        def fake_worker_capture(work_queue, completed_count, total_count, source_port, lock,
+                                interrupt_event, ip_to_hostname, script_scan, target_scan, start_time):
+            while True:
+                item = work_queue.get()
+                if item is None:
+                    work_queue.task_done()
+                    break
+                queued_files.append(item)
+                completed_count[0] += 1
+                work_queue.task_done()
+
+        with patch('spoonmap.nmap_worker', side_effect=fake_worker_capture):
+            nmap_scan('88', max_threads=2, script_scan=False)
+
+        assert queued_files == ['port80.txt']
+        assert '.DS_Store' not in queued_files
+
+    def test_already_scanned_ports_still_skipped_with_filter(self, tmp_path, capsys):
+        """Existing test_already_scanned_ports_skipped behavior still works with the new filter."""
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts')
+        os.makedirs(f'{tmp_path}/nmap_results')
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n')
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80_hostnames.txt').write_text('host.internal\n')
+        (Path(tmp_path) / 'nmap_results' / 'port80.xml').write_text('<nmaprun/>')
+
+        with patch('spoonmap.nmap_worker') as mock_worker:
+            nmap_scan('88', max_threads=2, script_scan=False)
+
+        assert not mock_worker.called
+        assert 'already been scanned' in capsys.readouterr().out
+
 
 # ── cucm-detect finding ───────────────────────────────────────────────────────
 

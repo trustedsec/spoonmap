@@ -1711,6 +1711,9 @@ def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
         # Filter out files that have already been scanned (both passes must be done)
         files_to_scan = []
         for host_file in host_files:
+            if not (host_file.startswith('port') and host_file.endswith('.txt')
+                    and not host_file.endswith('_hostnames.txt')):
+                continue
             dest_port = _fname_port((host_file.split('.')[0])[4:])
             banner_done = os.path.exists(f'{output_path}/nmap_results/port{_port_fname(dest_port)}.xml')
             scripts_exist = _get_scripts_for_port(dest_port, target_scan)
