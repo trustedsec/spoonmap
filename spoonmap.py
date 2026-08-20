@@ -606,6 +606,11 @@ def _discover_external_masscan(target_file, disc, max_rate, exclusions_file, tar
         masscan_cmd.extend(['--excludefile', exclusions_file])
     term_state = save_terminal_state()
     progress_thread = None
+    # Pre-initialised for the same reason progress_thread is: Ctrl-C during a
+    # scan is routine, and if SIGINT lands inside Popen() itself (the fork/exec
+    # window) the name is never bound, so a bare proc.kill() in the handler
+    # below replaced the KeyboardInterrupt with an UnboundLocalError.
+    proc = None
     try:
         proc = subprocess.Popen(masscan_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                 preexec_fn=_raise_fd_limit)
@@ -614,8 +619,9 @@ def _discover_external_masscan(target_file, disc, max_rate, exclusions_file, tar
         proc.wait()
         progress_thread.join()
     except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
+        if proc:
+            proc.kill()
+            proc.wait()
         if progress_thread:
             progress_thread.join()
         restore_terminal_state(term_state)
@@ -658,6 +664,11 @@ def _discover_internal_masscan(target_file, disc, max_rate, exclusions_file, tar
         masscan_cmd.extend(['--excludefile', exclusions_file])
     term_state = save_terminal_state()
     progress_thread = None
+    # Pre-initialised for the same reason progress_thread is: Ctrl-C during a
+    # scan is routine, and if SIGINT lands inside Popen() itself (the fork/exec
+    # window) the name is never bound, so a bare proc.kill() in the handler
+    # below replaced the KeyboardInterrupt with an UnboundLocalError.
+    proc = None
     try:
         proc = subprocess.Popen(masscan_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                 preexec_fn=_raise_fd_limit)
@@ -666,8 +677,9 @@ def _discover_internal_masscan(target_file, disc, max_rate, exclusions_file, tar
         proc.wait()
         progress_thread.join()
     except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
+        if proc:
+            proc.kill()
+            proc.wait()
         if progress_thread:
             progress_thread.join()
         restore_terminal_state(term_state)
@@ -815,12 +827,16 @@ def _nmap_host_discovery(target_file, disc, source_port, exclusions_file):
 
     print(_COLOR_INFO + 'Host discovery: running nmap -sn...' + _COLOR_RESET)
     term_state = save_terminal_state()
+    # SIGINT inside Popen() leaves proc unbound; a bare proc.kill() below then
+    # raised UnboundLocalError in place of the KeyboardInterrupt.
+    proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         proc.wait()
     except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
+        if proc:
+            proc.kill()
+            proc.wait()
         restore_terminal_state(term_state)
         raise
     except FileNotFoundError:
@@ -839,9 +855,15 @@ def _nmap_host_discovery(target_file, disc, source_port, exclusions_file):
             status = host.find('status')
             if status is None or status.attrib.get('state') != 'up':
                 continue
+            # An <address> with no addr= attribute (truncated -sn output) is not
+            # usable.  Subscripting it raised KeyError, which `except
+            # etree.ParseError` below does not catch, so one malformed element
+            # discarded the live hosts found by the whole sweep.
             addr = host.find('address[@addrtype="ipv4"]')
-            if addr is not None:
-                live_ips.add(addr.attrib['addr'])
+            ip = addr.attrib.get('addr') if addr is not None else None
+            if not ip:
+                continue
+            live_ips.add(ip)
     except etree.ParseError as e:
         print(_COLOR_ERROR + f'Error parsing nmap discovery XML: {e}' + _COLOR_RESET)
 
@@ -868,6 +890,11 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
 
     term_state = save_terminal_state()
     progress_thread = None
+    # Pre-initialised for the same reason progress_thread is: if SIGINT lands
+    # inside Popen() itself the name is never bound, and the handler's
+    # masscan_process.pid read raised UnboundLocalError instead of letting the
+    # KeyboardInterrupt through.
+    masscan_process = None
     stderr_holder = []
 
     def run_progress_and_capture(proc):
@@ -885,9 +912,10 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
         masscan_process.wait()
         progress_thread.join()
     except KeyboardInterrupt:
-        print(f'Killing PID {str(masscan_process.pid)}...')
-        masscan_process.kill()
-        masscan_process.wait()
+        if masscan_process:
+            print(f'Killing PID {str(masscan_process.pid)}...')
+            masscan_process.kill()
+            masscan_process.wait()
         if progress_thread:
             progress_thread.join()
         restore_terminal_state(term_state)
@@ -1083,12 +1111,16 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
     print(_COLOR_INFO + f'UDP discovery: scanning port {port_num} with nmap...' + _COLOR_RESET)
 
     term_state = save_terminal_state()
+    # SIGINT inside Popen() leaves proc unbound; a bare proc.kill() below then
+    # raised UnboundLocalError in place of the KeyboardInterrupt.
+    proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         proc.wait()
     except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
+        if proc:
+            proc.kill()
+            proc.wait()
         restore_terminal_state(term_state)
         raise
     except FileNotFoundError:
@@ -1104,10 +1136,14 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
     try:
         root = etree.parse(output_file)
         for host in root.findall('host'):
+            # Skip a <host> whose IPv4 <address> carries no addr= attribute:
+            # subscripting it raised KeyError, which the ParseError guard below
+            # does not catch, losing the whole UDP discovery pass over one
+            # unusable element.
             addr = host.find('address[@addrtype="ipv4"]')
-            if addr is None:
+            ip = addr.attrib.get('addr') if addr is not None else None
+            if not ip:
                 continue
-            ip = addr.attrib['addr']
             for port_elem in host.findall('.//port'):
                 state_elem = port_elem.find('state')
                 if state_elem is not None and state_elem.attrib.get('state') in ('open', 'open|filtered'):
@@ -1225,6 +1261,9 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
             stderr_lines.append(line)
 
     term_state = save_terminal_state()
+    # SIGINT inside Popen() leaves proc unbound; a bare proc.kill() below then
+    # raised UnboundLocalError in place of the KeyboardInterrupt.
+    proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
@@ -1237,8 +1276,9 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
         _et.join()
         stderr_output = ''.join(stderr_lines)
     except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
+        if proc:
+            proc.kill()
+            proc.wait()
         restore_terminal_state(term_state)
         raise
     except FileNotFoundError:
@@ -1263,10 +1303,13 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
     try:
         root = etree.parse(output_file)
         for host in root.findall('host'):
+            # Skip a <host> whose IPv4 <address> carries no addr= attribute.
+            # The KeyError from subscripting escaped the ParseError guard below
+            # and discarded the results for every other host in the sweep.
             addr = host.find('address[@addrtype="ipv4"]')
-            if addr is None:
+            ip = addr.attrib.get('addr') if addr is not None else None
+            if not ip:
                 continue
-            ip = addr.attrib['addr']
             for port_elem in host.findall('.//port'):
                 protocol = port_elem.attrib.get('protocol', 'tcp')
                 portid = port_elem.attrib.get('portid', '')
@@ -1378,7 +1421,14 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                     if not (fname.startswith('port') and fname.endswith('.txt')
                             and not fname.endswith('_hostnames.txt')):
                         continue
-                    port_key = fname[4:-4]
+                    # Convert the filename stem back to a port key, as the two
+                    # structurally identical loops in _nmap_port_discovery() and
+                    # _filter_udp_live_hosts() already do.  The raw stem leaves a
+                    # UDP port as 'U_53', which fails the port_key.startswith('U:')
+                    # test in _flag_suspected_tarpits() — so a resumed Full scan
+                    # counted UDP ports toward the TCP open-port fraction and could
+                    # skew or spuriously trigger the honeypot/tarpit heuristic.
+                    port_key = _fname_port(fname[4:-4])
                     with open(os.path.join(live_hosts_dir, fname)) as fh:
                         ips = {line.strip() for line in fh if line.strip()}
                     if ips:
@@ -1750,6 +1800,16 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 work_queue.task_done()
                 break
 
+            # task_done() must fire exactly once per successful get().  The inner
+            # `finally` below and the outer `except Exception` both called it, so
+            # an exception raised *inside* one of the inner handlers (a failing
+            # print, say) reached the outer handler after the finally had already
+            # run — a second call raises ValueError('task_done() called too many
+            # times') and, worse, over-decrements the queue's unfinished counter,
+            # so work_queue.join() returns as though every port had been scanned.
+            # That turns a visible hang into a silently incomplete scan.
+            task_done_called = False
+
             dest_port = _fname_port((host_file.split('.')[0])[4:])
             output_file = f'{output_path}/nmap_results/port{_port_fname(dest_port)}.xml'
             input_file = f'{_disc(output_path)}/live_hosts/port{_port_fname(dest_port)}.txt'
@@ -1847,12 +1907,20 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 with lock:
                     print(_COLOR_ERROR + f'Error running nmap for port {dest_port}: {e}' + _COLOR_RESET)
             finally:
+                # Flag set before the call so a raising task_done() cannot be
+                # retried by the outer handler either.
+                task_done_called = True
                 work_queue.task_done()
 
         except Exception as e:
-            with lock:
-                print(_COLOR_ERROR + f'Worker thread error: {e}' + _COLOR_RESET)
-            work_queue.task_done()
+            try:
+                with lock:
+                    print(_COLOR_ERROR + f'Worker thread error: {e}' + _COLOR_RESET)
+            finally:
+                # Only for failures before the inner try/finally was entered
+                # (queue item parsing, hostname target file creation).
+                if not task_done_called:
+                    work_queue.task_done()
 
 def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
               script_scan=False, target_scan='Internal'):
@@ -2299,7 +2367,18 @@ def _scan_extra_sql_ports(output_path, source_port):
         try:
             root = etree.parse(fpath)
             for host in root.findall('host'):
-                ip = host.findall('address')[0].attrib['addr']
+                # findall('address')[0] raised IndexError on a <host> with no
+                # <address> child, and KeyError on one with no addr=.  Both were
+                # swallowed by the broad guard below, which abandons the rest of
+                # the file — so one unusable host element lost every other SQL
+                # named instance in it.  Prefer the IPv4 address explicitly and
+                # skip the host when there is no usable identifier.
+                addr_elem = host.find("address[@addrtype='ipv4']")
+                if addr_elem is None:
+                    addr_elem = host.find('address')
+                ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
+                if not ip:
+                    continue
                 for script in host.iter('script'):
                     if script.attrib.get('id') != 'ms-sql-info':
                         continue
@@ -2571,10 +2650,14 @@ def _count_unmatched_service_ports(output_path):
         except etree.ParseError:
             continue
         for host in root.findall('host'):
+            # Skip a <host> whose IPv4 <address> has no addr= attribute.  The
+            # KeyError escaped the `except etree.ParseError` above (it wraps only
+            # the parse), aborting the honeypot heuristic for every remaining
+            # result file rather than for the one unusable element.
             addr_elem = host.find("address[@addrtype='ipv4']")
-            if addr_elem is None:
+            ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
+            if not ip:
                 continue
-            ip = addr_elem.attrib['addr']
             for port_elem in host.iter('port'):
                 state_elem = port_elem.find('state')
                 if state_elem is not None and state_elem.attrib.get('state') != 'open':
@@ -4249,10 +4332,14 @@ def _filter_udp_live_hosts(output_path):
             tree = etree.parse(nmap_xml)
             root_elem = tree.getroot()
             for host in root_elem.findall('host'):
+                # Skip a <host> whose IPv4 <address> has no addr= attribute: the
+                # KeyError escaped the ParseError guard below, and the resulting
+                # empty `confirmed` set would then rewrite live_hosts and strip
+                # every genuinely confirmed host from the nmap XML.
                 addr = host.find('address[@addrtype="ipv4"]')
-                if addr is None:
+                ip = addr.attrib.get('addr') if addr is not None else None
+                if not ip:
                     continue
-                ip = addr.attrib['addr']
                 for port_elem in host.findall('.//port'):
                     state_elem = port_elem.find('state')
                     if state_elem is not None and state_elem.attrib.get('state') == 'open':
@@ -4279,8 +4366,12 @@ def _filter_udp_live_hosts(output_path):
         # Atomic: this rewrites a file nmap already finished, so a failure mid-write
         # would otherwise leave truncated XML that breaks aggregation permanently.
         for host in root_elem.findall('host'):
+            # .attrib.get() rather than a bare subscript: this walk sits outside
+            # the parse guard above, so a KeyError here propagated out of
+            # _filter_udp_live_hosts() after live_hosts had already been rewritten,
+            # leaving the run's UDP state half-updated.
             addr = host.find('address[@addrtype="ipv4"]')
-            if addr is None or addr.attrib['addr'] not in confirmed:
+            if addr is None or addr.attrib.get('addr') not in confirmed:
                 root_elem.remove(host)
         _atomic_write(nmap_xml, prologue + etree.tostring(root_elem, encoding='unicode'))
 

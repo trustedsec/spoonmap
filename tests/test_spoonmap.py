@@ -1755,6 +1755,29 @@ class TestCountUnmatchedServicePorts:
         (nmap_results / 'port9999.xml').write_text(xml)
         assert _count_unmatched_service_ports(str(tmp_path)) == {}
 
+    def test_address_without_addr_attribute_skipped_others_kept(self, tmp_path):
+        """attrib['addr'] raised KeyError, which the `except etree.ParseError`
+        around the parse does not catch — aborting the honeypot heuristic for
+        every remaining result file, not just the one unusable element."""
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="9999">'
+            '<state state="open"/>'
+            '<service name="unknown" servicefp="SF-Port9999-TCP:..."/>'
+            '</port></ports></host>'
+            '<host><address addr="10.0.0.8" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="9999">'
+            '<state state="open"/>'
+            '<service name="unknown" servicefp="SF-Port9999-TCP:..."/>'
+            '</port></ports></host>'
+            '</nmaprun>'
+        )
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_unmatched_service_ports(str(tmp_path)) == {'10.0.0.8': 1}
+
 
 class TestGenerateFindingsHoneypot:
     """generate_findings() 'Likely Honeypot / Decoy Host' finding."""
@@ -2094,6 +2117,34 @@ class TestFullPortScan:
         tarpit_file = disc / 'suspected_tarpits.txt'
         assert tarpit_file.exists()
         assert '10.0.0.9' in tarpit_file.read_text()
+
+    def test_full_scan_resume_normalises_udp_port_key(self, tmp_path):
+        """A resumed Full scan must convert 'portU_53.txt' to the 'U:53' port key.
+
+        The raw filename stem fails the port_key.startswith('U:') test in
+        _flag_suspected_tarpits(), so a UDP port was counted toward the TCP
+        open-port fraction.  Nine TCP ports sit one below the threshold of 10;
+        counting the UDP port as a tenth spuriously flags the host as a tarpit.
+        """
+        spoonmap.output_path = str(tmp_path)
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        live_dir = disc / 'live_hosts'
+        live_dir.mkdir(parents=True)
+        (disc / 'masscan_results' / 'portFull.xml').write_text('<nmaprun/>')
+        for p in range(9):
+            (live_dir / f'port{p}.txt').write_text('10.0.0.9\n')
+        (live_dir / 'portU_53.txt').write_text('10.0.0.9\n')
+
+        with patch('spoonmap._run_masscan_batch') as mock_batch, \
+             patch('spoonmap.HONEYPOT_OPEN_PORT_FRACTION', 0.0001):
+            result = mass_scan('Full', ['1-65535'], '53', '10000',
+                               '/fake/targets.txt', '', resume=True)
+
+        assert not mock_batch.called
+        assert 'Hosts Found on Port U:53: 1' in result
+        assert 'Hosts Found on Port U_53' not in result
+        assert not (disc / 'suspected_tarpits.txt').exists()
 
     def _setup_full_resume_cache(self, tmp_path, xml_text):
         spoonmap.output_path = str(tmp_path)
@@ -4811,6 +4862,50 @@ class TestScanExtraSqlPorts:
 
         assert not mock_popen.called
 
+    def test_unusable_address_hosts_skipped_later_instance_still_scanned(self, tmp_path):
+        """findall('address')[0] raised IndexError on a <host> with no <address>,
+        and KeyError on one with no addr=.  The broad guard swallowed both and
+        abandoned the rest of the file, losing every later named instance."""
+        xml = textwrap.dedent("""\
+            <?xml version="1.0"?>
+            <nmaprun>
+              <host>
+                <ports><port protocol="udp" portid="1434"/></ports>
+              </host>
+              <host>
+                <address addrtype="ipv4"/>
+                <ports><port protocol="udp" portid="1434"/></ports>
+              </host>
+              <host>
+                <address addr="192.168.1.10" addrtype="ipv4"/>
+                <ports>
+                  <port protocol="udp" portid="1434">
+                    <script id="ms-sql-info" output="SQL Server Express">
+                      <table key="192.168.1.10\\SQLEXPRESS">
+                        <elem key="TCP port">51234</elem>
+                      </table>
+                    </script>
+                  </port>
+                </ports>
+              </host>
+            </nmaprun>
+        """)
+        nse_dir = tmp_path / 'nse_results'
+        nse_dir.mkdir()
+        (nse_dir / 'portU_1434.xml').write_text(xml)
+
+        with patch('spoonmap.subprocess.Popen') as mock_popen, \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            mock_proc = MagicMock()
+            mock_proc.wait.return_value = 0
+            mock_popen.return_value = mock_proc
+            _scan_extra_sql_ports(str(tmp_path), '88')
+
+        commands = [c[0][0] for c in mock_popen.call_args_list]
+        assert commands, 'the third host\'s named instance must still be scanned'
+        assert all('51234' in cmd for cmd in commands)
+
     def test_malformed_xml_logged_and_skipped(self, tmp_path, capsys):
         nse_dir = tmp_path / 'nse_results'
         nse_dir.mkdir()
@@ -5581,6 +5676,85 @@ class TestNmapWorker:
             nmap_worker(work_queue, completed_count, 1, '88', lock, interrupt_event, None)
 
         assert 'Worker thread error' in capsys.readouterr().out
+
+    def test_exception_inside_inner_handler_calls_task_done_once(self, tmp_path, capsys):
+        """An exception raised *inside* an inner except handler must not double
+        up task_done().
+
+        The inner `finally` and the outer `except Exception` both called it, so
+        this path decremented the queue's unfinished counter twice for a single
+        get().  The second call raises ValueError('task_done() called too many
+        times') and kills the worker while the counter has been over-decremented,
+        so work_queue.join() returns as though every port had been scanned —
+        turning a visible hang into a silently incomplete scan.
+        """
+        class _CountingQueue(Queue):
+            """Records unfinished_tasks after each task_done()."""
+            def __init__(self):
+                super().__init__()
+                self.task_done_calls = 0
+                self.remaining_after = []
+
+            def task_done(self):
+                self.task_done_calls += 1
+                super().task_done()
+                self.remaining_after.append(self.unfinished_tasks)
+
+        class _ExplodingLock:
+            """Raises on the Nth acquisition, to blow up inside a print()."""
+            def __init__(self, fail_on):
+                self.fail_on = fail_on
+                self.calls = 0
+
+            def __enter__(self):
+                self.calls += 1
+                if self.calls == self.fail_on:
+                    raise RuntimeError('print inside handler blew up')
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/nmap_results', exist_ok=True)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts', exist_ok=True)
+        live = Path(tmp_path) / 'discovery' / 'live_hosts'
+        (live / 'port80.txt').write_text('10.0.0.1\n')
+        (live / 'port443.txt').write_text('10.0.0.1\n')
+
+        work_queue = _CountingQueue()
+        work_queue.put('port80.txt')
+        work_queue.put('port443.txt')
+        work_queue.put(None)  # poison pill
+        completed_count = [0]
+        interrupt_event = threading.Event()
+
+        # Acquisition 1: port80's "Grabbing service banners".  Acquisition 2: the
+        # inner `except Exception` handler reporting the Popen failure — that is
+        # the one that must not leave task_done() to the outer handler as well.
+        lock = _ExplodingLock(fail_on=2)
+        popen_calls = []
+
+        def fake_popen(*args, **kwargs):
+            popen_calls.append(args)
+            if len(popen_calls) == 1:
+                raise RuntimeError('boom')
+            return self._make_finished_proc()
+
+        with patch('spoonmap._build_nmap_cmd', return_value=['nmap', 'fake']), \
+             patch('spoonmap._get_scripts_for_port', return_value=''), \
+             patch('spoonmap.subprocess.Popen', side_effect=fake_popen):
+            nmap_worker(work_queue, completed_count, 2, '88', lock,
+                        interrupt_event, None)
+
+        assert work_queue.task_done_calls == 3   # one per get(), no more
+        # Decisive: after port80 finished, port443 and the pill were still
+        # outstanding.  A doubled task_done() would show 1 here, and
+        # work_queue.join() would have returned with port443 unscanned.
+        assert work_queue.remaining_after == [2, 1, 0]
+        assert work_queue.unfinished_tasks == 0
+        out = capsys.readouterr().out
+        assert 'Worker thread error' in out
 
     def test_poison_pill_stops_worker_without_processing(self, tmp_path):
         """A lone poison pill (no work item) exits the loop cleanly."""
@@ -7184,6 +7358,19 @@ class TestRunMasscanBatchBehavior:
                                    '/fake/targets.txt', None, None)
         assert mock_proc.kill.called
 
+    def test_interrupt_inside_popen_reraises_and_restores_terminal(self, tmp_path):
+        """SIGINT in the fork/exec window left masscan_process unbound, so the
+        handler's `Killing PID {masscan_process.pid}` read raised
+        UnboundLocalError in place of the KeyboardInterrupt."""
+        output_xml = tmp_path / 'out.xml'
+        with patch('spoonmap.subprocess.Popen', side_effect=KeyboardInterrupt), \
+             patch('spoonmap.save_terminal_state', return_value='TERM'), \
+             patch('spoonmap.restore_terminal_state') as mock_restore:
+            with pytest.raises(KeyboardInterrupt):
+                _run_masscan_batch(['445'], '1000', str(output_xml),
+                                   '/fake/targets.txt', None, None)
+        assert mock_restore.called
+
     def test_returncode_1_prints_diagnostic_with_stderr(self, tmp_path, capsys):
         output_xml = tmp_path / 'out.xml'
         mock_proc = self._make_mock_proc(returncode=1)
@@ -7684,6 +7871,32 @@ class TestNmapUdpDiscovery:
             result = _nmap_udp_discovery('U:500', '/targets.txt', str(tmp_path), '53', '')
         assert result == set()
 
+    def test_address_without_addr_attribute_skipped_others_kept(self, tmp_path):
+        """attrib['addr'] raised KeyError past the ParseError guard, losing the
+        whole UDP discovery pass over one unusable <address>."""
+        (tmp_path / 'discovery' / 'masscan_results').mkdir(parents=True)
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4"/>'
+            '<ports><port protocol="udp" portid="500">'
+            '<state state="open"/></port></ports></host>'
+            '<host><address addr="10.0.0.4" addrtype="ipv4"/>'
+            '<ports><port protocol="udp" portid="500">'
+            '<state state="open"/></port></ports></host>'
+            '</nmaprun>'
+        )
+        spoonmap.output_path = str(tmp_path)
+        with patch('spoonmap.subprocess.Popen') as mock_popen, \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            mock_proc = MagicMock()
+            mock_proc.wait.return_value = 0
+            mock_popen.return_value = mock_proc
+            xml_path = tmp_path / 'discovery' / 'masscan_results' / 'portU_500.xml'
+            xml_path.write_text(xml)
+            result = _nmap_udp_discovery('U:500', '/targets.txt', str(tmp_path), '53', '')
+        assert result == {'10.0.0.4'}
+
     def test_malformed_xml_logged_and_empty_set_returned(self, tmp_path, capsys):
         (tmp_path / 'discovery' / 'masscan_results').mkdir(parents=True)
         spoonmap.output_path = str(tmp_path)
@@ -7720,6 +7933,18 @@ class TestNmapUdpDiscovery:
             with pytest.raises(KeyboardInterrupt):
                 _nmap_udp_discovery('U:500', '/targets.txt', str(tmp_path), '53', '')
         assert mock_proc.kill.called
+
+    def test_interrupt_inside_popen_reraises_and_restores_terminal(self, tmp_path):
+        """SIGINT in the fork/exec window left proc unbound, so proc.kill() in the
+        handler raised UnboundLocalError instead of letting the interrupt out."""
+        (tmp_path / 'discovery' / 'masscan_results').mkdir(parents=True)
+        spoonmap.output_path = str(tmp_path)
+        with patch('spoonmap.subprocess.Popen', side_effect=KeyboardInterrupt), \
+             patch('spoonmap.save_terminal_state', return_value='TERM'), \
+             patch('spoonmap.restore_terminal_state') as mock_restore:
+            with pytest.raises(KeyboardInterrupt):
+                _nmap_udp_discovery('U:500', '/targets.txt', str(tmp_path), '53', '')
+        assert mock_restore.called
 
 
 class TestNmapPortDiscovery:
@@ -7968,6 +8193,38 @@ class TestNmapPortDiscovery:
 
         assert 'Hosts Found' not in summary
 
+    def test_address_without_addr_attribute_skipped_others_kept(self, tmp_path):
+        """attrib['addr'] raised KeyError past the ParseError guard, discarding
+        the results for every other host in the sweep."""
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
+        spoonmap.output_path = str(tmp_path)
+
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="80">'
+            '<state state="open"/></port></ports></host>'
+            '<host><address addr="10.0.0.3" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="80">'
+            '<state state="open"/></port></ports></host>'
+            '</nmaprun>'
+        )
+
+        def fake_popen(cmd, **kwargs):
+            out_idx = cmd.index('-oX') + 1
+            Path(cmd[out_idx]).write_text(xml)
+            return self._make_mock_proc()
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            summary = _nmap_port_discovery(['80'], str(target), '', None, scan_type='Custom')
+
+        assert 'Hosts Found on Port 80: 1' in summary
+        live_file = tmp_path / 'discovery' / 'live_hosts' / 'port80.txt'
+        assert live_file.read_text() == '10.0.0.3\n'
+
     def test_keyboard_interrupt_kills_proc_and_reraises(self, tmp_path):
         target = tmp_path / 'targets.txt'
         target.write_text('10.0.0.1\n')
@@ -7983,6 +8240,21 @@ class TestNmapPortDiscovery:
                 _nmap_port_discovery(['80'], str(target), '', None, scan_type='Custom')
 
         assert mock_proc.kill.called
+
+    def test_interrupt_inside_popen_reraises_and_restores_terminal(self, tmp_path):
+        """SIGINT in the fork/exec window left proc unbound, so the handler's
+        proc.kill() raised UnboundLocalError in place of the interrupt."""
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
+        spoonmap.output_path = str(tmp_path)
+
+        with patch('spoonmap.subprocess.Popen', side_effect=KeyboardInterrupt), \
+             patch('spoonmap.save_terminal_state', return_value='TERM'), \
+             patch('spoonmap.restore_terminal_state') as mock_restore:
+            with pytest.raises(KeyboardInterrupt):
+                _nmap_port_discovery(['80'], str(target), '', None, scan_type='Custom')
+
+        assert mock_restore.called
 
     def test_nmap_not_found_returns_summary(self, tmp_path, capsys):
         target = tmp_path / 'targets.txt'
@@ -8514,6 +8786,40 @@ class TestFilterUdpLiveHosts:
         result = _filter_udp_live_hosts(str(tmp_path))
         assert result == {'U:500': 0}
 
+    def test_address_without_addr_attribute_skipped_others_kept(self, tmp_path):
+        """A KeyError from attrib['addr'] escaped both walks.
+
+        In the first walk it escaped `except etree.ParseError`, so `confirmed`
+        never got built; in the XML-rewrite walk it escaped the guard entirely,
+        propagating out after live_hosts had already been rewritten.  Either way
+        a genuinely confirmed host was lost.
+        """
+        nmap_dir = tmp_path / 'nmap_results'
+        live_dir = tmp_path / 'discovery' / 'live_hosts'
+        nmap_dir.mkdir()
+        live_dir.mkdir(parents=True)
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4"/>'
+            '<ports><port protocol="udp" portid="500">'
+            '<state state="open"/></port></ports></host>'
+            '<host><address addr="10.0.0.6" addrtype="ipv4"/>'
+            '<ports><port protocol="udp" portid="500">'
+            '<state state="open"/></port></ports></host>'
+            '</nmaprun>'
+        )
+        (nmap_dir / 'portU_500.xml').write_text(xml)
+        (live_dir / 'portU_500.txt').write_text('10.0.0.6\n')
+
+        result = _filter_udp_live_hosts(str(tmp_path))
+
+        assert result == {'U:500': 1}
+        assert (live_dir / 'portU_500.txt').read_text().strip() == '10.0.0.6'
+        tree = etree.parse(str(nmap_dir / 'portU_500.xml'))
+        hosts = tree.findall('host')
+        assert len(hosts) == 1
+        assert hosts[0].find('address').attrib['addr'] == '10.0.0.6'
+
 
 # ── _discovery_wait ───────────────────────────────────────────────────────────
 
@@ -8806,6 +9112,23 @@ class TestDiscoverInternalMasscan:
 
         assert mock_proc.kill.called
 
+    def test_interrupt_inside_popen_reraises_and_restores_terminal(self, tmp_path):
+        """SIGINT in the fork/exec window left proc unbound, so the handler's
+        proc.kill() raised UnboundLocalError in place of the interrupt — while
+        the terminal still had to be restored out of masscan's raw mode."""
+        disc = tmp_path / 'discovery'
+        disc.mkdir()
+        targets = tmp_path / 'targets.txt'
+        targets.write_text('10.0.0.0/24\n')
+
+        with patch('spoonmap.subprocess.Popen', side_effect=KeyboardInterrupt), \
+             patch('spoonmap.save_terminal_state', return_value='TERM'), \
+             patch('spoonmap.restore_terminal_state') as mock_restore:
+            with pytest.raises(KeyboardInterrupt):
+                _discover_internal_masscan(str(targets), str(disc), '1000', None, 256)
+
+        assert mock_restore.called
+
 
 class TestStreamMasscanProgress:
     """Unit tests for _stream_masscan_progress()."""
@@ -8960,6 +9283,23 @@ class TestDiscoverExternalMasscan:
 
         assert mock_proc.kill.called
 
+    def test_interrupt_inside_popen_reraises_and_restores_terminal(self, tmp_path):
+        """SIGINT in the fork/exec window left proc unbound, so the handler's
+        proc.kill() raised UnboundLocalError in place of the interrupt — while
+        the terminal still had to be restored out of masscan's raw mode."""
+        disc = tmp_path / 'discovery'
+        disc.mkdir()
+        targets = tmp_path / 'targets.txt'
+        targets.write_text('1.2.3.0/24\n')
+
+        with patch('spoonmap.subprocess.Popen', side_effect=KeyboardInterrupt), \
+             patch('spoonmap.save_terminal_state', return_value='TERM'), \
+             patch('spoonmap.restore_terminal_state') as mock_restore:
+            with pytest.raises(KeyboardInterrupt):
+                _discover_external_masscan(str(targets), str(disc), '10000', None, 256)
+
+        assert mock_restore.called
+
 
 class TestExternalHostDiscovery:
     """Unit tests for _external_host_discovery() — masscan + nmap -sn union."""
@@ -9090,6 +9430,34 @@ class TestNmapHostDiscovery:
 
         assert ips == set()
 
+    def test_address_without_addr_attribute_skipped_others_kept(self, tmp_path):
+        """A bare attrib['addr'] raised KeyError, which `except etree.ParseError`
+        does not catch — so one malformed element discarded the whole sweep."""
+        disc = tmp_path / 'discovery'
+        disc.mkdir()
+        targets = tmp_path / 'targets.txt'
+        targets.write_text('10.0.0.1\n')
+
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><status state="up"/><address addrtype="ipv4"/></host>'
+            '<host><status state="up"/>'
+            '<address addr="10.0.0.7" addrtype="ipv4"/></host>'
+            '</nmaprun>'
+        )
+
+        def fake_popen(cmd, **kwargs):
+            out_idx = cmd.index('-oX') + 1
+            Path(cmd[out_idx]).write_text(xml)
+            return self._make_mock_proc()
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            ips = _nmap_host_discovery(str(targets), str(disc), '', None)
+
+        assert ips == {'10.0.0.7'}
+
     def test_nmap_not_found_returns_empty_set(self, tmp_path, capsys):
         disc = tmp_path / 'discovery'
         disc.mkdir()
@@ -9103,6 +9471,22 @@ class TestNmapHostDiscovery:
 
         assert ips == set()
         assert 'nmap not found' in capsys.readouterr().out
+
+    def test_interrupt_inside_popen_reraises_and_restores_terminal(self, tmp_path):
+        """SIGINT in the fork/exec window left proc unbound, so the handler's
+        proc.kill() raised UnboundLocalError in place of the interrupt."""
+        disc = tmp_path / 'discovery'
+        disc.mkdir()
+        targets = tmp_path / 'targets.txt'
+        targets.write_text('10.0.0.1\n')
+
+        with patch('spoonmap.subprocess.Popen', side_effect=KeyboardInterrupt), \
+             patch('spoonmap.save_terminal_state', return_value='TERM'), \
+             patch('spoonmap.restore_terminal_state') as mock_restore:
+            with pytest.raises(KeyboardInterrupt):
+                _nmap_host_discovery(str(targets), str(disc), '', None)
+
+        assert mock_restore.called
 
     def test_keyboard_interrupt_kills_proc_and_reraises(self, tmp_path):
         disc = tmp_path / 'discovery'
