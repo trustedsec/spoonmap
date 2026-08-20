@@ -2402,9 +2402,14 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
         findings.append((sev, host, str(port), title, detail))
 
     def scripts_for_elem(elem):
-        """Return dict of {script_id: output} for a port or hostscript element."""
+        """Return dict of {script_id: output} for a port or hostscript element.
+
+        A <script> with no id= attribute (truncated/garbled NSE output) is
+        skipped rather than raising KeyError, which would abort the whole
+        findings phase over one unusable element.
+        """
         return {s.attrib['id']: s.attrib.get('output', '')
-                for s in elem.findall('script')}
+                for s in elem.findall('script') if s.attrib.get('id')}
 
     def add_sql_instance_finding(ip, port_str, ms_sql_output):
         """Emit the SQL Server discovery finding, with Azure exemption + on-prem EOL check.
@@ -2519,10 +2524,17 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
         file_port_str = port_str_from_fname(fname)
 
         for host in root.findall('host'):
+            # A <host> from a truncated or garbled result file can carry no
+            # <address> child at all, or one with no addr= attribute. Neither
+            # is usable, and indexing/subscripting blindly here raised
+            # IndexError/KeyError outside the parse guard above, taking down
+            # findings generation for every other host in the run.
             addr_elem = host.find("address[@addrtype='ipv4']")
             if addr_elem is None:
-                addr_elem = host.findall('address')[0]
-            ip = addr_elem.attrib['addr']
+                addr_elem = host.find('address')
+            ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
+            if not ip:
+                continue
 
             for port_elem in host.iter('port'):
                 state_elem = port_elem.find('state')
@@ -3755,13 +3767,18 @@ def _host_elem_to_dict(host_elem, ip_to_hostname=None):
                 'service':  svc_elem.attrib.get('name', '')    if svc_elem   is not None else '',
                 'product':  svc_elem.attrib.get('product', '') if svc_elem   is not None else '',
                 'version':  svc_elem.attrib.get('version', '') if svc_elem   is not None else '',
+                # Skip any <script> lacking an id= attribute; this function
+                # feeds the whole-run results aggregation, so a KeyError here
+                # would lose spoonmap_output.xml/.json entirely.
                 'scripts':  {s.attrib['id']: s.attrib.get('output', '')
-                             for s in port_elem.findall('script')},
+                             for s in port_elem.findall('script')
+                             if s.attrib.get('id')},
             })
     hostscript_elem = host_elem.find('hostscript')
     if hostscript_elem is not None:
         result['hostscripts'] = {s.attrib['id']: s.attrib.get('output', '')
-                                 for s in hostscript_elem.findall('script')}
+                                 for s in hostscript_elem.findall('script')
+                                 if s.attrib.get('id')}
     return result
 
 
