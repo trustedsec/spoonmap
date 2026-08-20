@@ -4318,8 +4318,14 @@ def _combine_live_hosts(disc, output_path):
     not IPs, so reading the directory unfiltered put hostnames into a file
     documented as a list of live IPs and listed every resolved host twice.
 
-    Each per-port file holds newline-terminated IPs; the union is written back
-    out as-is (lines keep their trailing newline), deduplicated across ports.
+    Each per-port file holds one IP per line; lines are stripped before being
+    added to the set and blanks are dropped, then the union is written back out
+    newline-terminated and in IP order.  Deduplicating the *raw* lines instead
+    meant '10.0.0.1' and '10.0.0.1\\n' were different set members, so a file whose
+    last line had no trailing newline — every internal writer newline-terminates
+    via _atomic_write(), but an operator-supplied or externally generated port
+    file need not — listed that IP twice in a file documented as a deduplicated
+    list.  Sorting also makes the output stable rather than set-iteration order.
     """
     all_ips = set()
     live_dir = f'{disc}/live_hosts'
@@ -4336,12 +4342,15 @@ def _combine_live_hosts(disc, output_path):
         try:
             with open(host_path) as input_file:
                 for line in input_file:
-                    all_ips.add(line)
+                    line = line.strip()
+                    if line:
+                        all_ips.add(line)
         except OSError as exc:
             # A directory or an unreadable file in here must not cost us the
             # IPs from every other port's file.
             print(_COLOR_ERROR + f'Warning: could not read {host_path}: {exc}' + _COLOR_RESET)
-    _write_artifact(f'{output_path}/all_live_hosts.txt', ''.join(all_ips))
+    _write_artifact(f'{output_path}/all_live_hosts.txt',
+                    ''.join(f'{ip}\n' for ip in sorted(all_ips, key=_ip_sort_key)))
 
 
 def _write_combined_results(output_path, hosts_json, xml_hosts):

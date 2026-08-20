@@ -7535,6 +7535,34 @@ class TestCombineLiveHosts:
         _combine_live_hosts(disc, str(tmp_path))
         assert (tmp_path / 'all_live_hosts.txt').read_text() == ''
 
+    def test_missing_trailing_newline_does_not_duplicate_an_ip(self, tmp_path):
+        """Dedup used to run on raw lines, so '10.0.0.2' and '10.0.0.2\\n' were
+        different set members and an unterminated last line listed that IP twice
+        in a file documented as deduplicated.  Internal writers always terminate
+        via _atomic_write(), so it takes an externally authored port file."""
+        disc = self._make_live_hosts(tmp_path, {
+            'port80.txt': '10.0.0.1\n10.0.0.2',    # no trailing newline
+            'port443.txt': '10.0.0.2\n',
+        })
+        _combine_live_hosts(disc, str(tmp_path))
+        written = (tmp_path / 'all_live_hosts.txt').read_text()
+        assert written.split() == ['10.0.0.1', '10.0.0.2']
+        assert written.count('10.0.0.2') == 1
+
+    def test_blank_lines_are_dropped(self, tmp_path):
+        disc = self._make_live_hosts(tmp_path, {'port80.txt': '10.0.0.1\n\n   \n'})
+        _combine_live_hosts(disc, str(tmp_path))
+        assert (tmp_path / 'all_live_hosts.txt').read_text() == '10.0.0.1\n'
+
+    def test_output_is_newline_terminated_and_ip_sorted(self, tmp_path):
+        disc = self._make_live_hosts(tmp_path, {
+            'port80.txt': '10.0.0.10\n10.0.0.2\n',
+        })
+        _combine_live_hosts(disc, str(tmp_path))
+        # Numeric IP order, not lexical, and a trailing newline like every other
+        # host list this tool writes.
+        assert (tmp_path / 'all_live_hosts.txt').read_text() == '10.0.0.2\n10.0.0.10\n'
+
     def test_hostname_files_are_excluded(self, tmp_path):
         # create_hostname_target_file() writes port{N}_hostnames.txt into the
         # same directory; those hold hostnames, not IPs, so all_live_hosts.txt
