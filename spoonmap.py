@@ -1576,13 +1576,28 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                 _combined_ips.update(line.strip() for line in fh if line.strip())
         if _combined_ips:
             combined_path = os.path.join(disc, 'live_hosts_combined.txt')
-            with open(combined_path, 'w') as fh:
-                for ip in sorted(_combined_ips, key=_ip_sort_key):
-                    fh.write(ip + '\n')
-            batch_target = combined_path
-            print(_COLOR_INFO
-                  + f'Combined target: {len(_combined_ips)} host(s) for remaining port batches.'
-                  + _COLOR_RESET)
+            # _atomic_write, not a plain open(): this file is the masscan -iL
+            # target for every remaining batch.  An ENOSPC part-way through a
+            # direct write raised OSError out of mass_scan() and out of main(),
+            # losing the whole run's aggregation, and a truncation that did not
+            # raise silently narrowed the batch target set — under-scanning with
+            # no error.  A failure now leaves the batches pointed at the full
+            # target file: slower, never quieter.
+            try:
+                _atomic_write(combined_path,
+                              ''.join(ip + '\n' for ip in
+                                      sorted(_combined_ips, key=_ip_sort_key)))
+            except OSError as e:
+                print(_COLOR_ERROR
+                      + f'Warning: could not write combined target list ({e}); '
+                        'falling back to the full target file for remaining batches.'
+                      + _COLOR_RESET)
+                batch_target = target_file
+            else:
+                batch_target = combined_path
+                print(_COLOR_INFO
+                      + f'Combined target: {len(_combined_ips)} host(s) for remaining port batches.'
+                      + _COLOR_RESET)
         else:
             batch_target = target_file
     else:

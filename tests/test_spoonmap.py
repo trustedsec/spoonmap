@@ -4177,6 +4177,36 @@ class TestMassScanProbe:
         assert '10.0.0.1' in combined
         assert '10.0.0.9' in combined  # only in discovery_file, not probe results
 
+    def test_unwritable_combined_target_falls_back_to_full_target_file(self, tmp_path, capsys):
+        """The combined list is the masscan -iL target for every remaining
+        batch, so a failed write (ENOSPC) must not raise out of mass_scan() and
+        lose the whole run's aggregation — the batches fall back to the full
+        target file, which over-scans rather than silently under-scanning."""
+        spoonmap.output_path = str(tmp_path)
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0 — hit
+            {},                       # main batch ['3306']
+        ]
+        real_atomic_write = spoonmap._atomic_write
+
+        def fail_only_combined(path, content):
+            # The per-port live_hosts writes must still land; only the combined
+            # target list is out of disk space.
+            if path.endswith('live_hosts_combined.txt'):
+                raise OSError('No space left on device')
+            return real_atomic_write(path, content)
+
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)) as mock_b, \
+             patch('spoonmap._atomic_write', side_effect=fail_only_combined):
+            result = mass_scan('All', ['443', '3306'], '53', '10000',
+                               '/fake/targets.txt', '', batch_size=1)
+
+        assert 'Hosts Found on Port 443' in result
+        # target_file positional arg of the remaining-port batch call
+        assert mock_b.call_args_list[1][0][3] == '/fake/targets.txt'
+        assert 'could not write combined target list' in capsys.readouterr().out
+
     # ── scan-type-aware probe port selection ─────────────────────────────────
 
     def test_external_scan_uses_web_probe_ports_only(self, tmp_path):
