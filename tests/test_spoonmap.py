@@ -380,6 +380,62 @@ class TestBuildDiscoveryTargetFile:
         result_file, count = _build_discovery_target_file(str(target), str(excl), str(tmp_path))
         assert count == 512  # both target ranges fully preserved
 
+    # ── IPv6 rejection (SpooNMAP is IPv4-only) ───────────────────────────────
+
+    def test_ipv6_cidr_in_target_file_named_and_skipped(self, tmp_path, capsys):
+        """ipaddress.ip_network() parses IPv6 happily, so the bad line used to be
+        stored silently and only surfaced later as an AddressValueError."""
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.0/24\n2001:db8::/32\n')
+        result_file, count = _build_discovery_target_file(str(target), None, str(tmp_path))
+        assert count == 256  # IPv6 range contributed nothing
+        out = capsys.readouterr().out
+        assert 'line 2' in out
+        assert '2001:db8::/32' in out
+        assert 'IPv4 only' in out
+
+    def test_ipv6_bare_address_in_target_file_named_and_skipped(self, tmp_path, capsys):
+        target = tmp_path / 'targets.txt'
+        target.write_text('fe80::1\n10.0.0.1\n')
+        result_file, count = _build_discovery_target_file(str(target), None, str(tmp_path))
+        assert count == 1
+        out = capsys.readouterr().out
+        assert 'line 1' in out
+        assert 'fe80::1' in out
+
+    def test_ipv6_target_via_exclusions_path_does_not_raise(self, tmp_path):
+        """The exclusions path is the one that reaches summarize_address_range()
+        and used to raise AddressValueError for a bound >= 2**32."""
+        target = tmp_path / 'targets.txt'
+        target.write_text('2001:db8::/64\n10.0.0.0/24\n')
+        excl = tmp_path / 'excl.txt'
+        excl.write_text('10.0.0.0/25\n')
+        result_file, count = _build_discovery_target_file(str(target), str(excl), str(tmp_path))
+        assert count == 128
+        content = Path(result_file).read_text()
+        assert '10.0.0.128/25' in content
+        assert ':' not in content  # no IPv6 leaked into the masscan target file
+
+    def test_ipv6_in_exclusions_file_named_and_skipped(self, tmp_path, capsys):
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.0/24\n')
+        excl = tmp_path / 'excl.txt'
+        excl.write_text('# comment\n2001:db8::/32\n10.0.0.0/25\n')
+        result_file, count = _build_discovery_target_file(str(target), str(excl), str(tmp_path))
+        assert count == 128
+        out = capsys.readouterr().out
+        assert str(excl) in out
+        assert 'line 2' in out
+
+    def test_ipv6_only_target_file_returns_zero_count(self, tmp_path, capsys):
+        target = tmp_path / 'targets.txt'
+        target.write_text('2001:db8::/32\n')
+        result_file, count = _build_discovery_target_file(str(target), None, str(tmp_path))
+        assert result_file == str(target)
+        assert count == 0
+        assert 'IPv4 only' in capsys.readouterr().out
+
+
 # ── _ip_sort_key ──────────────────────────────────────────────────────────────
 
 class TestIpSortKey:

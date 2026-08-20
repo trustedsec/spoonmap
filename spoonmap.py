@@ -167,11 +167,19 @@ def _build_discovery_target_file(target_file, exclusions_file, disc):
           - Inline comments:    10.0.0.0/8 # note
           - Range notation:     10.0.0.1-10.0.0.254
           - Netmask notation:   10.0.0.0 255.255.0.0
+
+        SpooNMAP is IPv4-only, so an IPv6 entry is reported by file and line
+        number and skipped here.  ipaddress.ip_network() happily parses IPv6, so
+        without this check the bounds were stored and only blew up several
+        hundred lines later, in the summarize_address_range() call below, as an
+        AddressValueError for a value >= 2**32 — and only when an exclusions
+        file happened to be configured, since the no-exclusions path returns
+        early.  Naming the offending line beats that traceback.
         """
         ranges = []
         try:
             with open(filepath) as fh:
-                for line in fh:
+                for lineno, line in enumerate(fh, 1):
                     # Strip inline comments before parsing
                     line = line.split('#')[0].strip()
                     if not line:
@@ -179,11 +187,19 @@ def _build_discovery_target_file(target_file, exclusions_file, disc):
                     # Standard CIDR or bare IP
                     try:
                         net = ipaddress.ip_network(line, strict=False)
+                    except ValueError:
+                        net = None
+                    if net is not None:
+                        if net.version != 4:
+                            print(_COLOR_ERROR
+                                  + f'Warning: {filepath} line {lineno}: '
+                                  + f'ignoring non-IPv4 target "{line}" '
+                                  + '— SpooNMAP scans IPv4 only.'
+                                  + _COLOR_RESET)
+                            continue
                         ranges.append((int(net.network_address),
                                        int(net.broadcast_address)))
                         continue
-                    except ValueError:
-                        pass
                     # Range notation: A.B.C.D-E.F.G.H
                     if '-' in line:
                         parts = line.split('-', 1)
