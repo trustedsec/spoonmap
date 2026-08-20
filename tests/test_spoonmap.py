@@ -1434,6 +1434,89 @@ class TestGenerateFindings:
         content = (nmap_dir / 'findings.txt').read_text()
         assert 'public' in content
 
+    # ── malformed <host> / <script> elements ──────────────────────────────────
+
+    def test_host_without_address_child_skipped(self, nmap_dir):
+        # A truncated result file can hold a <host> with no <address> at all.
+        # It must be skipped, not abort the walk over every other host.
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><ports><port protocol="tcp" portid="21">'
+            '<state state="open"/>'
+            '<script id="ftp-anon" output="Anonymous FTP login allowed"/>'
+            '</port></ports></host>'
+            '<host><address addr="10.0.0.11" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="21"><state state="open"/>'
+            '<script id="ftp-anon" output="Anonymous FTP login allowed"/>'
+            '</port></ports></host>'
+            '</nmaprun>'
+        )
+        (nmap_dir / 'nse_results' / 'port21.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        ftp = [r for r in records if r['title'] == 'Anonymous FTP']
+        assert [r['host'] for r in ftp] == ['10.0.0.11']
+
+    def test_host_address_without_addr_attribute_skipped(self, nmap_dir):
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="21"><state state="open"/>'
+            '<script id="ftp-anon" output="Anonymous FTP login allowed"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nmap_dir / 'nse_results' / 'port21.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        assert not [r for r in records if r['title'] == 'Anonymous FTP']
+
+    def test_non_ipv4_address_still_used(self, nmap_dir):
+        # No addrtype="ipv4" child, but a usable <address> — falls back to it.
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="fe80::1" addrtype="ipv6"/>'
+            '<ports><port protocol="tcp" portid="21"><state state="open"/>'
+            '<script id="ftp-anon" output="Anonymous FTP login allowed"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nmap_dir / 'nse_results' / 'port21.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        ftp = [r for r in records if r['title'] == 'Anonymous FTP']
+        assert ftp and ftp[0]['host'] == 'fe80::1'
+
+    def test_script_without_id_skipped_other_scripts_kept(self, nmap_dir):
+        # scripts_for_elem() is a closure, so exercise it via generate_findings().
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.12" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="21"><state state="open"/>'
+            '<script output="truncated, no id attribute"/>'
+            '<script id="ftp-anon" output="Anonymous FTP login allowed"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nmap_dir / 'nse_results' / 'port21.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        ftp = [r for r in records if r['title'] == 'Anonymous FTP']
+        assert ftp and ftp[0]['host'] == '10.0.0.12'
+
+    def test_hostscript_without_id_skipped_other_scripts_kept(self, nmap_dir):
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.13" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="445"><state state="open"/>'
+            '</port></ports>'
+            '<hostscript>'
+            '<script output="truncated, no id attribute"/>'
+            '<script id="smb2-security-mode" '
+            'output="Message signing enabled but not required"/>'
+            '</hostscript></host></nmaprun>'
+        )
+        (nmap_dir / 'nse_results' / 'port445.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        assert 'Signing Not Required' in (nmap_dir / 'findings.txt').read_text()
+
 
 class TestCountUnmatchedServicePorts:
     """Unit tests for _count_unmatched_service_ports()."""
@@ -1576,6 +1659,32 @@ class TestGenerateFindingsHoneypot:
         assert len(hp) == 1
         assert '20/20' in hp[0]['detail']
         assert 'no known service signature' in hp[0]['detail']
+
+    def test_truncated_tarpit_line_skipped_good_line_kept(self, nmap_dir):
+        # _report_suspected_tarpits() writes line by line, so an interrupt can
+        # leave a partial final line with three parts but empty numerics. That
+        # must not abort findings generation — the good line still counts.
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text(
+            '10.0.0.5,18,20\n10.0.0.6,5,\n10.0.0.7,,20\n')
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert [r['host'] for r in hp] == ['10.0.0.5']
+        assert '18/20' in hp[0]['detail']
+
+    def test_unreadable_tarpit_file_degrades_to_no_data(self, nmap_dir):
+        # os.path.exists() passes but open() raises (e.g. permissions, or the
+        # path is a directory) — findings must still be written.
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').mkdir(parents=True)
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        assert not [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+
+    def test_absent_tarpit_file_no_crash(self, nmap_dir):
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        assert not [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
 
 
 # ── _previous_results_exist / _delete_previous_results ───────────────────────
@@ -3191,6 +3300,30 @@ class TestHostElemToDict:
         result = _host_elem_to_dict(elem)
         assert result['ports'] == []
         assert result['hostscripts'] == {}
+
+    def test_port_script_without_id_skipped_not_fatal(self):
+        # A <script> with no id= (truncated NSE output) must not raise KeyError;
+        # this feeds the whole-run aggregation, so a raise loses all output.
+        xml = (
+            '<host><address addr="10.0.0.9" addrtype="ipv4"/><ports>'
+            '<port protocol="tcp" portid="21"><state state="open"/>'
+            '<script output="no id attribute"/>'
+            '<script id="ftp-anon" output="Anonymous FTP login allowed"/>'
+            '</port></ports></host>'
+        )
+        result = _host_elem_to_dict(etree.fromstring(xml))
+        assert result['ports'][0]['scripts'] == {'ftp-anon': 'Anonymous FTP login allowed'}
+
+    def test_hostscript_without_id_skipped_not_fatal(self):
+        xml = (
+            '<host><address addr="10.0.0.10" addrtype="ipv4"/>'
+            '<hostscript>'
+            '<script output="no id attribute"/>'
+            '<script id="smb2-security-mode" output="signing not required"/>'
+            '</hostscript></host>'
+        )
+        result = _host_elem_to_dict(etree.fromstring(xml))
+        assert result['hostscripts'] == {'smb2-security-mode': 'signing not required'}
 
 
 # ── TestMassScanProbe ─────────────────────────────────────────────────────────
