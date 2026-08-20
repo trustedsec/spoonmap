@@ -391,6 +391,24 @@ def _safe_mtime(path):
         return 0
 
 
+def _safe_size(path):
+    """Return *path*'s size in bytes, or 0 if it is not a readable regular file.
+
+    The _safe_mtime() companion for size checks: the resume gates and
+    _parse_result_xml() both test existence and then stat, and a file removed in
+    between (a parallel --cleanup, an operator tidying up mid-run) must read as
+    unusable (0) rather than raising FileNotFoundError out of a scan. A
+    directory reads as 0 too, which keeps the isfile() checks these callers used
+    to make.
+    """
+    try:
+        if not os.path.isfile(path):
+            return 0
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
 def _resume_cache_usable(output_file, baseline_mtime, description, is_xml=True):
     """True when cached *output_file* may satisfy a resume gate.
 
@@ -413,7 +431,7 @@ def _resume_cache_usable(output_file, baseline_mtime, description, is_xml=True):
     if is_xml:
         usable = _parse_result_xml(output_file) is not None
     else:
-        usable = os.path.isfile(output_file) and os.path.getsize(output_file) > 0
+        usable = _safe_size(output_file) > 0
     if not usable:
         print(_COLOR_INFO + f're-running {description}: cached result was empty '
                             'or unreadable' + _COLOR_RESET)
@@ -2033,14 +2051,18 @@ def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
         return
 
     try:
-        host_files = os.listdir(live_hosts_dir)
+        # Only portNN.txt files are per-port host lists; portNN_hostnames.txt is
+        # a derived input file and anything else is not ours.  The "nothing to
+        # scan" message below has to be decided from *this* list, not the raw
+        # listdir: a live_hosts/ holding only _hostnames.txt files (or unrelated
+        # files) is "no open ports found", not "already scanned".
+        port_files = [f for f in os.listdir(live_hosts_dir)
+                      if f.startswith('port') and f.endswith('.txt')
+                      and not f.endswith('_hostnames.txt')]
 
         # Filter out files that have already been scanned (both passes must be done)
         files_to_scan = []
-        for host_file in host_files:
-            if not (host_file.startswith('port') and host_file.endswith('.txt')
-                    and not host_file.endswith('_hostnames.txt')):
-                continue
+        for host_file in port_files:
             dest_port = _fname_port((host_file.split('.')[0])[4:])
             # An nmap killed part-way through leaves a zero-length or truncated
             # portN.xml; require parseable content in both passes so that port is
@@ -2057,7 +2079,7 @@ def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
                 files_to_scan.append(host_file)
 
         if not files_to_scan:
-            if not host_files:
+            if not port_files:
                 print(_COLOR_INFO + 'No open ports found in port discovery — skipping banner scan.' + _COLOR_RESET)
             else:
                 print(_COLOR_INFO + 'All ports have already been scanned.' + _COLOR_RESET)
@@ -4199,7 +4221,7 @@ def _parse_result_xml(path):
     Callers aggregating a whole results directory must skip both instead of
     aborting.
     """
-    if not path.endswith('.xml') or not os.path.isfile(path) or os.path.getsize(path) == 0:
+    if not path.endswith('.xml') or _safe_size(path) == 0:
         return None
     try:
         return etree.parse(path)

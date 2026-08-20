@@ -85,6 +85,7 @@ from spoonmap import (
     _run_masscan_batch,
     _resume_cache_usable,
     _safe_mtime,
+    _safe_size,
     _scan_extra_sql_ports,
     _validate_snmp_any_community,
     _SMB_COUPLED_PORTS,
@@ -2892,6 +2893,30 @@ class TestSafeMtime:
         # Also covers the TOCTOU case: a file removed between exists() and
         # getmtime() must read as stale instead of raising FileNotFoundError.
         assert _safe_mtime(str(tmp_path / 'gone.txt')) == 0
+
+
+class TestSafeSize:
+    def test_returns_size_of_existing_file(self, tmp_path):
+        p = tmp_path / 'f.txt'
+        p.write_text('abcd')
+        assert _safe_size(str(p)) == 4
+
+    def test_missing_file_reads_as_zero(self, tmp_path):
+        assert _safe_size(str(tmp_path / 'gone.txt')) == 0
+
+    def test_directory_reads_as_zero(self, tmp_path):
+        # Directories have a non-zero st_size, so the isfile() guard the callers
+        # used to make inline has to live in here.
+        assert _safe_size(str(tmp_path)) == 0
+
+    def test_stat_failure_reads_as_zero(self, tmp_path):
+        # The exists()-then-stat race _safe_mtime() closes for mtimes: a file
+        # removed (or a mount yanked) between the two calls must read as
+        # unusable rather than raising out of a scan.
+        p = tmp_path / 'f.txt'
+        p.write_text('abcd')
+        with patch('spoonmap.os.path.getsize', side_effect=OSError('gone')):
+            assert _safe_size(str(p)) == 0
 
 
 class TestResumeCacheUsable:
@@ -6241,6 +6266,24 @@ class TestNmapScan:
 
         assert not mock_worker.called
         assert 'already been scanned' in capsys.readouterr().out
+
+    def test_only_hostname_files_reports_no_open_ports(self, tmp_path, capsys):
+        """A live_hosts/ holding nothing but derived _hostnames.txt files means
+        discovery found no open ports. The message was chosen from the raw
+        listdir while the scan list was filtered, so it claimed everything had
+        already been scanned."""
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts')
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80_hostnames.txt').write_text(
+            'host1.internal\n')
+
+        with patch('spoonmap.nmap_worker') as mock_worker:
+            nmap_scan('88', max_threads=2)
+
+        assert not mock_worker.called
+        out = capsys.readouterr().out
+        assert 'No open ports found' in out
+        assert 'already been scanned' not in out
 
     def _setup_banner_cache(self, tmp_path, xml_text):
         spoonmap.output_path = str(tmp_path)
