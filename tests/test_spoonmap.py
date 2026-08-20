@@ -4348,6 +4348,154 @@ class TestMassScanProbe:
         written = (live_hosts / 'port443.txt').read_text().split()
         assert sorted(written) == ['10.0.0.1', '10.0.0.4']
 
+    # ── cached hosts folded into the combined batch target ───────────────────
+
+    def _write_scope(self, tmp_path, body='10.0.0.0/24\n'):
+        """Write a real target file so target_file defines a parseable scope."""
+        target_file = tmp_path / 'targets.txt'
+        target_file.write_text(body)
+        return str(target_file)
+
+    def test_cached_hosts_are_scanned_by_the_remaining_batches(self, tmp_path):
+        """host_discovery=False resume: with no discovery_file, the combined
+        target used to be this run's probe hits alone, so a cached host was
+        retained in live_hosts/portN.txt (and all_live_hosts.txt) while never
+        being scanned for any remaining port — output claiming coverage the scan
+        never performed."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.0.0.2\n10.0.0.3\n')
+        target_file = self._write_scope(tmp_path)
+
+        responses = [
+            {'443': {'10.0.0.2'}},   # probe_fast_0 — only one of the three
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)) as mock_b:
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      target_file, '', batch_size=1, resume=True)
+
+        combined_path = tmp_path / 'discovery' / 'live_hosts_combined.txt'
+        assert sorted(combined_path.read_text().split()) == [
+            '10.0.0.1', '10.0.0.2', '10.0.0.3']
+        # The remaining-port batch must actually be pointed at that list.
+        assert mock_b.call_args_list[1][0][3] == str(combined_path)
+
+    def test_cached_hosts_outside_current_scope_are_not_scanned(self, tmp_path):
+        """Nothing prunes live_hosts/ when ranges.txt narrows, so a cached file
+        can hold hosts from a previous, wider engagement. Those must never reach
+        masscan as targets — scanning out of scope is worse than under-scanning."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        # Both are leftovers from a previous, wider scope: one sorting above
+        # every current range and one below, which are separate paths through
+        # the bisect in _ip_in_ranges().
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.99.0.7\n9.1.1.1\n')
+        target_file = self._write_scope(tmp_path, '10.0.0.0/24\n')
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      target_file, '', batch_size=1, resume=True)
+
+        combined = (tmp_path / 'discovery' / 'live_hosts_combined.txt').read_text()
+        assert combined.split() == ['10.0.0.1']
+        assert '10.99.0.7' not in combined
+        assert '9.1.1.1' not in combined
+        # They keep their place in the retained host list — this gates scanning,
+        # not keeping.
+        retained = (live_hosts / 'port443.txt').read_text()
+        assert '10.99.0.7' in retained
+        assert '9.1.1.1' in retained
+
+    def test_non_ipv4_cached_entry_is_not_folded_and_does_not_raise(self, tmp_path):
+        """A hostname or IPv6 literal that leaked into a resume file must read as
+        out of scope rather than crash the scope check."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\nfe80::1\nweb1.corp.local\n')
+        target_file = self._write_scope(tmp_path)
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      target_file, '', batch_size=1, resume=True)
+
+        combined = (tmp_path / 'discovery' / 'live_hosts_combined.txt').read_text()
+        assert '10.0.0.1' in combined
+        assert 'fe80::1' not in combined
+        assert 'web1.corp.local' not in combined
+
+    def test_fold_reports_how_many_cached_hosts_were_added(self, tmp_path, capsys):
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.0.0.2\n10.0.0.3\n')
+        target_file = self._write_scope(tmp_path)
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0 — 2 cached hosts are new
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      target_file, '', batch_size=1, resume=True)
+
+        assert 'added 2 cached host(s)' in capsys.readouterr().out
+
+    def test_no_cached_hosts_means_no_fold_message(self, tmp_path, capsys):
+        """Nothing cached beyond the probe's own hits — the combined target is
+        unchanged and the fold stays quiet."""
+        spoonmap.output_path = str(tmp_path)
+        target_file = self._write_scope(tmp_path)
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      target_file, '', batch_size=1)
+
+        out = capsys.readouterr().out
+        assert 'cached host(s)' not in out
+        combined = (tmp_path / 'discovery' / 'live_hosts_combined.txt').read_text()
+        assert combined.split() == ['10.0.0.1']
+
+    def test_unparseable_target_file_folds_nothing(self, tmp_path):
+        """No parseable scope means no way to prove a cached host is in scope, so
+        nothing is folded — the pre-existing behaviour, and the safe direction."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.0.0.9\n')
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      '/fake/targets.txt', '', batch_size=1, resume=True)
+
+        combined = (tmp_path / 'discovery' / 'live_hosts_combined.txt').read_text()
+        assert combined.split() == ['10.0.0.1']
+
     # ── batch_size > 1 (legacy two-call probe) ───────────────────────────────
 
     def test_batch5_uses_legacy_two_call_probe(self, tmp_path):

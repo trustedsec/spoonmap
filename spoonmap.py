@@ -3,6 +3,7 @@
 # Author: Spoonman (Larry.Spohn@TrustedSec.com)
 # QA and Personal Pythonian Consultant: Bandrel (Justin.Bollinger@TrustedSec.com)
 
+import bisect
 import collections
 import contextlib
 import datetime
@@ -162,6 +163,110 @@ def _ip_sort_key(value):
         return (1, 0, str(value))
 
 
+def _parse_target_ranges(filepath):
+    """Parse IPs/CIDRs/ranges from a masscan-style target or exclude file.
+
+    Returns a list of inclusive ``(start_int, end_int)`` IPv4 bounds.
+
+    Handles three formats masscan accepts but ipaddress rejects:
+      - Inline comments:    10.0.0.0/8 # note
+      - Range notation:     10.0.0.1-10.0.0.254
+      - Netmask notation:   10.0.0.0 255.255.0.0
+
+    SpooNMAP is IPv4-only, so an IPv6 entry is reported by file and line
+    number and skipped here.  ipaddress.ip_network() happily parses IPv6, so
+    without this check the bounds were stored and only blew up several hundred
+    lines later, in _build_discovery_target_file()'s summarize_address_range()
+    call, as an AddressValueError for a value >= 2**32 — and only when an
+    exclusions file happened to be configured, since the no-exclusions path
+    returns early.  Naming the offending line beats that traceback.
+
+    Module level rather than nested inside _build_discovery_target_file()
+    because mass_scan() needs the same parse to decide whether a cached
+    live_hosts entry is still inside the operator's current scope.  One parser
+    for "what does this target file actually cover", not two.
+    """
+    ranges = []
+    try:
+        with open(filepath) as fh:
+            for lineno, line in enumerate(fh, 1):
+                # Strip inline comments before parsing
+                line = line.split('#')[0].strip()
+                if not line:
+                    continue
+                # Standard CIDR or bare IP
+                try:
+                    net = ipaddress.ip_network(line, strict=False)
+                except ValueError:
+                    net = None
+                if net is not None:
+                    if net.version != 4:
+                        print(_COLOR_ERROR
+                              + f'Warning: {filepath} line {lineno}: '
+                              + f'ignoring non-IPv4 target "{line}" '
+                              + '— SpooNMAP scans IPv4 only.'
+                              + _COLOR_RESET)
+                        continue
+                    ranges.append((int(net.network_address),
+                                   int(net.broadcast_address)))
+                    continue
+                # Range notation: A.B.C.D-E.F.G.H
+                if '-' in line:
+                    parts = line.split('-', 1)
+                    try:
+                        start = int(ipaddress.IPv4Address(parts[0].strip()))
+                        end   = int(ipaddress.IPv4Address(parts[1].strip()))
+                        if start <= end:
+                            ranges.append((start, end))
+                        continue
+                    except ValueError:
+                        pass
+                # Netmask notation: A.B.C.D M.M.M.M
+                parts = line.split()
+                if len(parts) == 2:
+                    try:
+                        net = ipaddress.ip_network(f'{parts[0]}/{parts[1]}', strict=False)
+                        ranges.append((int(net.network_address),
+                                       int(net.broadcast_address)))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return ranges
+
+
+def _merge_ranges(ranges):
+    """Coalesce overlapping/adjacent ``(start, end)`` bounds, sorted by start."""
+    out = []
+    for s, e in sorted(ranges):
+        if out and s <= out[-1][1] + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], e))
+        else:
+            out.append((s, e))
+    return out
+
+
+def _ip_in_ranges(value, merged_ranges):
+    """Return True if IPv4 string *value* falls inside *merged_ranges*.
+
+    *merged_ranges* must come from _merge_ranges(): disjoint and sorted, so a
+    bisect finds the only range that could contain the address.  Never raises —
+    anything that is not a plain IPv4 address (an unresolved hostname, an IPv6
+    literal, a truncated line read back from a resume file) reads as out of
+    range, so it is excluded rather than crashing the caller.  This gates what
+    gets *scanned*, so failing closed is the only safe direction.
+    """
+    try:
+        addr = int(ipaddress.IPv4Address(value))
+    except ValueError:
+        return False
+    idx = bisect.bisect_right(merged_ranges, (addr, float('inf'))) - 1
+    if idx < 0:
+        return False
+    start, end = merged_ranges[idx]
+    return start <= addr <= end
+
+
 def _build_discovery_target_file(target_file, exclusions_file, disc):
     """Pre-subtract exclusions from target ranges and write a masscan-ready file.
 
@@ -174,79 +279,6 @@ def _build_discovery_target_file(target_file, exclusions_file, disc):
     Returns (filtered_file_path, accurate_host_count).  If no exclusions apply,
     returns (target_file, raw_count) unchanged so callers omit --excludefile.
     """
-    def _parse_ranges(filepath):
-        """Parse IPs/CIDRs/ranges from a masscan-style target or exclude file.
-
-        Handles three formats masscan accepts but ipaddress rejects:
-          - Inline comments:    10.0.0.0/8 # note
-          - Range notation:     10.0.0.1-10.0.0.254
-          - Netmask notation:   10.0.0.0 255.255.0.0
-
-        SpooNMAP is IPv4-only, so an IPv6 entry is reported by file and line
-        number and skipped here.  ipaddress.ip_network() happily parses IPv6, so
-        without this check the bounds were stored and only blew up several
-        hundred lines later, in the summarize_address_range() call below, as an
-        AddressValueError for a value >= 2**32 — and only when an exclusions
-        file happened to be configured, since the no-exclusions path returns
-        early.  Naming the offending line beats that traceback.
-        """
-        ranges = []
-        try:
-            with open(filepath) as fh:
-                for lineno, line in enumerate(fh, 1):
-                    # Strip inline comments before parsing
-                    line = line.split('#')[0].strip()
-                    if not line:
-                        continue
-                    # Standard CIDR or bare IP
-                    try:
-                        net = ipaddress.ip_network(line, strict=False)
-                    except ValueError:
-                        net = None
-                    if net is not None:
-                        if net.version != 4:
-                            print(_COLOR_ERROR
-                                  + f'Warning: {filepath} line {lineno}: '
-                                  + f'ignoring non-IPv4 target "{line}" '
-                                  + '— SpooNMAP scans IPv4 only.'
-                                  + _COLOR_RESET)
-                            continue
-                        ranges.append((int(net.network_address),
-                                       int(net.broadcast_address)))
-                        continue
-                    # Range notation: A.B.C.D-E.F.G.H
-                    if '-' in line:
-                        parts = line.split('-', 1)
-                        try:
-                            start = int(ipaddress.IPv4Address(parts[0].strip()))
-                            end   = int(ipaddress.IPv4Address(parts[1].strip()))
-                            if start <= end:
-                                ranges.append((start, end))
-                            continue
-                        except ValueError:
-                            pass
-                    # Netmask notation: A.B.C.D M.M.M.M
-                    parts = line.split()
-                    if len(parts) == 2:
-                        try:
-                            net = ipaddress.ip_network(f'{parts[0]}/{parts[1]}', strict=False)
-                            ranges.append((int(net.network_address),
-                                           int(net.broadcast_address)))
-                        except ValueError:
-                            pass
-        except OSError:
-            pass
-        return ranges
-
-    def _merge(ranges):
-        out = []
-        for s, e in sorted(ranges):
-            if out and s <= out[-1][1] + 1:
-                out[-1] = (out[-1][0], max(out[-1][1], e))
-            else:
-                out.append((s, e))
-        return out
-
     def _subtract(targets, excls):
         result = []
         ei = 0
@@ -267,7 +299,7 @@ def _build_discovery_target_file(target_file, exclusions_file, disc):
                 result.append((cur, te))
         return result
 
-    target_ranges = _parse_ranges(target_file)
+    target_ranges = _parse_target_ranges(target_file)
     if not target_ranges:
         return target_file, 0
 
@@ -276,11 +308,11 @@ def _build_discovery_target_file(target_file, exclusions_file, disc):
     if not exclusions_file or not os.path.exists(exclusions_file):
         return target_file, raw_count
 
-    excl_ranges = _parse_ranges(exclusions_file)
+    excl_ranges = _parse_target_ranges(exclusions_file)
     if not excl_ranges:
         return target_file, raw_count
 
-    remaining = _subtract(_merge(target_ranges), _merge(excl_ranges))
+    remaining = _subtract(_merge_ranges(target_ranges), _merge_ranges(excl_ranges))
     if not remaining:
         filtered_file = os.path.join(disc, 'discovery_targets_filtered.txt')
         open(filtered_file, 'w').close()
@@ -1627,6 +1659,39 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         if discovery_file and os.path.exists(discovery_file):
             with open(discovery_file) as fh:
                 _combined_ips.update(line.strip() for line in fh if line.strip())
+        # Fold in the cached hosts the probe loop just unioned into port_ips, so
+        # the -iL list the remaining batches scan covers every host we retain.
+        # Without this, retaining a cached host (see the probe write loop above)
+        # while leaving it out of the batch target meant it reached
+        # all_live_hosts.txt having been scanned for the probe ports only — output
+        # asserting coverage the scan never performed.  Reachable whenever this
+        # set is not already the whole live population: with host_discovery=False
+        # there is no discovery_file at all, so _combined_ips would otherwise be
+        # nothing but this run's probe hits.
+        #
+        # Filtered against target_file's ranges, never folded in blind.  Nothing
+        # prunes live_hosts/ when ranges.txt narrows — a --resume run deletes no
+        # prior output, and the mtime gate only forces phases to re-run — so a
+        # cached file can still hold hosts from a previous, wider engagement
+        # scope.  Handing those to masscan would scan outside the operator's
+        # current authorisation, which is far worse than under-scanning, so an
+        # out-of-scope cached host keeps its place in live_hosts/portN.txt but
+        # never becomes a target.  An unparseable target file yields no ranges
+        # and folds nothing, which is the pre-existing behaviour.
+        _scope_ranges = _merge_ranges(_parse_target_ranges(target_file))
+        if _scope_ranges:
+            _cached_in_scope = {
+                ip
+                for port_key in probe_ports_used
+                for ip in port_ips.get(port_key, ())
+                if ip not in _combined_ips and _ip_in_ranges(ip, _scope_ranges)
+            }
+            if _cached_in_scope:
+                _combined_ips.update(_cached_in_scope)
+                print(_COLOR_INFO
+                      + f'Combined target: added {len(_cached_in_scope)} cached '
+                        'host(s) from previous runs (in current scope).'
+                      + _COLOR_RESET)
         if _combined_ips:
             combined_path = os.path.join(disc, 'live_hosts_combined.txt')
             # _atomic_write, not a plain open(): this file is the masscan -iL
