@@ -129,6 +129,25 @@ def _count_hosts_in_file(filepath):
     return count
 
 
+def _ip_sort_key(value):
+    """Total-order sort key for a list of IPv4 address strings that never raises.
+
+    The previous inline key, ``tuple(int(o) for o in x.split('.'))``, raises
+    ValueError for anything that is not four decimal octets — a hostname that
+    survived resolution, an IPv6 literal that leaked out of a parser, a
+    truncated line read back from a resume file.  Those sorts run *after* a
+    completed masscan sweep, so a single odd entry discarded the whole sweep
+    with an opaque traceback.  Sorting must not be able to lose scan results.
+
+    IPv4 addresses keep their existing numeric ordering; anything unparseable
+    sorts after them, ordered lexically among itself, and is still written out.
+    """
+    try:
+        return (0, int(ipaddress.IPv4Address(value)), '')
+    except ValueError:
+        return (1, 0, str(value))
+
+
 def _build_discovery_target_file(target_file, exclusions_file, disc):
     """Pre-subtract exclusions from target ranges and write a masscan-ready file.
 
@@ -148,11 +167,19 @@ def _build_discovery_target_file(target_file, exclusions_file, disc):
           - Inline comments:    10.0.0.0/8 # note
           - Range notation:     10.0.0.1-10.0.0.254
           - Netmask notation:   10.0.0.0 255.255.0.0
+
+        SpooNMAP is IPv4-only, so an IPv6 entry is reported by file and line
+        number and skipped here.  ipaddress.ip_network() happily parses IPv6, so
+        without this check the bounds were stored and only blew up several
+        hundred lines later, in the summarize_address_range() call below, as an
+        AddressValueError for a value >= 2**32 — and only when an exclusions
+        file happened to be configured, since the no-exclusions path returns
+        early.  Naming the offending line beats that traceback.
         """
         ranges = []
         try:
             with open(filepath) as fh:
-                for line in fh:
+                for lineno, line in enumerate(fh, 1):
                     # Strip inline comments before parsing
                     line = line.split('#')[0].strip()
                     if not line:
@@ -160,11 +187,19 @@ def _build_discovery_target_file(target_file, exclusions_file, disc):
                     # Standard CIDR or bare IP
                     try:
                         net = ipaddress.ip_network(line, strict=False)
+                    except ValueError:
+                        net = None
+                    if net is not None:
+                        if net.version != 4:
+                            print(_COLOR_ERROR
+                                  + f'Warning: {filepath} line {lineno}: '
+                                  + f'ignoring non-IPv4 target "{line}" '
+                                  + '— SpooNMAP scans IPv4 only.'
+                                  + _COLOR_RESET)
+                            continue
                         ranges.append((int(net.network_address),
                                        int(net.broadcast_address)))
                         continue
-                    except ValueError:
-                        pass
                     # Range notation: A.B.C.D-E.F.G.H
                     if '-' in line:
                         parts = line.split('-', 1)
@@ -462,15 +497,21 @@ def _get_scripts_for_port(dest_port, target_scan):
 
 
 def _parse_masscan_ping_xml(xml_file):
-    """Return set of IPs from a masscan --ping XML output file."""
+    """Return set of IPv4 addresses from a masscan --ping XML output file.
+
+    Filters on addrtype="ipv4" to match what the nmap parsers already do.  The
+    first <address> child is not necessarily the IPv4 one, and this tool is
+    IPv4-only: an IPv6 or MAC string admitted here flows straight into
+    live_ips/port_ips and on into the address sort keys and masscan -iL files.
+    """
     ips = set()
     if not os.path.exists(xml_file) or os.stat(xml_file).st_size == 0:
         return ips
     try:
         root = etree.parse(xml_file)
         for host in root.findall('host'):
-            addr_elem = host.find('address')
-            if addr_elem is not None:
+            addr_elem = host.find("address[@addrtype='ipv4']")
+            if addr_elem is not None and addr_elem.attrib.get('addr'):
                 ips.add(addr_elem.attrib['addr'])
     except etree.ParseError:
         pass
@@ -478,7 +519,13 @@ def _parse_masscan_ping_xml(xml_file):
 
 
 def _parse_nmap_sn_xml(xml_file):
-    """Return set of IPs from a nmap -sn XML output where status is 'up'."""
+    """Return set of IPv4 addresses from a nmap -sn XML output where status is 'up'.
+
+    Same addrtype="ipv4" filter as _parse_masscan_ping_xml: an -sn sweep of a
+    dual-stacked host can report a MAC or IPv6 <address> first, and this set is
+    unioned with the masscan discovery set before being sorted and written to a
+    target file that only IPv4 tooling reads.
+    """
     ips = set()
     if not os.path.exists(xml_file) or os.stat(xml_file).st_size == 0:
         return ips
@@ -487,8 +534,8 @@ def _parse_nmap_sn_xml(xml_file):
         for host in root.findall('host'):
             status = host.find('status')
             if status is not None and status.attrib.get('state') == 'up':
-                addr_elem = host.find('address')
-                if addr_elem is not None:
+                addr_elem = host.find("address[@addrtype='ipv4']")
+                if addr_elem is not None and addr_elem.attrib.get('addr'):
                     ips.add(addr_elem.attrib['addr'])
     except etree.ParseError:
         pass
@@ -745,7 +792,7 @@ def _host_discovery(target_file, output_path, max_rate, exclusions_file,
         return None
 
     with open(discovery_file, 'w') as fh:
-        for ip in sorted(live_ips, key=lambda x: tuple(int(o) for o in x.split('.'))):
+        for ip in sorted(live_ips, key=_ip_sort_key):
             fh.write(ip + '\n')
 
     return discovery_file
@@ -882,7 +929,16 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
     try:
         root = etree.parse(output_file)
         for host in root.findall('host'):
-            ip_address = host.findall('address')[0].attrib['addr']
+            # Select the IPv4 <address> explicitly rather than trusting the
+            # first child.  findall(...)[0] raised IndexError on an <host> with
+            # no <address> at all (killing the whole batch's results, not just
+            # that host), and on a dual-stacked host it could hand back an IPv6
+            # or MAC string that then propagated into live_hosts/portNN.txt and
+            # became a masscan -iL target this IPv4-only tool cannot scan.
+            addr_elem = host.find("address[@addrtype='ipv4']")
+            if addr_elem is None or not addr_elem.attrib.get('addr'):
+                continue
+            ip_address = addr_elem.attrib['addr']
             ports_elem = host.find('ports')
             if ports_elem is not None:
                 port_elem = ports_elem.find('port')
@@ -1258,7 +1314,7 @@ def _report_suspected_tarpits(suspected, disc):
         return
     tarpit_file = os.path.join(disc, 'suspected_tarpits.txt')
     lines = []
-    for ip in sorted(suspected, key=lambda x: tuple(int(o) for o in x.split('.'))):
+    for ip in sorted(suspected, key=_ip_sort_key):
         open_count, total = suspected[ip]
         lines.append(f'{ip},{open_count},{total}\n')
         print(_COLOR_ERROR
@@ -1457,8 +1513,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         if _combined_ips:
             combined_path = os.path.join(disc, 'live_hosts_combined.txt')
             with open(combined_path, 'w') as fh:
-                for ip in sorted(_combined_ips,
-                                 key=lambda x: tuple(int(o) for o in x.split('.'))):
+                for ip in sorted(_combined_ips, key=_ip_sort_key):
                     fh.write(ip + '\n')
             batch_target = combined_path
             print(_COLOR_INFO
