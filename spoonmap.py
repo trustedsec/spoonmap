@@ -109,9 +109,19 @@ def _count_hosts_in_file(filepath):
     """Return total IP address count for all entries in a target/exclusions file.
 
     Each line may be a bare IP, a CIDR, or a hostname.
-    CIDRs are expanded to their full address count via ipaddress.
+    IPv4 CIDRs are expanded to their full address count via ipaddress.
     Hostnames count as 1. Blank lines and # comments are skipped.
     Returns None if the file cannot be opened.
+
+    Non-IPv4 entries count as 0, matching _parse_ranges(), which rejects them at
+    parse time because SpooNMAP scans IPv4 only.  ipaddress.ip_network() happily
+    parses IPv6, so counting it at face value meant one ``::/0`` line contributed
+    2**128 hosts.  This count drives the discovery port-list trim against
+    INTERNAL_DISCOVERY_STATE_CEILING and _calc_scan_wait(), so a single stray IPv6
+    line in ranges.txt cut an all-IPv4 scan's port list from 10 ports to 5 and
+    skewed the inter-scan wait — no crash and no lost output, but it silently
+    changed what got scanned.  _parse_ranges() already names the offending line,
+    so no second warning is printed here.
     """
     count = 0
     try:
@@ -121,9 +131,12 @@ def _count_hosts_in_file(filepath):
                 if not line or line.startswith('#'):
                     continue
                 try:
-                    count += ipaddress.ip_network(line, strict=False).num_addresses
+                    net = ipaddress.ip_network(line, strict=False)
                 except ValueError:
                     count += 1   # hostname — resolves to one IP
+                else:
+                    if net.version == 4:
+                        count += net.num_addresses
     except OSError:
         return None
     return count

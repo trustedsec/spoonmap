@@ -243,6 +243,21 @@ class TestCountHostsInFile:
     def test_missing_file_returns_none(self, tmp_path):
         assert _count_hosts_in_file(str(tmp_path / 'nonexistent.txt')) is None
 
+    def test_ipv6_entries_count_as_zero(self, tmp_path):
+        """ipaddress parses IPv6 happily, so ``::/0`` used to contribute 2**128.
+        That count drives the INTERNAL_DISCOVERY_STATE_CEILING port-list trim and
+        _calc_scan_wait(), so one stray v6 line silently halved an all-IPv4
+        scan's port list.  SpooNMAP is IPv4-only; _parse_ranges() already skips
+        these, and this must agree."""
+        f = tmp_path / 'targets.txt'
+        f.write_text('10.0.0.1\n::/0\n2001:db8::1\nfe80::/64\n')
+        assert _count_hosts_in_file(str(f)) == 1
+
+    def test_ipv6_only_file_counts_zero_not_a_huge_number(self, tmp_path):
+        f = tmp_path / 'targets.txt'
+        f.write_text('2001:db8::/32\n')
+        assert _count_hosts_in_file(str(f)) == 0
+
 
 class TestBuildDiscoveryTargetFile:
     """_build_discovery_target_file() pre-subtracts exclusions from targets
