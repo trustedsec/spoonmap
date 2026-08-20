@@ -4601,8 +4601,17 @@ _CONFIG_DOCS = {
          'Optional: overrides scan_categories with an explicit port list. '
          'Use U: prefix for UDP (e.g. U:53).'),
     ],
+    'masscan_batch_size': [
+        ('__numeric_fields_note__',
+         'masscan_batch_size, max_rate, nmap_threads and nmap_threshold accept a '
+         'JSON number or a quoted number. A non-numeric or null value falls back to '
+         'the default, and a value below the minimum of 1 is raised to 1; both print '
+         'a warning rather than failing mid-scan.'),
+    ],
     'banner_scan': [
-        ('__banner_scan_choices__', 'True, False'),
+        ('__banner_scan_choices__',
+         'true, false (JSON booleans; legacy quoted "True"/"False" '
+         'still accepted)'),
         ('__banner_scan_udp_warning__',
          'WARNING: When scanning UDP ports (U:* prefixed) with banner_scan=False, '
          'hosts will not undergo NSE confirmation. All open|filtered UDP hosts '
@@ -4610,10 +4619,14 @@ _CONFIG_DOCS = {
          'significantly. Enable banner_scan or script_scan when using UDP ports.'),
     ],
     'script_scan': [
-        ('__script_scan_choices__', 'True, False'),
+        ('__script_scan_choices__',
+         'true, false (JSON booleans; legacy quoted "True"/"False" '
+         'still accepted)'),
     ],
     'host_discovery': [
-        ('__host_discovery_choices__', 'True, False'),
+        ('__host_discovery_choices__',
+         'true, false (JSON booleans; legacy quoted "True"/"False" '
+         'still accepted)'),
         ('__host_discovery_note__',
          'When False, no host discovery sweep runs and every target is port-scanned '
          'directly. No source-port override is used in any phase. Independent of this '
@@ -4624,10 +4637,14 @@ _CONFIG_DOCS = {
          '(~60K concurrent entries max).'),
     ],
     'resume': [
-        ('__resume_choices__', 'True, False'),
+        ('__resume_choices__',
+         'true, false (JSON booleans; legacy quoted "True"/"False" '
+         'still accepted)'),
     ],
     'target_scan': [
-        ('__target_scan_choices__', 'External, Internal'),
+        ('__target_scan_choices__',
+         'External, Internal (case-insensitive; any other value stops the run '
+         'rather than scanning with the Internal-only checks silently skipped)'),
     ],
     'max_rate': [
         ('__max_rate_external_recommendation__',
@@ -4665,9 +4682,16 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
     The result round-trips through main()'s config loader: reloading it
     reproduces the same scan without prompting.  A custom port list is stored
     under ``dest_ports``; an All/Full/category selection under
-    ``scan_categories``.  ``resume`` is written as ``"False"`` so a plain
-    re-run still surfaces the delete/append prompt — resuming is opt-in via the
+    ``scan_categories``.  ``resume`` is written as ``false`` so a plain re-run
+    still surfaces the delete/append prompt — resuming is opt-in via the
     ``--resume`` flag.
+
+    Booleans are written as JSON booleans, matching config.json.sample.  They
+    used to be the quoted ``"True"``/``"False"`` strings the sample once used,
+    which meant a generated config disagreed with the documented spelling and
+    with the ``true, false`` its own ``__*_choices__`` notes advertised.  Both
+    spellings still load (see _config_bool), so this is about the two files
+    telling an operator the same thing.
 
     Keys are emitted in ``_CONFIG_FIELD_ORDER`` with their ``_CONFIG_DOCS``
     entries interleaved, so the written file documents its editable fields the
@@ -4676,10 +4700,10 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
     ``scan_categories`` one.
     """
     values = {
-        'banner_scan': 'True' if banner_scan else 'False',
-        'script_scan': 'True' if script_scan else 'False',
-        'host_discovery': 'True' if host_discovery else 'False',
-        'resume': 'False',
+        'banner_scan': bool(banner_scan),
+        'script_scan': bool(script_scan),
+        'host_discovery': bool(host_discovery),
+        'resume': False,
         'target_scan': target_scan,
         'max_rate': str(max_rate),
         'nmap_threads': int(nmap_threads),
@@ -4846,11 +4870,13 @@ _CONFIG_FALSE_STRINGS = ('false', 'no', 'off', '0', '')
 def _config_bool(key, value, default):
     """Coerce a config.json boolean-ish *value*, accepting both spellings.
 
-    config.json.sample quotes its booleans ("resume": "False") but leaves
-    integers bare, which invites JSON-native true/false.  The old code compared
-    == 'True', so a real JSON `true` evaluated to False: setting
-    "script_scan": true silently got you no script scan and no warning.  Legacy
-    "True"/"False" strings must keep working, so both forms are accepted here.
+    config.json.sample used to quote its booleans ("resume": "False") while
+    leaving integers bare, which invited JSON-native true/false.  The old code
+    compared == 'True', so a real JSON `true` evaluated to False: setting
+    "script_scan": true silently got you no script scan and no warning.  The
+    sample and the generated config now both use JSON booleans, but every
+    hand-edited config.json out there still carries the quoted strings, so both
+    forms are accepted here indefinitely.
     """
     if isinstance(value, bool):
         return value

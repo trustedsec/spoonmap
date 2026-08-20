@@ -2684,15 +2684,35 @@ class TestBuildInteractiveConfig:
         assert 'scan_categories' not in cfg
         assert self._resolve(cfg) == ('Custom', ['80', '443', 'U:53'])
 
-    def test_booleans_and_rate_serialize_as_strings(self):
+    def test_booleans_serialize_as_json_booleans_and_rate_as_a_string(self):
+        """Booleans match config.json.sample's spelling (and what the generated
+        file's own __*_choices__ notes advertise) rather than the quoted strings
+        the sample used to carry; max_rate stays a string because
+        _discover_external_masscan() hands it straight to Popen()."""
         cfg = _build_interactive_config(
             'All', [], 'All', True, False, 'Internal', 2000,
             'r', 'o', None, 5, 5, 5_000_000, False)
-        assert cfg['banner_scan'] == 'True'
-        assert cfg['script_scan'] == 'False'
-        assert cfg['host_discovery'] == 'False'
+        assert cfg['banner_scan'] is True
+        assert cfg['script_scan'] is False
+        assert cfg['host_discovery'] is False
         assert cfg['max_rate'] == '2000'
-        assert cfg['resume'] == 'False'
+        assert cfg['resume'] is False
+
+    def test_generated_booleans_survive_a_json_round_trip(self, tmp_path):
+        """The generated file is read back by main()'s loader, so the booleans
+        must mean the same thing after json.dump/json.load as they did in the
+        dict — this is the pairing that silently broke when the loader compared
+        == 'True' and an operator wrote a JSON-native true."""
+        cfg = _build_interactive_config(
+            'All', [], 'All', True, True, 'Internal', '2000',
+            '/t/r', '/t/o', None, 5, 5, 5_000_000, False)
+        path = tmp_path / 'config.json'
+        assert _write_interactive_config(str(path), cfg) is True
+        reloaded = _load_config(json.loads(path.read_text()), '/t')
+        assert reloaded['banner_scan'] is True
+        assert reloaded['script_scan'] is True
+        assert reloaded['host_discovery'] is False
+        assert reloaded['resume'] is False
 
     def test_exclusions_none_becomes_empty_string(self):
         cfg = _build_interactive_config(
