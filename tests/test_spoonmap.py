@@ -6467,6 +6467,61 @@ class TestNmapWorker:
         assert stderr_touched.is_set()
         assert completed_count[0] == 1
 
+    def test_worker_survives_a_stderr_reader_that_never_finishes(self, tmp_path):
+        """The stderr reader joins are bounded, so an fd held open past the
+        child's exit cannot strand the worker.
+
+        The child is reaped before every join, so the reader has normally already
+        ended — but nmap's own helper processes can inherit the stderr fd, and an
+        inherited write end keeps the read end from ever seeing EOF. An unbounded
+        join() there parks this worker for the rest of the scan while
+        work_queue.join() waits on it. The thread is a daemon and its lines are
+        already collected, so the wait was only ever a courtesy.
+        """
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/nmap_results', exist_ok=True)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts', exist_ok=True)
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n')
+
+        release_reader = threading.Event()
+
+        class _NeverClosedStderr:
+            """Models an inherited write end: iteration blocks, never hits EOF."""
+
+            def __iter__(self):
+                release_reader.wait(30)
+                return iter(())
+
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.wait.return_value = 0
+        proc.poll.return_value = 0
+        proc.stderr = _NeverClosedStderr()
+
+        work_queue = Queue()
+        work_queue.put('port80.txt')
+        work_queue.put(None)
+        completed_count = [0]
+        interrupt_event = threading.Event()
+
+        def _run():
+            with patch('spoonmap._build_nmap_cmd', return_value=['nmap', 'fake']), \
+                 patch('spoonmap._get_scripts_for_port', return_value=''), \
+                 patch('spoonmap._STDERR_JOIN_TIMEOUT', 0.2), \
+                 patch('spoonmap.subprocess.Popen', return_value=proc):
+                nmap_worker(work_queue, completed_count, 1, '88', threading.Lock(),
+                            interrupt_event, None)
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(timeout=5)
+        try:
+            assert not thread.is_alive()
+            assert completed_count[0] == 1
+        finally:
+            # Let the reader thread exit so it does not outlive the test.
+            release_reader.set()
+
 
 def _fake_worker_drain(work_queue, completed_count, total_count, source_port, lock,
                        interrupt_event, ip_to_hostname, script_scan, target_scan, start_time):

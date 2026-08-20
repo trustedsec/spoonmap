@@ -1185,6 +1185,13 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
     return ips
 
 
+# Upper bound on how long a caller waits for a _start_stderr_reader() thread
+# after the child has been reaped.  Normally the join returns instantly; the
+# timeout only matters when a grandchild inherited the stderr fd and is holding
+# the pipe open, which would otherwise hang the worker for the rest of the scan.
+_STDERR_JOIN_TIMEOUT = 5
+
+
 def _start_stderr_reader(stderr_stream):
     """Drain *stderr_stream* on a daemon thread; return ``(thread, lines)``.
 
@@ -1986,13 +1993,22 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 while nmap_process.poll() is None and not interrupt_event.is_set():
                     interrupt_event.wait(0.1)
 
+                # Bounded joins.  The child is always reaped first, so the
+                # reader's loop has already ended and these return immediately
+                # in every normal case — but the fd can outlive the child if a
+                # grandchild inherited it (nmap's own helper processes), which
+                # would hold the pipe open and hang this worker forever.  The
+                # thread is a daemon and its accumulated lines are already usable
+                # either way, so waiting is only ever a courtesy.  Do NOT move
+                # the reader's start below the poll loop to "simplify" this: that
+                # reintroduces the pipe-buffer deadlock of issue #25.
                 if interrupt_event.is_set() and nmap_process.poll() is None:
                     nmap_process.kill()
                     nmap_process.wait()
-                    nmap_err_thread.join()
+                    nmap_err_thread.join(timeout=_STDERR_JOIN_TIMEOUT)
                 else:
                     nmap_process.wait()
-                    nmap_err_thread.join()
+                    nmap_err_thread.join(timeout=_STDERR_JOIN_TIMEOUT)
 
                     if interrupt_event.is_set():
                         # Exited on its own during an interrupt — neither a
@@ -2039,7 +2055,8 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                         if interrupt_event.is_set() and nse_process.poll() is None:
                             nse_process.kill()
                         nse_process.wait()
-                        nse_err_thread.join()
+                        # Bounded for the same reason as the banner pass above.
+                        nse_err_thread.join(timeout=_STDERR_JOIN_TIMEOUT)
                         # A killed process also exits non-zero, so only report
                         # when no interrupt is in flight.
                         if nse_process.returncode != 0 and not interrupt_event.is_set():
