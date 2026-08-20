@@ -70,6 +70,8 @@ from spoonmap import (
     _nmap_udp_discovery,
     _parse_masscan_ping_xml,
     _parse_nmap_sn_xml,
+    _parse_result_xml,
+    _aggregate_result_dir,
     _path_completion,
     _run_masscan_batch,
     _scan_extra_sql_ports,
@@ -5268,6 +5270,92 @@ class TestParseNmapSnXml:
         f = tmp_path / 'sn.xml'
         f.write_text('<nmaprun><host>')  # unclosed tags
         assert _parse_nmap_sn_xml(str(f)) == set()
+
+
+# ── TestParseResultXml ────────────────────────────────────────────────────────
+
+def _result_xml(*ips):
+    hosts = ''.join(
+        f'<host><address addr="{ip}" addrtype="ipv4"/>'
+        f'<ports><port protocol="tcp" portid="445"><state state="open"/></port></ports>'
+        '</host>'
+        for ip in ips
+    )
+    return f'<?xml version="1.0"?><nmaprun>{hosts}</nmaprun>'
+
+
+class TestParseResultXml:
+    """_parse_result_xml() skips files that carry no parseable results."""
+
+    def test_parses_valid_file(self, tmp_path):
+        f = tmp_path / 'batch_0.xml'
+        f.write_text(_result_xml('10.0.0.1'))
+        root = _parse_result_xml(str(f))
+        assert [h.find('address').attrib['addr'] for h in root.findall('host')] == ['10.0.0.1']
+
+    def test_empty_file_returns_none(self, tmp_path):
+        # A zero-length -oX file is how masscan records a batch with no open
+        # ports; _run_masscan_batch() returns {} for it rather than erroring.
+        f = tmp_path / 'batch_0.xml'
+        f.write_text('')
+        assert _parse_result_xml(str(f)) is None
+
+    def test_truncated_file_returns_none(self, tmp_path):
+        # A killed nmap leaves the prologue with no closing </nmaprun>.
+        f = tmp_path / 'port443.xml'
+        f.write_text('<?xml version="1.0"?>\n<nmaprun><host>')
+        assert _parse_result_xml(str(f)) is None
+
+    def test_non_xml_file_returns_none(self, tmp_path):
+        f = tmp_path / 'batch_0.txt'
+        f.write_text('not xml at all')
+        assert _parse_result_xml(str(f)) is None
+
+    def test_directory_returns_none(self, tmp_path):
+        d = tmp_path / 'nested.xml'
+        d.mkdir()
+        assert _parse_result_xml(str(d)) is None
+
+    def test_missing_file_returns_none(self, tmp_path):
+        assert _parse_result_xml(str(tmp_path / 'nope.xml')) is None
+
+
+class TestAggregateResultDir:
+    """_aggregate_result_dir() must survive empty result files (regression)."""
+
+    def test_empty_batch_files_are_skipped(self, tmp_path):
+        # Mirrors the real failure: masscan_results/ where batch_0.xml sorts
+        # first and is empty, which used to abort the whole run with
+        # "ParseError: no element found: line 1, column 0".
+        for idx in range(3):
+            (tmp_path / f'batch_{idx}.xml').write_text('')
+        (tmp_path / 'batch_3.xml').write_text(_result_xml('10.0.0.7'))
+
+        hosts_json, xml_hosts = _aggregate_result_dir(str(tmp_path), {})
+
+        assert list(xml_hosts) == ['10.0.0.7']
+        assert [h['ip'] for h in hosts_json] == ['10.0.0.7']
+
+    def test_all_files_empty_yields_nothing(self, tmp_path):
+        (tmp_path / 'batch_0.xml').write_text('')
+        assert _aggregate_result_dir(str(tmp_path), {}) == ([], {})
+
+    def test_merges_same_ip_across_files(self, tmp_path):
+        (tmp_path / 'batch_0.xml').write_text('')
+        (tmp_path / 'port22.xml').write_text(_result_xml('10.0.0.1'))
+        (tmp_path / 'port80.xml').write_text(_result_xml('10.0.0.1', '10.0.0.2'))
+
+        hosts_json, xml_hosts = _aggregate_result_dir(str(tmp_path), {})
+
+        assert sorted(xml_hosts) == ['10.0.0.1', '10.0.0.2']
+        merged = next(h for h in hosts_json if h['ip'] == '10.0.0.1')
+        assert len(merged['ports']) == 2
+
+    def test_trailing_slash_result_dir(self, tmp_path):
+        # main() builds result_dir with a trailing separator.
+        (tmp_path / 'batch_0.xml').write_text(_result_xml('10.0.0.5'))
+        _, xml_hosts = _aggregate_result_dir(str(tmp_path) + os.sep, {})
+        assert list(xml_hosts) == ['10.0.0.5']
 
 
 # ── TestRunMasscanBatchWaitMinimum ─────────────────────────────────────────────

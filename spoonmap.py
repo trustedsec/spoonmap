@@ -3756,6 +3756,53 @@ def _merge_host_xml(base, other):
                 seen_scripts.add(script.get('id'))
 
 
+def _parse_result_xml(path):
+    """Parse one masscan/nmap result file, returning None if it holds no results.
+
+    A zero-length file is the normal on-disk form of a batch that found nothing:
+    _run_masscan_batch() returns {} for an empty -oX file rather than treating it
+    as an error, so a scan where any batch came up dry leaves empty XML behind.
+    A killed nmap or masscan can likewise leave an unterminated file. Callers
+    aggregating a whole results directory must skip both instead of aborting.
+    """
+    if not path.endswith('.xml') or not os.path.isfile(path) or os.path.getsize(path) == 0:
+        return None
+    try:
+        return etree.parse(path)
+    except etree.ParseError as e:
+        print(_COLOR_ERROR + f'Warning: skipping unreadable result file '
+              f'{os.path.basename(path)}: {e}' + _COLOR_RESET)
+        return None
+
+
+def _aggregate_result_dir(result_dir, ip_to_hostname):
+    """Merge every result file in *result_dir* into (hosts_json, xml_hosts).
+
+    Returns the JSON-shaped host list and an {ip: merged <host> Element} map,
+    deduplicating hosts seen in more than one file.
+    """
+    hosts_json = []
+    ip_index   = {}  # {ip: index into hosts_json}
+    xml_hosts  = {}  # {ip: merged <host> Element}
+    for xml_file in sorted(os.listdir(result_dir)):
+        root = _parse_result_xml(os.path.join(result_dir, xml_file))
+        if root is None:
+            continue
+        for host in root.findall('host'):
+            hd = _host_elem_to_dict(host, ip_to_hostname)
+            ip = hd['ip']
+            if ip in xml_hosts:
+                _merge_host_xml(xml_hosts[ip], host)
+                existing = hosts_json[ip_index[ip]]
+                existing['ports'].extend(hd['ports'])
+                existing['hostscripts'].update(hd['hostscripts'])
+            else:
+                xml_hosts[ip] = host
+                ip_index[ip] = len(hosts_json)
+                hosts_json.append(hd)
+    return hosts_json, xml_hosts
+
+
 def _cleanup_cmd(dir_path):
     """Handle --cleanup: remove prior scan output from output_path and exit."""
     idx = sys.argv.index('--cleanup')
@@ -4668,23 +4715,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 result_dir = f'{output_path}/nmap_results/'
             else:
                 result_dir = f'{disc}/masscan_results/'
-            hosts_json = []
-            ip_index   = {}  # {ip: index into hosts_json}
-            xml_hosts  = {}  # {ip: merged <host> Element}
-            for xml_file in sorted(os.listdir(result_dir)):
-                root = etree.parse(result_dir + xml_file)
-                for host in root.findall('host'):
-                    hd = _host_elem_to_dict(host, ip_to_hostname)
-                    ip = hd['ip']
-                    if ip in xml_hosts:
-                        _merge_host_xml(xml_hosts[ip], host)
-                        existing = hosts_json[ip_index[ip]]
-                        existing['ports'].extend(hd['ports'])
-                        existing['hostscripts'].update(hd['hostscripts'])
-                    else:
-                        xml_hosts[ip] = host
-                        ip_index[ip] = len(hosts_json)
-                        hosts_json.append(hd)
+            hosts_json, xml_hosts = _aggregate_result_dir(result_dir, ip_to_hostname)
             xml_result = '<?xml version="1.0"?>\n<!-- SpooNMAP -->\n<nmaprun>\n'
             for host_elem in xml_hosts.values():
                 xml_result += etree.tostring(host_elem, encoding="unicode", method="xml")
