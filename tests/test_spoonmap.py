@@ -56,6 +56,7 @@ from spoonmap import (
     _combine_live_hosts,
     _load_config,
     _read_config_file,
+    _write_artifact,
     _write_combined_results,
     _write_if_changed,
     _write_interactive_config,
@@ -610,6 +611,27 @@ class TestLineCount:
         assert 'Error reading file' in capsys.readouterr().out
 
 
+# ── _write_artifact ───────────────────────────────────────────────────────────
+
+class TestWriteArtifact:
+    """_write_artifact() must never let one unwritable path raise out."""
+
+    def test_writes_content_and_reports_success(self, tmp_path):
+        target = tmp_path / 'artifact.txt'
+        assert _write_artifact(str(target), 'body\n') is True
+        assert target.read_text() == 'body\n'
+
+    def test_os_error_is_reported_not_raised(self, tmp_path, capsys):
+        target = str(tmp_path / 'artifact.txt')
+        with patch('spoonmap._atomic_write',
+                   side_effect=OSError('No space left on device')):
+            assert _write_artifact(target, 'body\n') is False
+        out = capsys.readouterr().out
+        assert 'could not write' in out
+        assert target in out                    # names the path
+        assert 'No space left on device' in out  # names the error
+
+
 # ── _write_findings_txt ───────────────────────────────────────────────────────
 
 SAMPLE_FINDINGS = [
@@ -693,6 +715,14 @@ class TestWriteFindingsTxt:
         content = (tmp_path / 'findings.txt').read_text()
         assert f'--script {spoonmap._DIR}/nse/ldap-signing-check.nse' in content
         assert '--script spoonmap/nse/' not in content  # not the old relative path
+
+    def test_write_failure_is_reported_not_raised(self, tmp_path, capsys):
+        # A read-only output dir must not unwind main() and lose findings.md/.json.
+        with patch('spoonmap._atomic_write', side_effect=OSError('Read-only file system')):
+            _write_findings_txt(str(tmp_path), 'Internal', SAMPLE_FINDINGS)
+        out = capsys.readouterr().out
+        assert 'findings.txt' in out
+        assert 'Read-only file system' in out
 
 
 class TestBuildReproCmd:
@@ -780,6 +810,13 @@ class TestWriteFindingsMd:
         assert '### Weak SSH Auth' in content
         assert content.count('| Host | Port | Detail |') == 2
 
+    def test_write_failure_is_reported_not_raised(self, tmp_path, capsys):
+        with patch('spoonmap._atomic_write', side_effect=OSError('Disk quota exceeded')):
+            _write_findings_md(str(tmp_path), 'Internal', SAMPLE_FINDINGS)
+        out = capsys.readouterr().out
+        assert 'findings.md' in out
+        assert 'Disk quota exceeded' in out
+
 
 # ── _write_findings_json ──────────────────────────────────────────────────────
 
@@ -803,6 +840,35 @@ class TestWriteFindingsJson:
         assert len(data) == len(SAMPLE_FINDINGS)
         for record in data:
             assert set(record.keys()) == {'severity', 'host', 'port', 'title', 'detail'}
+
+    def test_write_failure_is_reported_not_raised(self, tmp_path, capsys):
+        with patch('spoonmap._atomic_write', side_effect=OSError('Stale file handle')):
+            _write_findings_json(str(tmp_path), SAMPLE_FINDINGS)
+        out = capsys.readouterr().out
+        assert 'findings.json' in out
+        assert 'Stale file handle' in out
+
+
+class TestGenerateFindingsWriteFailureIsolation:
+    """One unwritable findings artifact must not cost the other two."""
+
+    def test_txt_failure_still_writes_md_and_json(self, tmp_path, capsys):
+        txt_path = f'{tmp_path}/findings.txt'
+        real_atomic_write = spoonmap._atomic_write
+
+        def fail_txt_only(path, content):
+            if path == txt_path:
+                raise OSError('Read-only file system')
+            return real_atomic_write(path, content)
+
+        with patch('spoonmap._atomic_write', side_effect=fail_txt_only):
+            _write_findings_txt(str(tmp_path), 'Internal', SAMPLE_FINDINGS)
+            _write_findings_md(str(tmp_path), 'Internal', SAMPLE_FINDINGS)
+            _write_findings_json(str(tmp_path), SAMPLE_FINDINGS)
+        assert not (tmp_path / 'findings.txt').exists()
+        assert (tmp_path / 'findings.md').exists()
+        assert (tmp_path / 'findings.json').exists()
+        assert 'findings.txt' in capsys.readouterr().out
 
 
 # ── generate_findings ─────────────────────────────────────────────────────────
@@ -5703,6 +5769,55 @@ class TestCombineLiveHosts:
         _combine_live_hosts(disc, str(tmp_path))
         assert (tmp_path / 'all_live_hosts.txt').read_text() == ''
 
+    def test_hostname_files_are_excluded(self, tmp_path):
+        # create_hostname_target_file() writes port{N}_hostnames.txt into the
+        # same directory; those hold hostnames, not IPs, so all_live_hosts.txt
+        # used to interleave them and list every resolved host twice.
+        disc = self._make_live_hosts(tmp_path, {
+            'port80.txt': '10.0.0.1\n10.0.0.2\n',
+            'port80_hostnames.txt': 'web1.corp.local\nweb2.corp.local\n',
+        })
+        _combine_live_hosts(disc, str(tmp_path))
+        written = (tmp_path / 'all_live_hosts.txt').read_text()
+        assert sorted(written.split()) == ['10.0.0.1', '10.0.0.2']
+        assert 'web1.corp.local' not in written
+
+    def test_non_port_files_are_ignored(self, tmp_path):
+        disc = self._make_live_hosts(tmp_path, {
+            'port80.txt': '10.0.0.1\n',
+            'notes.md': 'scratch\n',
+        })
+        _combine_live_hosts(disc, str(tmp_path))
+        written = (tmp_path / 'all_live_hosts.txt').read_text()
+        assert sorted(written.split()) == ['10.0.0.1']
+
+    def test_unreadable_entry_does_not_lose_other_ports(self, tmp_path, capsys):
+        # A directory named portNN.txt raises IsADirectoryError on open().
+        disc = self._make_live_hosts(tmp_path, {'port80.txt': '10.0.0.1\n'})
+        (tmp_path / 'discovery' / 'live_hosts' / 'port443.txt').mkdir()
+        _combine_live_hosts(disc, str(tmp_path))
+        written = (tmp_path / 'all_live_hosts.txt').read_text()
+        assert sorted(written.split()) == ['10.0.0.1']
+        assert 'port443.txt' in capsys.readouterr().out
+
+    def test_unlistable_live_hosts_dir_is_reported(self, tmp_path, capsys):
+        disc = self._make_live_hosts(tmp_path, {})
+        with patch('spoonmap.os.listdir',
+                   side_effect=PermissionError('Permission denied')):
+            _combine_live_hosts(disc, str(tmp_path))
+        out = capsys.readouterr().out
+        assert 'could not list' in out
+        assert 'live_hosts' in out
+        assert not (tmp_path / 'all_live_hosts.txt').exists()
+
+    def test_write_failure_is_reported_not_raised(self, tmp_path, capsys):
+        disc = self._make_live_hosts(tmp_path, {'port80.txt': '10.0.0.1\n'})
+        with patch('spoonmap._atomic_write', side_effect=OSError('No space left on device')):
+            _combine_live_hosts(disc, str(tmp_path))
+        out = capsys.readouterr().out
+        assert 'all_live_hosts.txt' in out
+        assert 'No space left on device' in out
+
 
 # ── _write_combined_results ───────────────────────────────────────────────────
 
@@ -5734,6 +5849,45 @@ class TestWriteCombinedResults:
         _write_combined_results(str(tmp_path), [], hosts)
         root = etree.parse(str(tmp_path / 'spoonmap_output.xml')).getroot()
         assert {h.find('address').get('addr') for h in root.findall('host')} == set(hosts)
+
+    def _fail_one(self, tmp_path, failing_name):
+        """side_effect that fails _atomic_write for one artifact only."""
+        failing = f'{tmp_path}/{failing_name}'
+        real_atomic_write = spoonmap._atomic_write
+
+        def side_effect(path, content):
+            if path == failing:
+                raise OSError('No space left on device')
+            return real_atomic_write(path, content)
+        return side_effect
+
+    def test_xml_failure_still_writes_json(self, tmp_path, capsys):
+        # The two expensive artifacts are guarded independently: losing the XML
+        # must not also lose the JSON.
+        with patch('spoonmap._atomic_write',
+                   side_effect=self._fail_one(tmp_path, 'spoonmap_output.xml')):
+            _write_combined_results(str(tmp_path), [{'ip': '10.0.0.1'}], {})
+        assert not (tmp_path / 'spoonmap_output.xml').exists()
+        with open(str(tmp_path / 'spoonmap_output.json')) as fh:
+            assert json.load(fh) == [{'ip': '10.0.0.1'}]
+        out = capsys.readouterr().out
+        assert 'spoonmap_output.xml' in out
+        assert 'No space left on device' in out
+
+    def test_json_failure_still_writes_xml(self, tmp_path, capsys):
+        with patch('spoonmap._atomic_write',
+                   side_effect=self._fail_one(tmp_path, 'spoonmap_output.json')):
+            _write_combined_results(str(tmp_path), [], {})
+        assert (tmp_path / 'spoonmap_output.xml').exists()
+        assert not (tmp_path / 'spoonmap_output.json').exists()
+        assert 'could not write' in capsys.readouterr().out
+
+    def test_both_failures_suppress_success_message(self, tmp_path, capsys):
+        with patch('spoonmap._atomic_write', side_effect=OSError('Read-only file system')):
+            _write_combined_results(str(tmp_path), [], {})
+        out = capsys.readouterr().out
+        assert 'Results written to' not in out
+        assert out.count('could not write') == 2
 
 
 # ── TestRunMasscanBatchWaitMinimum ─────────────────────────────────────────────

@@ -3607,6 +3607,23 @@ def _build_repro_cmd(title, port_str, host):
     return f'nmap {udp_flag}-p {pnum} {flags} {host}'
 
 
+def _write_artifact(path, content):
+    """Write *content* to *path*, downgrading a write failure to a warning.
+
+    Every output artifact goes through here so that one unwritable path (full
+    disk after a large -sV/NSE run, a dropped SMB/NFS mount, a read-only
+    remount, a root-owned file left by a prior sudo run) cannot unwind main()
+    and discard the *rest* of a completed scan's output.  Returns True if the
+    file was written.
+    """
+    try:
+        _atomic_write(path, content)
+        return True
+    except OSError as exc:
+        print(_COLOR_ERROR + f'ERROR: could not write {path}: {exc}' + _COLOR_RESET)
+        return False
+
+
 def _write_findings_txt(output_path, target_scan, findings):
     today = datetime.date.today()
     lines = [
@@ -3678,8 +3695,7 @@ def _write_findings_txt(output_path, target_scan, findings):
             lines.append('')
 
     lines.append(f'Total findings: {len(groups)}')
-    with open(f'{output_path}/findings.txt', 'w') as fh:
-        fh.write('\n'.join(lines) + '\n')
+    _write_artifact(f'{output_path}/findings.txt', '\n'.join(lines) + '\n')
 
 
 def _write_findings_md(output_path, target_scan, findings):
@@ -3708,8 +3724,7 @@ def _write_findings_md(output_path, target_scan, findings):
                 lines.append(f'| `{host}` | {port} | {detail_safe} |')
             lines.append('')
     lines.append(f'**Total findings:** {len(findings)}')
-    with open(f'{output_path}/findings.md', 'w') as fh:
-        fh.write('\n'.join(lines) + '\n')
+    _write_artifact(f'{output_path}/findings.md', '\n'.join(lines) + '\n')
 
 
 def _write_findings_json(output_path, findings):
@@ -3718,8 +3733,7 @@ def _write_findings_json(output_path, findings):
         {'severity': sev, 'host': host, 'port': port, 'title': title, 'detail': detail}
         for sev, host, port, title, detail in findings
     ]
-    with open(f'{output_path}/findings.json', 'w') as fh:
-        json.dump(records, fh, indent=2)
+    _write_artifact(f'{output_path}/findings.json', json.dumps(records, indent=2))
 
 
 def _host_elem_to_dict(host_elem, ip_to_hostname=None):
@@ -3826,21 +3840,37 @@ def _aggregate_result_dir(result_dir, ip_to_hostname):
 
 
 def _combine_live_hosts(disc, output_path):
-    """Write output_path/all_live_hosts.txt from every file in disc/live_hosts.
+    """Write output_path/all_live_hosts.txt from disc/live_hosts/portNN.txt.
 
-    Each per-port live-host file holds newline-terminated IPs; the union is
-    written back out as-is (lines keep their trailing newline), deduplicated
-    across ports.
+    Only port*.txt files are read.  create_hostname_target_file() also writes
+    port{N}_hostnames.txt into this same directory and those hold *hostnames*,
+    not IPs, so reading the directory unfiltered put hostnames into a file
+    documented as a list of live IPs and listed every resolved host twice.
+
+    Each per-port file holds newline-terminated IPs; the union is written back
+    out as-is (lines keep their trailing newline), deduplicated across ports.
     """
     all_ips = set()
-    host_files = os.listdir(f'{disc}/live_hosts')
+    live_dir = f'{disc}/live_hosts'
+    try:
+        host_files = sorted(os.listdir(live_dir))
+    except OSError as exc:
+        print(_COLOR_ERROR + f'ERROR: could not list {live_dir}: {exc}' + _COLOR_RESET)
+        return
     for host_file in host_files:
-        with open(f'{disc}/live_hosts/{host_file}') as input_file:
-            for line in input_file:
-                all_ips.add(line)
-    with open(f'{output_path}/all_live_hosts.txt', 'w') as output_file:
-        for ip in all_ips:
-            output_file.write(ip)
+        if not (host_file.startswith('port') and host_file.endswith('.txt')
+                and not host_file.endswith('_hostnames.txt')):
+            continue
+        host_path = f'{live_dir}/{host_file}'
+        try:
+            with open(host_path) as input_file:
+                for line in input_file:
+                    all_ips.add(line)
+        except OSError as exc:
+            # A directory or an unreadable file in here must not cost us the
+            # IPs from every other port's file.
+            print(_COLOR_ERROR + f'Warning: could not read {host_path}: {exc}' + _COLOR_RESET)
+    _write_artifact(f'{output_path}/all_live_hosts.txt', ''.join(all_ips))
 
 
 def _write_combined_results(output_path, hosts_json, xml_hosts):
@@ -3849,16 +3879,19 @@ def _write_combined_results(output_path, hosts_json, xml_hosts):
     *xml_hosts* / *hosts_json* come from _aggregate_result_dir(); the XML is
     the merged <host> elements wrapped in a minimal <nmaprun> document so the
     result loads in tools that expect nmap output.
+
+    The two writes are guarded independently: these are the two most expensive
+    artifacts to regenerate, so an unwritable .xml must not also cost the .json.
     """
     xml_result = '<?xml version="1.0"?>\n<!-- SpooNMAP -->\n<nmaprun>\n'
     for host_elem in xml_hosts.values():
         xml_result += etree.tostring(host_elem, encoding="unicode", method="xml")
     xml_result += '</nmaprun>'
-    with open(f'{output_path}/spoonmap_output.xml', 'w+') as spoonmap_output:
-        spoonmap_output.write(xml_result)
-    with open(f'{output_path}/spoonmap_output.json', 'w') as f:
-        json.dump(hosts_json, f, indent=2)
-    print(_COLOR_RESULT + f'\nResults written to {output_path}/spoonmap_output.xml / .json' + _COLOR_RESET)
+    wrote_xml = _write_artifact(f'{output_path}/spoonmap_output.xml', xml_result)
+    wrote_json = _write_artifact(f'{output_path}/spoonmap_output.json',
+                                json.dumps(hosts_json, indent=2))
+    if wrote_xml or wrote_json:
+        print(_COLOR_RESULT + f'\nResults written to {output_path}/spoonmap_output.xml / .json' + _COLOR_RESET)
 
 
 def _read_config_file(path):
@@ -4894,15 +4927,18 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         # Combine all live hosts into one file
         disc = _disc(output_path)
         if os.path.exists(f'{disc}/live_hosts'):
-            _combine_live_hosts(disc, output_path)
-
-            # Combine all XML results into one file
+            # Combine all XML results into one file.  These two are the
+            # expensive artifacts, so they are written *before* the trivially
+            # regenerable all_live_hosts.txt -- the old order let a failure on
+            # the cheapest artifact abort before either of them was reached.
             if banner_scan or script_scan:
                 result_dir = f'{output_path}/nmap_results/'
             else:
                 result_dir = f'{disc}/masscan_results/'
             hosts_json, xml_hosts = _aggregate_result_dir(result_dir, ip_to_hostname)
             _write_combined_results(output_path, hosts_json, xml_hosts)
+
+            _combine_live_hosts(disc, output_path)
 
             if script_scan:
                 generate_findings(output_path, target_scan, snmp_any_validated=snmp_any_validated)
