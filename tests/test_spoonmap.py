@@ -5604,6 +5604,7 @@ class TestRunMasscanBatchWaitMinimum:
     def _make_mock_proc(self):
         mock_proc = MagicMock()
         mock_proc.wait.return_value = 0
+        mock_proc.returncode = 0
         mock_proc.pid = 12345
         # Finite stderr so _stream_masscan_progress()'s read(1) loop terminates;
         # a bare MagicMock would return truthy bytes forever and hang the join.
@@ -5780,6 +5781,61 @@ class TestRunMasscanBatchBehavior:
                 _run_masscan_batch(['445'], '1000', str(output_xml),
                                    '/fake/targets.txt', None, None)
         assert mock_proc.kill.called
+
+    def test_returncode_1_prints_diagnostic_with_stderr(self, tmp_path, capsys):
+        output_xml = tmp_path / 'out.xml'
+        mock_proc = self._make_mock_proc(returncode=1)
+        mock_proc.stderr = io.BytesIO(b'Error: failed to detect IP of interface')
+
+        with patch('spoonmap.subprocess.Popen', return_value=mock_proc), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            with pytest.raises(SystemExit) as exc:
+                _run_masscan_batch(['445'], '1000', str(output_xml),
+                                   '/fake/targets.txt', None, None)
+
+        assert exc.value.code == 1
+        output = capsys.readouterr().out
+        assert 'masscan exited with code 1' in output
+        assert 'failed to detect IP of interface' in output
+
+    def test_returncode_2_prints_diagnostic_with_stderr(self, tmp_path, capsys):
+        output_xml = tmp_path / 'out.xml'
+        mock_proc = self._make_mock_proc(returncode=2)
+        mock_proc.stderr = io.BytesIO(b'Fatal error: invalid argument')
+
+        with patch('spoonmap.subprocess.Popen', return_value=mock_proc), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            with pytest.raises(SystemExit) as exc:
+                _run_masscan_batch(['445'], '1000', str(output_xml),
+                                   '/fake/targets.txt', None, None)
+
+        assert exc.value.code == 1
+        output = capsys.readouterr().out
+        assert 'masscan exited with code 2' in output
+        assert 'Fatal error: invalid argument' in output
+
+    def test_returncode_0_parses_normally(self, tmp_path):
+        output_xml = tmp_path / 'out.xml'
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.1" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="445"/></ports></host>'
+            '</nmaprun>'
+        )
+
+        def fake_popen(cmd, **kwargs):
+            output_xml.write_text(xml)
+            return self._make_mock_proc(returncode=0)
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            results = _run_masscan_batch(['445'], '1000', str(output_xml),
+                                         '/fake/targets.txt', None, None)
+
+        assert results == {'445': {'10.0.0.1'}}
 
 
 class TestFlagSuspectedTarpits:
