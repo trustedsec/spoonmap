@@ -79,11 +79,13 @@ from spoonmap import (
     _parse_masscan_ping_xml,
     _parse_nmap_sn_xml,
     _parse_result_xml,
+    _quarantine_failed_output,
     _aggregate_result_dir,
     _path_completion,
     _run_masscan_batch,
     _resume_cache_usable,
     _safe_mtime,
+    _safe_size,
     _scan_extra_sql_ports,
     _validate_snmp_any_community,
     _SMB_COUPLED_PORTS,
@@ -2444,6 +2446,51 @@ class TestLoadConfig:
         assert cfg['masscan_batch_size'] == 5
         assert 'masscan_batch_size' in capsys.readouterr().out
 
+    # ---- numeric floors (the interactive twin _prompt_int has always enforced
+    # minimum=1; the config path enforced nothing) ---------------------------
+
+    def test_zero_nmap_threads_is_clamped_to_one(self, capsys):
+        # nmap_scan() does `for _ in range(max_threads)`, so 0 starts no workers
+        # and work_queue.join() hangs forever — after discovery already ran.
+        cfg = _load_config(_config_dict(nmap_threads=0), '/t')
+        assert cfg['nmap_threads'] == 1
+        out = capsys.readouterr().out
+        assert 'nmap_threads' in out
+        assert 'below the minimum' in out
+
+    def test_negative_masscan_batch_size_is_clamped_to_one(self, capsys):
+        # range(0, len(normal), 0) raises "range() arg 3 must not be zero",
+        # unwinding main() mid-scan.
+        cfg = _load_config(_config_dict(masscan_batch_size=-3), '/t')
+        assert cfg['masscan_batch_size'] == 1
+        assert 'masscan_batch_size' in capsys.readouterr().out
+
+    def test_zero_nmap_threshold_is_clamped_to_one(self, capsys):
+        cfg = _load_config(_config_dict(nmap_threshold=0), '/t')
+        assert cfg['nmap_threshold'] == 1
+        assert 'nmap_threshold' in capsys.readouterr().out
+
+    def test_null_max_rate_warns_instead_of_crashing_mid_scan(self, capsys):
+        # str(None) == 'None' used to reach int(max_rate) in
+        # _discover_internal_masscan() as a raw ValueError traceback.
+        cfg = _load_config(_config_dict(max_rate=None), '/t')
+        assert cfg['max_rate'] == '2000'
+        out = capsys.readouterr().out
+        assert 'max_rate' in out
+        assert 'not a number' in out
+
+    def test_null_max_rate_default_follows_target_scan(self, capsys):
+        cfg = _load_config(_config_dict(max_rate=None, target_scan='External'), '/t')
+        assert cfg['max_rate'] == '20000'
+        assert 'max_rate' in capsys.readouterr().out
+
+    def test_zero_max_rate_is_clamped_not_passed_to_masscan(self, capsys):
+        # '0' is truthy, so the `if not max_rate:` re-prompt never fired and
+        # masscan ran at --max-rate 0.
+        cfg = _load_config(_config_dict(max_rate=0), '/t')
+        assert cfg['max_rate'] == '1'
+        assert 'below the minimum' in capsys.readouterr().out
+
     # ---- required-key validation -------------------------------------------
 
     def test_missing_target_scan_reports_key_and_exits(self, capsys):
@@ -2464,6 +2511,33 @@ class TestLoadConfig:
         for key in ('banner_scan', 'max_rate', 'target_file', 'output_path'):
             assert key in out
         assert 'missing required keys' in out
+
+    # ---- target_scan validation --------------------------------------------
+
+    def test_lowercase_target_scan_is_normalised(self):
+        # Unvalidated, "internal" matched neither literal: the scan ran and
+        # looked normal while every target_scan == 'Internal' gated check (SMB
+        # security mode, MS17-010, LDAP signing/channel binding, ms-sql-info,
+        # the extra SQL port sweep) was silently skipped.
+        assert _load_config(_config_dict(target_scan='internal'),
+                            '/t')['target_scan'] == 'Internal'
+
+    def test_padded_mixed_case_target_scan_is_normalised(self):
+        assert _load_config(_config_dict(target_scan='  eXTERNAL '),
+                            '/t')['target_scan'] == 'External'
+
+    def test_unrecognised_target_scan_exits(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _load_config(_config_dict(target_scan='inernal'), '/t')
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert 'target_scan' in out
+        assert "'Internal' or 'External'" in out
+
+    def test_null_target_scan_exits_rather_than_scanning(self, capsys):
+        with pytest.raises(SystemExit):
+            _load_config(_config_dict(target_scan=None), '/t')
+        assert 'target_scan' in capsys.readouterr().out
 
 
 # ── Config: Full scan_categories ──────────────────────────────────────────────
@@ -2819,6 +2893,30 @@ class TestSafeMtime:
         # Also covers the TOCTOU case: a file removed between exists() and
         # getmtime() must read as stale instead of raising FileNotFoundError.
         assert _safe_mtime(str(tmp_path / 'gone.txt')) == 0
+
+
+class TestSafeSize:
+    def test_returns_size_of_existing_file(self, tmp_path):
+        p = tmp_path / 'f.txt'
+        p.write_text('abcd')
+        assert _safe_size(str(p)) == 4
+
+    def test_missing_file_reads_as_zero(self, tmp_path):
+        assert _safe_size(str(tmp_path / 'gone.txt')) == 0
+
+    def test_directory_reads_as_zero(self, tmp_path):
+        # Directories have a non-zero st_size, so the isfile() guard the callers
+        # used to make inline has to live in here.
+        assert _safe_size(str(tmp_path)) == 0
+
+    def test_stat_failure_reads_as_zero(self, tmp_path):
+        # The exists()-then-stat race _safe_mtime() closes for mtimes: a file
+        # removed (or a mount yanked) between the two calls must read as
+        # unusable rather than raising out of a scan.
+        p = tmp_path / 'f.txt'
+        p.write_text('abcd')
+        with patch('spoonmap.os.path.getsize', side_effect=OSError('gone')):
+            assert _safe_size(str(p)) == 0
 
 
 class TestResumeCacheUsable:
@@ -4103,6 +4201,36 @@ class TestMassScanProbe:
         combined = (disc / 'live_hosts_combined.txt').read_text()
         assert '10.0.0.1' in combined
         assert '10.0.0.9' in combined  # only in discovery_file, not probe results
+
+    def test_unwritable_combined_target_falls_back_to_full_target_file(self, tmp_path, capsys):
+        """The combined list is the masscan -iL target for every remaining
+        batch, so a failed write (ENOSPC) must not raise out of mass_scan() and
+        lose the whole run's aggregation — the batches fall back to the full
+        target file, which over-scans rather than silently under-scanning."""
+        spoonmap.output_path = str(tmp_path)
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0 — hit
+            {},                       # main batch ['3306']
+        ]
+        real_atomic_write = spoonmap._atomic_write
+
+        def fail_only_combined(path, content):
+            # The per-port live_hosts writes must still land; only the combined
+            # target list is out of disk space.
+            if path.endswith('live_hosts_combined.txt'):
+                raise OSError('No space left on device')
+            return real_atomic_write(path, content)
+
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)) as mock_b, \
+             patch('spoonmap._atomic_write', side_effect=fail_only_combined):
+            result = mass_scan('All', ['443', '3306'], '53', '10000',
+                               '/fake/targets.txt', '', batch_size=1)
+
+        assert 'Hosts Found on Port 443' in result
+        # target_file positional arg of the remaining-port batch call
+        assert mock_b.call_args_list[1][0][3] == '/fake/targets.txt'
+        assert 'could not write combined target list' in capsys.readouterr().out
 
     # ── scan-type-aware probe port selection ─────────────────────────────────
 
@@ -5536,6 +5664,45 @@ class TestCreateHostnameTargetFile:
         assert hostname_file.read_text() == '10.0.0.5\n'
 
 
+class TestQuarantineFailedOutput:
+    """_quarantine_failed_output() renames a failed pass's XML out of the way."""
+
+    def test_existing_output_is_renamed_and_rejected_by_the_resume_gate(self, tmp_path):
+        # A failed nmap can still leave a valid, hostless XML: parseable, so the
+        # gate accepted it and the port was never re-scanned.
+        out = tmp_path / 'port80.xml'
+        out.write_text('<nmaprun/>')
+        assert _resume_cache_usable(str(out), 0, 'port 80 banner scan') is True
+
+        failed = _quarantine_failed_output(str(out))
+
+        assert failed == str(out) + '.failed'
+        assert not out.exists()
+        assert (tmp_path / 'port80.xml.failed').read_text() == '<nmaprun/>'
+        assert _resume_cache_usable(str(out), 0, 'port 80 banner scan') is False
+
+    def test_quarantined_name_is_invisible_to_result_parsing(self, tmp_path):
+        # The suffix must not end in .xml, or aggregation would pick the failed
+        # run's partial hosts back up.
+        out = tmp_path / 'port80.xml'
+        out.write_text('<nmaprun/>')
+        failed = _quarantine_failed_output(str(out))
+        assert _parse_result_xml(failed) is None
+
+    def test_missing_output_returns_none(self, tmp_path):
+        # nmap exiting before it created any file at all — already fails the gate.
+        assert _quarantine_failed_output(str(tmp_path / 'gone.xml')) is None
+
+    def test_rename_failure_is_swallowed(self, tmp_path):
+        """A read-only output dir must not turn a reportable nmap failure into
+        an exception that takes down the worker thread."""
+        out = tmp_path / 'port80.xml'
+        out.write_text('<nmaprun/>')
+        with patch('spoonmap.os.replace', side_effect=OSError('read-only')):
+            assert _quarantine_failed_output(str(out)) is None
+        assert out.exists()
+
+
 class TestNmapWorker:
     """Unit tests for nmap_worker() — the per-port scan worker thread function.
 
@@ -5842,6 +6009,46 @@ class TestNmapWorker:
         assert 'Illegal port specification' in out
         assert completed_count[0] == 0
 
+    def test_failed_banner_pass_quarantines_its_xml_for_resume(self, tmp_path, capsys):
+        """A non-zero banner pass that still finalised a valid XML must not
+        satisfy the resume gate: nmap exiting non-zero after writing a hostless
+        but parseable file (target resolution failure, missing privileges) left
+        that port looking scanned forever."""
+        def fake_popen(*a, **k):
+            # nmap finalises the XML, then exits non-zero.
+            Path(f'{tmp_path}/nmap_results/port80.xml').write_text('<nmaprun/>')
+            return self._make_finished_proc(returncode=1, stderr='QUITTING!\n')
+
+        self._run(tmp_path, popen_side_effect=fake_popen)
+
+        banner_xml = f'{tmp_path}/nmap_results/port80.xml'
+        assert not os.path.exists(banner_xml)
+        assert Path(banner_xml + '.failed').read_text() == '<nmaprun/>'
+        assert _resume_cache_usable(banner_xml, 0, 'port 80 banner scan') is False
+        out = capsys.readouterr().out
+        assert 'WILL be re-scanned on resume' in out
+        assert 'port80.xml.failed' in out
+
+    def test_failed_nse_pass_quarantines_its_own_xml(self, tmp_path):
+        """The NSE pass quarantines nse_results/, not the banner output."""
+        call_count = {'n': 0}
+
+        def fake_popen(*a, **k):
+            call_count['n'] += 1
+            if call_count['n'] == 1:
+                Path(f'{tmp_path}/nmap_results/port80.xml').write_text('<nmaprun/>')
+                return self._make_finished_proc()
+            Path(f'{tmp_path}/nse_results/port80.xml').write_text('<nmaprun/>')
+            return self._make_finished_proc(returncode=2, stderr='NSE failed\n')
+
+        self._run(tmp_path, script_scan=True, scripts_for_port='ftp-anon',
+                  popen_side_effect=fake_popen)
+
+        # Banner pass succeeded, so its XML stays put.
+        assert os.path.exists(f'{tmp_path}/nmap_results/port80.xml')
+        assert not os.path.exists(f'{tmp_path}/nse_results/port80.xml')
+        assert os.path.exists(f'{tmp_path}/nse_results/port80.xml.failed')
+
     def test_zero_exit_prints_no_failure_diagnostic(self, tmp_path, capsys):
         """A clean exit counts as completed and prints no failure text."""
         completed_count, _, _, _, _ = self._run(tmp_path)
@@ -5945,12 +6152,77 @@ class TestNmapWorker:
 
     def test_stderr_is_captured_not_discarded(self, tmp_path):
         """stderr must be piped (so failures are diagnosable) while stdout stays
-        DEVNULL, and start_new_session must survive the change."""
+        DEVNULL, and start_new_session must survive the change.
+
+        Piping alone is not enough — an undrained pipe is worse than DEVNULL —
+        so the behavioural half of this contract lives in
+        test_stderr_is_drained_while_the_worker_polls below.
+        """
         _, mock_popen, _, _, _ = self._run(tmp_path)
         kwargs = mock_popen.call_args[1]
         assert kwargs['stderr'] is spoonmap.subprocess.PIPE
         assert kwargs['stdout'] is spoonmap.subprocess.DEVNULL
         assert kwargs['start_new_session'] is True
+
+    def test_stderr_is_drained_while_the_worker_polls(self, tmp_path):
+        """Regression: the same deadlock as #25, reintroduced in nmap_worker.
+
+        Piping stderr without draining it means nmap blocks in write() once the
+        ~64 KB pipe buffer fills (a -sV pass against a few thousand hosts on a
+        filtered port emits one line per retransmission-cap hit). The worker's
+        poll() then never returns non-None and work_queue.join() in nmap_scan()
+        hangs forever — a scan that silently stops progressing. A MagicMock is
+        not a real pipe, so this models the kernel's behaviour instead: the
+        child cannot exit until a reader has arrived, i.e. poll() keeps
+        returning None until something consumes stderr. With the pre-fix code
+        (read only inside the failure path, after wait()) the worker never
+        leaves the poll loop and is still alive after the bounded join.
+        """
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/nmap_results', exist_ok=True)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts', exist_ok=True)
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n')
+
+        stderr_touched = threading.Event()
+
+        class _WatchedStderr(io.StringIO):
+            """Signals as soon as anything starts consuming the stream."""
+
+            def __iter__(self):
+                stderr_touched.set()
+                return io.StringIO.__iter__(self)
+
+            def read(self, *args, **kwargs):
+                stderr_touched.set()
+                return io.StringIO.read(self, *args, **kwargs)
+
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.wait.return_value = 0
+        proc.stderr = _WatchedStderr(
+            'nmap: giving up on port 445 after 10 retransmissions\n' * 1200)
+        proc.poll.side_effect = lambda: 0 if stderr_touched.is_set() else None
+
+        work_queue = Queue()
+        work_queue.put('port80.txt')
+        work_queue.put(None)
+        completed_count = [0]
+        interrupt_event = threading.Event()
+
+        def _run():
+            with patch('spoonmap._build_nmap_cmd', return_value=['nmap', 'fake']), \
+                 patch('spoonmap._get_scripts_for_port', return_value=''), \
+                 patch('spoonmap.subprocess.Popen', return_value=proc):
+                nmap_worker(work_queue, completed_count, 1, '88', threading.Lock(),
+                            interrupt_event, None)
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert stderr_touched.is_set()
+        assert completed_count[0] == 1
 
 
 def _fake_worker_drain(work_queue, completed_count, total_count, source_port, lock,
@@ -5994,6 +6266,24 @@ class TestNmapScan:
 
         assert not mock_worker.called
         assert 'already been scanned' in capsys.readouterr().out
+
+    def test_only_hostname_files_reports_no_open_ports(self, tmp_path, capsys):
+        """A live_hosts/ holding nothing but derived _hostnames.txt files means
+        discovery found no open ports. The message was chosen from the raw
+        listdir while the scan list was filtered, so it claimed everything had
+        already been scanned."""
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts')
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80_hostnames.txt').write_text(
+            'host1.internal\n')
+
+        with patch('spoonmap.nmap_worker') as mock_worker:
+            nmap_scan('88', max_threads=2)
+
+        assert not mock_worker.called
+        out = capsys.readouterr().out
+        assert 'No open ports found' in out
+        assert 'already been scanned' not in out
 
     def _setup_banner_cache(self, tmp_path, xml_text):
         spoonmap.output_path = str(tmp_path)

@@ -391,6 +391,24 @@ def _safe_mtime(path):
         return 0
 
 
+def _safe_size(path):
+    """Return *path*'s size in bytes, or 0 if it is not a readable regular file.
+
+    The _safe_mtime() companion for size checks: the resume gates and
+    _parse_result_xml() both test existence and then stat, and a file removed in
+    between (a parallel --cleanup, an operator tidying up mid-run) must read as
+    unusable (0) rather than raising FileNotFoundError out of a scan. A
+    directory reads as 0 too, which keeps the isfile() checks these callers used
+    to make.
+    """
+    try:
+        if not os.path.isfile(path):
+            return 0
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
 def _resume_cache_usable(output_file, baseline_mtime, description, is_xml=True):
     """True when cached *output_file* may satisfy a resume gate.
 
@@ -413,7 +431,7 @@ def _resume_cache_usable(output_file, baseline_mtime, description, is_xml=True):
     if is_xml:
         usable = _parse_result_xml(output_file) is not None
     else:
-        usable = os.path.isfile(output_file) and os.path.getsize(output_file) > 0
+        usable = _safe_size(output_file) > 0
     if not usable:
         print(_COLOR_INFO + f're-running {description}: cached result was empty '
                             'or unreadable' + _COLOR_RESET)
@@ -1153,6 +1171,30 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
     return ips
 
 
+def _start_stderr_reader(stderr_stream):
+    """Drain *stderr_stream* on a daemon thread; return ``(thread, lines)``.
+
+    Must run concurrently with the wait()/poll() that reaps the child: nmap
+    emits one stderr line per failed packet send, and if nobody drains the pipe
+    the child blocks in write() once the ~64 KB buffer fills — so wait() never
+    returns and poll() never stops returning None.  Callers join *thread* after
+    the child is reaped and then ``''.join(lines)`` for the full text.
+
+    One helper rather than a per-call-site closure: this exact deadlock has now
+    been introduced twice in this module (issues #25 and the nmap_worker
+    regression), so there is a single idiom to reuse.
+    """
+    lines = []
+
+    def _stderr_reader():
+        for line in stderr_stream:
+            lines.append(line)
+
+    thread = threading.Thread(target=_stderr_reader, daemon=True)
+    thread.start()
+    return thread, lines
+
+
 def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
                          scan_type='Full', resume=False, max_rate=None, total_hosts=None):
     """Run nmap -T4 port discovery in place of masscan for small target sets.
@@ -1251,15 +1293,6 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
             if re.search(r'About\s+[\d.]+%\s+done', line):
                 print(_COLOR_PROGRESS + f'  [nmap] {line}' + _COLOR_RESET, flush=True)
 
-    stderr_lines = []
-
-    def _stderr_reader(stderr_stream):
-        # Must run concurrently with proc.wait(): nmap emits one stderr line per
-        # failed packet send, and if nobody drains the pipe it blocks in write()
-        # once the ~64 KB buffer fills, so wait() would never return.
-        for line in stderr_stream:
-            stderr_lines.append(line)
-
     term_state = save_terminal_state()
     # SIGINT inside Popen() leaves proc unbound; a bare proc.kill() below then
     # raised UnboundLocalError in place of the KeyboardInterrupt.
@@ -1269,8 +1302,7 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
                                 stderr=subprocess.PIPE, text=True)
         _t = threading.Thread(target=_progress_reader, args=(proc.stdout,), daemon=True)
         _t.start()
-        _et = threading.Thread(target=_stderr_reader, args=(proc.stderr,), daemon=True)
-        _et.start()
+        _et, stderr_lines = _start_stderr_reader(proc.stderr)
         proc.wait()
         _t.join()
         _et.join()
@@ -1562,13 +1594,28 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                 _combined_ips.update(line.strip() for line in fh if line.strip())
         if _combined_ips:
             combined_path = os.path.join(disc, 'live_hosts_combined.txt')
-            with open(combined_path, 'w') as fh:
-                for ip in sorted(_combined_ips, key=_ip_sort_key):
-                    fh.write(ip + '\n')
-            batch_target = combined_path
-            print(_COLOR_INFO
-                  + f'Combined target: {len(_combined_ips)} host(s) for remaining port batches.'
-                  + _COLOR_RESET)
+            # _atomic_write, not a plain open(): this file is the masscan -iL
+            # target for every remaining batch.  An ENOSPC part-way through a
+            # direct write raised OSError out of mass_scan() and out of main(),
+            # losing the whole run's aggregation, and a truncation that did not
+            # raise silently narrowed the batch target set — under-scanning with
+            # no error.  A failure now leaves the batches pointed at the full
+            # target file: slower, never quieter.
+            try:
+                _atomic_write(combined_path,
+                              ''.join(ip + '\n' for ip in
+                                      sorted(_combined_ips, key=_ip_sort_key)))
+            except OSError as e:
+                print(_COLOR_ERROR
+                      + f'Warning: could not write combined target list ({e}); '
+                        'falling back to the full target file for remaining batches.'
+                      + _COLOR_RESET)
+                batch_target = target_file
+            else:
+                batch_target = combined_path
+                print(_COLOR_INFO
+                      + f'Combined target: {len(_combined_ips)} host(s) for remaining port batches.'
+                      + _COLOR_RESET)
         else:
             batch_target = target_file
     else:
@@ -1765,25 +1812,70 @@ def _build_nmap_cmd(dest_port, input_file, output_file, source_port,
     return cmd
 
 
+def _quarantine_failed_output(output_file):
+    """Rename a failed pass's XML to ``<name>.xml.failed``; return the new path.
+
+    A non-zero nmap exit can still leave a perfectly *valid* XML behind holding
+    zero or partial hosts (whole-target resolution failure, missing privileges
+    for the requested scan type).  _resume_cache_usable() only rejects files
+    that fail to parse, so such a file satisfies the resume gate forever and the
+    port is treated as scanned when it never was — an "appears scanned but
+    wasn't", the worst failure mode this tool has.  Renaming makes the gate
+    reject it while leaving the data on disk for inspection.
+
+    The '.xml.failed' suffix is chosen so no consumer can pick it up: every
+    aggregation and post-processing pass requires an '.xml' extension (or an
+    exact filename), and the live_hosts filters only match 'port*.txt'.
+
+    Returns None when there was nothing to rename or the rename failed — a
+    missing output file already fails the gate, so either way the port is
+    re-scanned.
+    """
+    if not os.path.exists(output_file):
+        return None
+    failed_path = output_file + '.failed'
+    try:
+        os.replace(output_file, failed_path)
+    except OSError:
+        return None
+    return failed_path
+
+
 def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 interrupt_event, ip_to_hostname, script_scan=False,
                 target_scan='Internal', start_time=None):
     """Worker thread function to process NMAP scans from queue"""
 
-    def _report_nmap_failure(pass_label, dest_port, proc):
+    def _report_nmap_failure(pass_label, dest_port, proc, stderr_output, output_file):
         """Print a diagnostic for a non-zero nmap exit that was not an interrupt.
 
         Callers must confirm interrupt_event is clear first: a deliberately
         killed nmap also exits non-zero, and reporting that as a failure would
         spam an error for every port on Ctrl-C.
+
+        *stderr_output* comes from the concurrent drain started at Popen() time,
+        never from a read() after the fact: reading only on the failure path
+        leaves the pipe unread while the worker polls, which deadlocks the whole
+        scan the moment nmap exceeds the pipe buffer (see _start_stderr_reader).
+
+        The partial output is quarantined before the message is printed so the
+        claim about resume is unconditionally true: this used to promise the port
+        would NOT be retried, which stopped being accurate once the resume gate
+        started accepting any *parseable* XML — a valid, hostless XML from a
+        failed run satisfied the gate and stranded that port permanently.
         """
-        stderr_output = proc.stderr.read() if proc.stderr is not None else ''
+        failed_path = _quarantine_failed_output(output_file)
         with lock:
             print(_COLOR_ERROR
                   + f'Error: nmap {pass_label} for port {dest_port} exited with code '
-                    f'{proc.returncode} — results for this port may be missing or '
-                    f'incomplete and will NOT be retried on resume.'
+                    f'{proc.returncode} — results for this port are missing or '
+                    f'incomplete, so this port WILL be re-scanned on resume.'
                   + _COLOR_RESET)
+            if failed_path:
+                print(_COLOR_ERROR
+                      + f'Partial output kept for inspection: '
+                        f'{os.path.basename(failed_path)}'
+                      + _COLOR_RESET)
             if stderr_output.strip():
                 print(_COLOR_ERROR + stderr_output.strip() + _COLOR_RESET)
 
@@ -1834,8 +1926,12 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 # between nmap and spoonmap in either direction, making external
                 # `kill <nmap_pid>` safe without stopping the overall scan.
                 # stderr is captured rather than discarded so a non-zero exit
-                # (bad port spec, missing privileges, disk full) is reportable;
-                # nmap's stderr is short, so buffering it is cheap.
+                # (bad port spec, missing privileges, disk full) is reportable.
+                # It MUST be drained concurrently: a -sV pass against a few
+                # thousand hosts on a filtered port emits a stderr line per
+                # retransmission-cap hit, and once that fills the ~64 KB pipe
+                # buffer nmap blocks in write() — poll() then never returns
+                # non-None and work_queue.join() in nmap_scan() hangs forever.
                 nmap_process = subprocess.Popen(
                     nmap_cmd,
                     stdout=subprocess.DEVNULL,
@@ -1843,6 +1939,7 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                     text=True,
                     start_new_session=True,
                 )
+                nmap_err_thread, nmap_err_lines = _start_stderr_reader(nmap_process.stderr)
 
                 # Poll process to allow interrupt checking; wake immediately on interrupt
                 while nmap_process.poll() is None and not interrupt_event.is_set():
@@ -1851,8 +1948,10 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 if interrupt_event.is_set() and nmap_process.poll() is None:
                     nmap_process.kill()
                     nmap_process.wait()
+                    nmap_err_thread.join()
                 else:
                     nmap_process.wait()
+                    nmap_err_thread.join()
 
                     if interrupt_event.is_set():
                         # Exited on its own during an interrupt — neither a
@@ -1862,7 +1961,8 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                         # Failed scan: leave completed_count alone so the
                         # progress percentage does not claim work that produced
                         # no (or truncated) XML.
-                        _report_nmap_failure('banner scan', dest_port, nmap_process)
+                        _report_nmap_failure('banner scan', dest_port, nmap_process,
+                                             ''.join(nmap_err_lines), output_file)
                     else:
                         with lock:
                             completed_count[0] += 1
@@ -1890,15 +1990,20 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                             text=True,
                             start_new_session=True,
                         )
+                        # Same concurrent drain as the banner pass: an NSE run
+                        # can be even chattier on stderr (per-script warnings).
+                        nse_err_thread, nse_err_lines = _start_stderr_reader(nse_process.stderr)
                         while nse_process.poll() is None and not interrupt_event.is_set():
                             interrupt_event.wait(0.1)
                         if interrupt_event.is_set() and nse_process.poll() is None:
                             nse_process.kill()
                         nse_process.wait()
+                        nse_err_thread.join()
                         # A killed process also exits non-zero, so only report
                         # when no interrupt is in flight.
                         if nse_process.returncode != 0 and not interrupt_event.is_set():
-                            _report_nmap_failure('NSE script pass', dest_port, nse_process)
+                            _report_nmap_failure('NSE script pass', dest_port, nse_process,
+                                                 ''.join(nse_err_lines), nse_output)
 
             except FileNotFoundError:
                 with lock:
@@ -1946,14 +2051,18 @@ def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
         return
 
     try:
-        host_files = os.listdir(live_hosts_dir)
+        # Only portNN.txt files are per-port host lists; portNN_hostnames.txt is
+        # a derived input file and anything else is not ours.  The "nothing to
+        # scan" message below has to be decided from *this* list, not the raw
+        # listdir: a live_hosts/ holding only _hostnames.txt files (or unrelated
+        # files) is "no open ports found", not "already scanned".
+        port_files = [f for f in os.listdir(live_hosts_dir)
+                      if f.startswith('port') and f.endswith('.txt')
+                      and not f.endswith('_hostnames.txt')]
 
         # Filter out files that have already been scanned (both passes must be done)
         files_to_scan = []
-        for host_file in host_files:
-            if not (host_file.startswith('port') and host_file.endswith('.txt')
-                    and not host_file.endswith('_hostnames.txt')):
-                continue
+        for host_file in port_files:
             dest_port = _fname_port((host_file.split('.')[0])[4:])
             # An nmap killed part-way through leaves a zero-length or truncated
             # portN.xml; require parseable content in both passes so that port is
@@ -1970,7 +2079,7 @@ def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
                 files_to_scan.append(host_file)
 
         if not files_to_scan:
-            if not host_files:
+            if not port_files:
                 print(_COLOR_INFO + 'No open ports found in port discovery — skipping banner scan.' + _COLOR_RESET)
             else:
                 print(_COLOR_INFO + 'All ports have already been scanned.' + _COLOR_RESET)
@@ -4112,7 +4221,7 @@ def _parse_result_xml(path):
     Callers aggregating a whole results directory must skip both instead of
     aborting.
     """
-    if not path.endswith('.xml') or not os.path.isfile(path) or os.path.getsize(path) == 0:
+    if not path.endswith('.xml') or _safe_size(path) == 0:
         return None
     try:
         return etree.parse(path)
@@ -4642,6 +4751,8 @@ def _handle_previous_results(output_path, resume, prompt_fn=input):
 _CONFIG_REQUIRED_KEYS = ('banner_scan', 'target_scan', 'max_rate',
                          'target_file', 'output_path')
 
+_CONFIG_TARGET_SCANS = ('Internal', 'External')
+
 _CONFIG_TRUE_STRINGS = ('true', 'yes', 'on', '1')
 _CONFIG_FALSE_STRINGS = ('false', 'no', 'off', '0', '')
 
@@ -4669,18 +4780,58 @@ def _config_bool(key, value, default):
     return default
 
 
-def _config_int(key, value, default):
+def _config_int(key, value, default, minimum=1):
     """Coerce a config.json integer *value*, warning instead of crashing.
 
     A bare int() raised ValueError on a non-numeric string and TypeError on a
     JSON null, aborting the run before any scanning happened.
+
+    *minimum* mirrors _prompt_int()'s contract, which the interactive path has
+    always enforced while the config path enforced nothing.  A too-small value
+    is clamped rather than rejected, because the failures it produced all
+    surfaced *after* discovery had already run: nmap_threads=0 starts zero
+    workers and hangs forever in work_queue.join(), masscan_batch_size=0 raises
+    "range() arg 3 must not be zero" out of main() mid-scan, and max_rate=0
+    silently runs masscan at --max-rate 0.
     """
     try:
-        return int(value)
+        parsed = int(value)
     except (TypeError, ValueError):
         print(_COLOR_ERROR + f'Warning: config.json: {key} = {value!r} is not a '
                              f'number; using {default}.' + _COLOR_RESET)
         return default
+    if parsed < minimum:
+        print(_COLOR_ERROR + f'Warning: config.json: {key} = {value!r} is below the '
+                             f'minimum of {minimum}; using {minimum}.' + _COLOR_RESET)
+        return minimum
+    return parsed
+
+
+def _config_target_scan(value):
+    """Normalise config.json's *target_scan* to exactly 'Internal' or 'External'.
+
+    Roughly 25 sites compare target_scan against those two literals, so an
+    unrecognised spelling is not an inert typo: discovery falls into the
+    Internal-ish ``else`` branch, the scan runs and looks completely normal, but
+    every ``target_scan == 'Internal'`` gated check is skipped — SMB security
+    mode, MS17-010, LDAP signing and channel binding, ms-sql-info, the extra SQL
+    port sweep. The operator gets a clean report with ~20 internal checks
+    silently absent, from one lowercase letter. That is the worst failure mode
+    in this tool's threat model, so an unusable value exits rather than warns.
+
+    Case and surrounding whitespace are normalised rather than rejected:
+    "internal" is unambiguous, and accepting it removes the trap outright
+    instead of merely reporting it once the operator hits it.
+    """
+    text = str(value).strip().lower()
+    for valid in _CONFIG_TARGET_SCANS:
+        if text == valid.lower():
+            return valid
+    print(_COLOR_ERROR + f'ERROR: config.json: target_scan = {value!r} is not '
+                         "'Internal' or 'External'." + _COLOR_RESET)
+    print('See config.json.sample for the expected keys, or delete '
+          'config.json to be prompted instead.')
+    sys.exit(1)
 
 
 def _load_config(config_parser, dir_path, resume=False):
@@ -4727,11 +4878,17 @@ def _load_config(config_parser, dir_path, resume=False):
         dest_ports = config_parser['dest_ports']
         scan_type = 'Custom'
     banner_scan = _config_bool('banner_scan', config_parser['banner_scan'], False)
-    target_scan = config_parser['target_scan']
+    target_scan = _config_target_scan(config_parser['target_scan'])
     source_port = ''
     # Coerced to str here because _discover_external_masscan() passes max_rate
-    # straight to Popen(), which rejects an int with a bare TypeError.
-    max_rate = str(config_parser['max_rate'])
+    # straight to Popen(), which rejects an int with a bare TypeError.  It goes
+    # through _config_int() first because it was the one required numeric that
+    # only got str(): a JSON null became the string 'None' and blew up as a raw
+    # ValueError traceback out of int(max_rate) in _discover_internal_masscan(),
+    # and 0 is truthy as '0' so it skipped the re-prompt and scanned at
+    # --max-rate 0.  The fallbacks mirror the interactive prompt's defaults.
+    max_rate = str(_config_int('max_rate', config_parser['max_rate'],
+                               20000 if target_scan == 'External' else 2000))
     target_file = config_parser['target_file']
     output_path = config_parser['output_path']
     # Absent or empty means "no exclusions" — normalize to None so it is
