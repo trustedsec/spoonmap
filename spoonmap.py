@@ -129,6 +129,25 @@ def _count_hosts_in_file(filepath):
     return count
 
 
+def _ip_sort_key(value):
+    """Total-order sort key for a list of IPv4 address strings that never raises.
+
+    The previous inline key, ``tuple(int(o) for o in x.split('.'))``, raises
+    ValueError for anything that is not four decimal octets — a hostname that
+    survived resolution, an IPv6 literal that leaked out of a parser, a
+    truncated line read back from a resume file.  Those sorts run *after* a
+    completed masscan sweep, so a single odd entry discarded the whole sweep
+    with an opaque traceback.  Sorting must not be able to lose scan results.
+
+    IPv4 addresses keep their existing numeric ordering; anything unparseable
+    sorts after them, ordered lexically among itself, and is still written out.
+    """
+    try:
+        return (0, int(ipaddress.IPv4Address(value)), '')
+    except ValueError:
+        return (1, 0, str(value))
+
+
 def _build_discovery_target_file(target_file, exclusions_file, disc):
     """Pre-subtract exclusions from target ranges and write a masscan-ready file.
 
@@ -745,7 +764,7 @@ def _host_discovery(target_file, output_path, max_rate, exclusions_file,
         return None
 
     with open(discovery_file, 'w') as fh:
-        for ip in sorted(live_ips, key=lambda x: tuple(int(o) for o in x.split('.'))):
+        for ip in sorted(live_ips, key=_ip_sort_key):
             fh.write(ip + '\n')
 
     return discovery_file
@@ -1258,7 +1277,7 @@ def _report_suspected_tarpits(suspected, disc):
         return
     tarpit_file = os.path.join(disc, 'suspected_tarpits.txt')
     lines = []
-    for ip in sorted(suspected, key=lambda x: tuple(int(o) for o in x.split('.'))):
+    for ip in sorted(suspected, key=_ip_sort_key):
         open_count, total = suspected[ip]
         lines.append(f'{ip},{open_count},{total}\n')
         print(_COLOR_ERROR
@@ -1457,8 +1476,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         if _combined_ips:
             combined_path = os.path.join(disc, 'live_hosts_combined.txt')
             with open(combined_path, 'w') as fh:
-                for ip in sorted(_combined_ips,
-                                 key=lambda x: tuple(int(o) for o in x.split('.'))):
+                for ip in sorted(_combined_ips, key=_ip_sort_key):
                     fh.write(ip + '\n')
             batch_target = combined_path
             print(_COLOR_INFO

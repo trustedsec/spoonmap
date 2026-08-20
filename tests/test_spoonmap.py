@@ -71,6 +71,7 @@ from spoonmap import (
     preprocess_targets,
     _discovery_wait,
     _internal_host_discovery,
+    _ip_sort_key,
     _merge_host_xml,
     _filter_udp_live_hosts,
     _nmap_port_discovery,
@@ -378,6 +379,34 @@ class TestBuildDiscoveryTargetFile:
         excl.write_text('9.0.0.0/24\n10.0.1.0/24\n')  # before, then in the gap
         result_file, count = _build_discovery_target_file(str(target), str(excl), str(tmp_path))
         assert count == 512  # both target ranges fully preserved
+
+# ── _ip_sort_key ──────────────────────────────────────────────────────────────
+
+class TestIpSortKey:
+    """_ip_sort_key() replaces three inline int(octet) tuple keys that raised
+    ValueError — discarding a completed sweep — on any non-IPv4 string."""
+
+    def test_ipv4_sorts_numerically_not_lexically(self):
+        ips = ['10.0.0.10', '10.0.0.2', '9.255.255.255', '10.0.1.1']
+        assert sorted(ips, key=_ip_sort_key) == [
+            '9.255.255.255', '10.0.0.2', '10.0.0.10', '10.0.1.1']
+
+    def test_matches_previous_octet_tuple_ordering_for_ipv4(self):
+        ips = ['192.168.1.1', '10.0.0.1', '172.16.255.254', '10.0.0.255']
+        legacy = sorted(ips, key=lambda x: tuple(int(o) for o in x.split('.')))
+        assert sorted(ips, key=_ip_sort_key) == legacy
+
+    def test_non_ipv4_entries_sort_last_without_raising(self):
+        mixed = ['host.example.com', '::1', '10.0.0.1']
+        assert sorted(mixed, key=_ip_sort_key) == ['10.0.0.1', '::1', 'host.example.com']
+
+    def test_truncated_and_empty_strings_do_not_raise(self):
+        assert sorted(['10.0.0', '', '10.0.0.1'], key=_ip_sort_key)[0] == '10.0.0.1'
+
+    def test_out_of_range_octet_does_not_raise(self):
+        """'10.0.0.999' parses as four ints but is not a valid address."""
+        assert sorted(['10.0.0.999', '10.0.0.1'], key=_ip_sort_key) == [
+            '10.0.0.1', '10.0.0.999']
 
 
 # ── is_hostname ───────────────────────────────────────────────────────────────
@@ -2932,6 +2961,19 @@ class TestHostDiscoveryBranches:
             _host_discovery(str(target), str(out), '1000', None, scan_type='Internal')
         assert 'pre-filtered to 128 target IPs' in capsys.readouterr().out
 
+    def test_non_ipv4_host_does_not_discard_completed_discovery(self, tmp_path):
+        """The sort runs after the whole sweep finishes, so a ValueError here
+        threw away every discovered host, not just the odd one."""
+        out = tmp_path / 'out'
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.0/24\n')
+        with patch('spoonmap._internal_host_discovery',
+                   return_value={'10.0.0.2', '10.0.0.10', 'fe80::1'}):
+            result = _host_discovery(str(target), str(out), '1000', None, scan_type='Internal')
+        assert result is not None
+        lines = Path(result).read_text().split()
+        assert lines == ['10.0.0.2', '10.0.0.10', 'fe80::1']
+
 
 class TestNmapUdpDiscoveryResumeFreshness:
     def _setup(self, tmp_path):
@@ -3873,6 +3915,24 @@ class TestMassScanProbe:
         # Main batch call must use max_rate (no rate reduction)
         main_batch_call = mock_b.call_args_list[2]
         assert main_batch_call[0][1] == '1000'
+
+    def test_non_ipv4_probe_hit_does_not_abort_the_scan(self, tmp_path):
+        """The combined-target sort runs mid-mass_scan, between the probe and the
+        remaining port batches, so a ValueError killed the run outright."""
+        spoonmap.output_path = str(tmp_path)
+        responses = [
+            {'443': {'10.0.0.10', '10.0.0.2', 'fe80::1'}},  # probe_fast_0 — hit
+            {},                                              # main batch 3306
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)) as mock_b:
+            result = mass_scan('All', ['443', '3306'], '53', '10000',
+                               '/fake/targets.txt', '', batch_size=1)
+
+        assert mock_b.call_count == 2
+        assert 'Hosts Found on Port 443' in result
+        combined = tmp_path / 'discovery' / 'live_hosts_combined.txt'
+        assert combined.read_text().split() == ['10.0.0.2', '10.0.0.10', 'fe80::1']
 
     # ── batch_size > 1 (legacy two-call probe) ───────────────────────────────
 
@@ -7147,6 +7207,15 @@ class TestReportSuspectedTarpits:
         assert '10.0.0.1' in out
         assert '19/20' in out
         assert 'tarpit' in out.lower()
+
+    def test_non_ipv4_host_does_not_crash_the_report(self, tmp_path, capsys):
+        """A tarpit report is written mid-scan; a ValueError in the sort key
+        aborted the scan instead of just mis-ordering one line."""
+        suspected = {'10.0.0.10': (19, 20), '10.0.0.2': (20, 20), 'fe80::1': (18, 20)}
+        _report_suspected_tarpits(suspected, str(tmp_path))
+        lines = (tmp_path / 'suspected_tarpits.txt').read_text().split()
+        assert lines == ['10.0.0.2,20,20', '10.0.0.10,19,20', 'fe80::1,18,20']
+        assert 'fe80::1' in capsys.readouterr().out
 
     def test_empty_suspected_writes_nothing(self, tmp_path, capsys):
         _report_suspected_tarpits({}, str(tmp_path))
