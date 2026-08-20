@@ -839,9 +839,15 @@ def _nmap_host_discovery(target_file, disc, source_port, exclusions_file):
             status = host.find('status')
             if status is None or status.attrib.get('state') != 'up':
                 continue
+            # An <address> with no addr= attribute (truncated -sn output) is not
+            # usable.  Subscripting it raised KeyError, which `except
+            # etree.ParseError` below does not catch, so one malformed element
+            # discarded the live hosts found by the whole sweep.
             addr = host.find('address[@addrtype="ipv4"]')
-            if addr is not None:
-                live_ips.add(addr.attrib['addr'])
+            ip = addr.attrib.get('addr') if addr is not None else None
+            if not ip:
+                continue
+            live_ips.add(ip)
     except etree.ParseError as e:
         print(_COLOR_ERROR + f'Error parsing nmap discovery XML: {e}' + _COLOR_RESET)
 
@@ -1104,10 +1110,14 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
     try:
         root = etree.parse(output_file)
         for host in root.findall('host'):
+            # Skip a <host> whose IPv4 <address> carries no addr= attribute:
+            # subscripting it raised KeyError, which the ParseError guard below
+            # does not catch, losing the whole UDP discovery pass over one
+            # unusable element.
             addr = host.find('address[@addrtype="ipv4"]')
-            if addr is None:
+            ip = addr.attrib.get('addr') if addr is not None else None
+            if not ip:
                 continue
-            ip = addr.attrib['addr']
             for port_elem in host.findall('.//port'):
                 state_elem = port_elem.find('state')
                 if state_elem is not None and state_elem.attrib.get('state') in ('open', 'open|filtered'):
@@ -1263,10 +1273,13 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
     try:
         root = etree.parse(output_file)
         for host in root.findall('host'):
+            # Skip a <host> whose IPv4 <address> carries no addr= attribute.
+            # The KeyError from subscripting escaped the ParseError guard below
+            # and discarded the results for every other host in the sweep.
             addr = host.find('address[@addrtype="ipv4"]')
-            if addr is None:
+            ip = addr.attrib.get('addr') if addr is not None else None
+            if not ip:
                 continue
-            ip = addr.attrib['addr']
             for port_elem in host.findall('.//port'):
                 protocol = port_elem.attrib.get('protocol', 'tcp')
                 portid = port_elem.attrib.get('portid', '')
@@ -2306,7 +2319,18 @@ def _scan_extra_sql_ports(output_path, source_port):
         try:
             root = etree.parse(fpath)
             for host in root.findall('host'):
-                ip = host.findall('address')[0].attrib['addr']
+                # findall('address')[0] raised IndexError on a <host> with no
+                # <address> child, and KeyError on one with no addr=.  Both were
+                # swallowed by the broad guard below, which abandons the rest of
+                # the file — so one unusable host element lost every other SQL
+                # named instance in it.  Prefer the IPv4 address explicitly and
+                # skip the host when there is no usable identifier.
+                addr_elem = host.find("address[@addrtype='ipv4']")
+                if addr_elem is None:
+                    addr_elem = host.find('address')
+                ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
+                if not ip:
+                    continue
                 for script in host.iter('script'):
                     if script.attrib.get('id') != 'ms-sql-info':
                         continue
@@ -2578,10 +2602,14 @@ def _count_unmatched_service_ports(output_path):
         except etree.ParseError:
             continue
         for host in root.findall('host'):
+            # Skip a <host> whose IPv4 <address> has no addr= attribute.  The
+            # KeyError escaped the `except etree.ParseError` above (it wraps only
+            # the parse), aborting the honeypot heuristic for every remaining
+            # result file rather than for the one unusable element.
             addr_elem = host.find("address[@addrtype='ipv4']")
-            if addr_elem is None:
+            ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
+            if not ip:
                 continue
-            ip = addr_elem.attrib['addr']
             for port_elem in host.iter('port'):
                 state_elem = port_elem.find('state')
                 if state_elem is not None and state_elem.attrib.get('state') != 'open':
@@ -4256,10 +4284,14 @@ def _filter_udp_live_hosts(output_path):
             tree = etree.parse(nmap_xml)
             root_elem = tree.getroot()
             for host in root_elem.findall('host'):
+                # Skip a <host> whose IPv4 <address> has no addr= attribute: the
+                # KeyError escaped the ParseError guard below, and the resulting
+                # empty `confirmed` set would then rewrite live_hosts and strip
+                # every genuinely confirmed host from the nmap XML.
                 addr = host.find('address[@addrtype="ipv4"]')
-                if addr is None:
+                ip = addr.attrib.get('addr') if addr is not None else None
+                if not ip:
                     continue
-                ip = addr.attrib['addr']
                 for port_elem in host.findall('.//port'):
                     state_elem = port_elem.find('state')
                     if state_elem is not None and state_elem.attrib.get('state') == 'open':
@@ -4286,8 +4318,12 @@ def _filter_udp_live_hosts(output_path):
         # Atomic: this rewrites a file nmap already finished, so a failure mid-write
         # would otherwise leave truncated XML that breaks aggregation permanently.
         for host in root_elem.findall('host'):
+            # .attrib.get() rather than a bare subscript: this walk sits outside
+            # the parse guard above, so a KeyError here propagated out of
+            # _filter_udp_live_hosts() after live_hosts had already been rewritten,
+            # leaving the run's UDP state half-updated.
             addr = host.find('address[@addrtype="ipv4"]')
-            if addr is None or addr.attrib['addr'] not in confirmed:
+            if addr is None or addr.attrib.get('addr') not in confirmed:
                 root_elem.remove(host)
         _atomic_write(nmap_xml, prologue + etree.tostring(root_elem, encoding='unicode'))
 

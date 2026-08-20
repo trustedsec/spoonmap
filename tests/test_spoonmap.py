@@ -1755,6 +1755,29 @@ class TestCountUnmatchedServicePorts:
         (nmap_results / 'port9999.xml').write_text(xml)
         assert _count_unmatched_service_ports(str(tmp_path)) == {}
 
+    def test_address_without_addr_attribute_skipped_others_kept(self, tmp_path):
+        """attrib['addr'] raised KeyError, which the `except etree.ParseError`
+        around the parse does not catch — aborting the honeypot heuristic for
+        every remaining result file, not just the one unusable element."""
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="9999">'
+            '<state state="open"/>'
+            '<service name="unknown" servicefp="SF-Port9999-TCP:..."/>'
+            '</port></ports></host>'
+            '<host><address addr="10.0.0.8" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="9999">'
+            '<state state="open"/>'
+            '<service name="unknown" servicefp="SF-Port9999-TCP:..."/>'
+            '</port></ports></host>'
+            '</nmaprun>'
+        )
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_unmatched_service_ports(str(tmp_path)) == {'10.0.0.8': 1}
+
 
 class TestGenerateFindingsHoneypot:
     """generate_findings() 'Likely Honeypot / Decoy Host' finding."""
@@ -4839,6 +4862,50 @@ class TestScanExtraSqlPorts:
 
         assert not mock_popen.called
 
+    def test_unusable_address_hosts_skipped_later_instance_still_scanned(self, tmp_path):
+        """findall('address')[0] raised IndexError on a <host> with no <address>,
+        and KeyError on one with no addr=.  The broad guard swallowed both and
+        abandoned the rest of the file, losing every later named instance."""
+        xml = textwrap.dedent("""\
+            <?xml version="1.0"?>
+            <nmaprun>
+              <host>
+                <ports><port protocol="udp" portid="1434"/></ports>
+              </host>
+              <host>
+                <address addrtype="ipv4"/>
+                <ports><port protocol="udp" portid="1434"/></ports>
+              </host>
+              <host>
+                <address addr="192.168.1.10" addrtype="ipv4"/>
+                <ports>
+                  <port protocol="udp" portid="1434">
+                    <script id="ms-sql-info" output="SQL Server Express">
+                      <table key="192.168.1.10\\SQLEXPRESS">
+                        <elem key="TCP port">51234</elem>
+                      </table>
+                    </script>
+                  </port>
+                </ports>
+              </host>
+            </nmaprun>
+        """)
+        nse_dir = tmp_path / 'nse_results'
+        nse_dir.mkdir()
+        (nse_dir / 'portU_1434.xml').write_text(xml)
+
+        with patch('spoonmap.subprocess.Popen') as mock_popen, \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            mock_proc = MagicMock()
+            mock_proc.wait.return_value = 0
+            mock_popen.return_value = mock_proc
+            _scan_extra_sql_ports(str(tmp_path), '88')
+
+        commands = [c[0][0] for c in mock_popen.call_args_list]
+        assert commands, 'the third host\'s named instance must still be scanned'
+        assert all('51234' in cmd for cmd in commands)
+
     def test_malformed_xml_logged_and_skipped(self, tmp_path, capsys):
         nse_dir = tmp_path / 'nse_results'
         nse_dir.mkdir()
@@ -7712,6 +7779,32 @@ class TestNmapUdpDiscovery:
             result = _nmap_udp_discovery('U:500', '/targets.txt', str(tmp_path), '53', '')
         assert result == set()
 
+    def test_address_without_addr_attribute_skipped_others_kept(self, tmp_path):
+        """attrib['addr'] raised KeyError past the ParseError guard, losing the
+        whole UDP discovery pass over one unusable <address>."""
+        (tmp_path / 'discovery' / 'masscan_results').mkdir(parents=True)
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4"/>'
+            '<ports><port protocol="udp" portid="500">'
+            '<state state="open"/></port></ports></host>'
+            '<host><address addr="10.0.0.4" addrtype="ipv4"/>'
+            '<ports><port protocol="udp" portid="500">'
+            '<state state="open"/></port></ports></host>'
+            '</nmaprun>'
+        )
+        spoonmap.output_path = str(tmp_path)
+        with patch('spoonmap.subprocess.Popen') as mock_popen, \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            mock_proc = MagicMock()
+            mock_proc.wait.return_value = 0
+            mock_popen.return_value = mock_proc
+            xml_path = tmp_path / 'discovery' / 'masscan_results' / 'portU_500.xml'
+            xml_path.write_text(xml)
+            result = _nmap_udp_discovery('U:500', '/targets.txt', str(tmp_path), '53', '')
+        assert result == {'10.0.0.4'}
+
     def test_malformed_xml_logged_and_empty_set_returned(self, tmp_path, capsys):
         (tmp_path / 'discovery' / 'masscan_results').mkdir(parents=True)
         spoonmap.output_path = str(tmp_path)
@@ -7995,6 +8088,38 @@ class TestNmapPortDiscovery:
             summary = _nmap_port_discovery(['80'], str(target), '', None, scan_type='Custom')
 
         assert 'Hosts Found' not in summary
+
+    def test_address_without_addr_attribute_skipped_others_kept(self, tmp_path):
+        """attrib['addr'] raised KeyError past the ParseError guard, discarding
+        the results for every other host in the sweep."""
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
+        spoonmap.output_path = str(tmp_path)
+
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="80">'
+            '<state state="open"/></port></ports></host>'
+            '<host><address addr="10.0.0.3" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="80">'
+            '<state state="open"/></port></ports></host>'
+            '</nmaprun>'
+        )
+
+        def fake_popen(cmd, **kwargs):
+            out_idx = cmd.index('-oX') + 1
+            Path(cmd[out_idx]).write_text(xml)
+            return self._make_mock_proc()
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            summary = _nmap_port_discovery(['80'], str(target), '', None, scan_type='Custom')
+
+        assert 'Hosts Found on Port 80: 1' in summary
+        live_file = tmp_path / 'discovery' / 'live_hosts' / 'port80.txt'
+        assert live_file.read_text() == '10.0.0.3\n'
 
     def test_keyboard_interrupt_kills_proc_and_reraises(self, tmp_path):
         target = tmp_path / 'targets.txt'
@@ -8541,6 +8666,40 @@ class TestFilterUdpLiveHosts:
         (live_dir / 'portU_500.txt').write_text('10.0.0.1\n')
         result = _filter_udp_live_hosts(str(tmp_path))
         assert result == {'U:500': 0}
+
+    def test_address_without_addr_attribute_skipped_others_kept(self, tmp_path):
+        """A KeyError from attrib['addr'] escaped both walks.
+
+        In the first walk it escaped `except etree.ParseError`, so `confirmed`
+        never got built; in the XML-rewrite walk it escaped the guard entirely,
+        propagating out after live_hosts had already been rewritten.  Either way
+        a genuinely confirmed host was lost.
+        """
+        nmap_dir = tmp_path / 'nmap_results'
+        live_dir = tmp_path / 'discovery' / 'live_hosts'
+        nmap_dir.mkdir()
+        live_dir.mkdir(parents=True)
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4"/>'
+            '<ports><port protocol="udp" portid="500">'
+            '<state state="open"/></port></ports></host>'
+            '<host><address addr="10.0.0.6" addrtype="ipv4"/>'
+            '<ports><port protocol="udp" portid="500">'
+            '<state state="open"/></port></ports></host>'
+            '</nmaprun>'
+        )
+        (nmap_dir / 'portU_500.xml').write_text(xml)
+        (live_dir / 'portU_500.txt').write_text('10.0.0.6\n')
+
+        result = _filter_udp_live_hosts(str(tmp_path))
+
+        assert result == {'U:500': 1}
+        assert (live_dir / 'portU_500.txt').read_text().strip() == '10.0.0.6'
+        tree = etree.parse(str(nmap_dir / 'portU_500.xml'))
+        hosts = tree.findall('host')
+        assert len(hosts) == 1
+        assert hosts[0].find('address').attrib['addr'] == '10.0.0.6'
 
 
 # ── _discovery_wait ───────────────────────────────────────────────────────────
@@ -9117,6 +9276,34 @@ class TestNmapHostDiscovery:
             ips = _nmap_host_discovery(str(targets), str(disc), '', None)
 
         assert ips == set()
+
+    def test_address_without_addr_attribute_skipped_others_kept(self, tmp_path):
+        """A bare attrib['addr'] raised KeyError, which `except etree.ParseError`
+        does not catch — so one malformed element discarded the whole sweep."""
+        disc = tmp_path / 'discovery'
+        disc.mkdir()
+        targets = tmp_path / 'targets.txt'
+        targets.write_text('10.0.0.1\n')
+
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><status state="up"/><address addrtype="ipv4"/></host>'
+            '<host><status state="up"/>'
+            '<address addr="10.0.0.7" addrtype="ipv4"/></host>'
+            '</nmaprun>'
+        )
+
+        def fake_popen(cmd, **kwargs):
+            out_idx = cmd.index('-oX') + 1
+            Path(cmd[out_idx]).write_text(xml)
+            return self._make_mock_proc()
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            ips = _nmap_host_discovery(str(targets), str(disc), '', None)
+
+        assert ips == {'10.0.0.7'}
 
     def test_nmap_not_found_returns_empty_set(self, tmp_path, capsys):
         disc = tmp_path / 'discovery'
