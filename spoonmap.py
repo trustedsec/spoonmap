@@ -30,6 +30,12 @@ _COLOR_RESULT   = '\x1b[38;5;226m'   # electric yellow — output paths / final 
 _COLOR_ERROR    = '\x1b[38;5;198m'   # hot pink        — errors and warnings
 _COLOR_RESET    = '\x1b[0m'
 
+# Written over a zero-length -oX file after a *successful* masscan run so that
+# "completed, found nothing" is distinguishable on disk from "killed before it
+# wrote anything".  Parses to a tree with zero <host> elements, so it reads as
+# an empty result set everywhere and as usable output to the resume gates.
+_EMPTY_RESULT_XML = '<?xml version="1.0"?>\n<nmaprun></nmaprun>\n'
+
 
 def _raise_fd_limit():
     """Raise RLIMIT_NOFILE to 65535 (or the hard limit, whichever is lower).
@@ -858,7 +864,18 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
             print(_COLOR_ERROR + f'Error output: {stderr_str}' + _COLOR_RESET)
         sys.exit(1)
 
-    if not os.path.exists(output_file) or os.stat(output_file).st_size == 0:
+    # masscan writes nothing at all to -oX when a batch finds no open ports, so
+    # "ran to completion, found nothing" and "was killed before writing" both
+    # look like a zero-length file on disk.  Only the success path gets here (a
+    # non-zero exit sys.exit()s above and an interrupt re-raises), so stamp a
+    # minimal valid document over the empty one: the resume gates can then tell
+    # the two apart and skip an honestly-empty batch instead of redoing it on
+    # every resume.  It parses to zero <host> elements, so every consumer of
+    # this directory behaves exactly as it did for the zero-length file.
+    if os.path.exists(output_file) and os.stat(output_file).st_size == 0:
+        _atomic_write(output_file, _EMPTY_RESULT_XML)
+        return {}
+    if not os.path.exists(output_file):
         return {}
 
     results = {}
@@ -1816,14 +1833,16 @@ def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
                 continue
             dest_port = _fname_port((host_file.split('.')[0])[4:])
             # An nmap killed part-way through leaves a zero-length or truncated
-            # portN.xml; require parseable content so that port is rescanned
-            # instead of being treated as banner-grabbed forever.
+            # portN.xml; require parseable content in both passes so that port is
+            # rescanned instead of being treated as scanned forever.
             banner_done = _resume_cache_usable(
                 f'{output_path}/nmap_results/port{_port_fname(dest_port)}.xml',
                 0, f'port {dest_port} banner scan')
             scripts_exist = _get_scripts_for_port(dest_port, target_scan)
             script_done = (not script_scan or not scripts_exist or
-                           os.path.exists(f'{output_path}/nse_results/port{_port_fname(dest_port)}.xml'))
+                           _resume_cache_usable(
+                               f'{output_path}/nse_results/port{_port_fname(dest_port)}.xml',
+                               0, f'port {dest_port} NSE scan'))
             if not (banner_done and script_done):
                 files_to_scan.append(host_file)
 
@@ -3947,11 +3966,13 @@ def _merge_host_xml(base, other):
 def _parse_result_xml(path):
     """Parse one masscan/nmap result file, returning None if it holds no results.
 
-    A zero-length file is the normal on-disk form of a batch that found nothing:
-    _run_masscan_batch() returns {} for an empty -oX file rather than treating it
-    as an error, so a scan where any batch came up dry leaves empty XML behind.
-    A killed nmap or masscan can likewise leave an unterminated file. Callers
-    aggregating a whole results directory must skip both instead of aborting.
+    A zero-length or unterminated file is what a killed nmap or masscan leaves
+    behind. (An honestly-empty masscan batch is *not* zero length: masscan writes
+    nothing to -oX when it finds nothing, so _run_masscan_batch() stamps
+    _EMPTY_RESULT_XML over the empty file on its success path to keep the two
+    cases distinguishable — see the resume gates in _resume_cache_usable().)
+    Callers aggregating a whole results directory must skip both instead of
+    aborting.
     """
     if not path.endswith('.xml') or not os.path.isfile(path) or os.path.getsize(path) == 0:
         return None

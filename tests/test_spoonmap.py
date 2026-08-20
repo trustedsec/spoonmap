@@ -4300,6 +4300,50 @@ class TestMassScanResume:
         assert self._main_batch_calls(mock_b) == []
         assert 'skipping completed batch' in capsys.readouterr().out
 
+    def test_completed_but_empty_batch_skipped_on_resume(self, tmp_path, capsys):
+        """End-to-end: a batch that ran and found nothing must stay skipped.
+
+        This is the common case on an internal segmentation test — most port
+        batches legitimately find nothing — so if "completed, found nothing"
+        were not representable on disk, every resume would redo every batch.
+        Uses the real _run_masscan_batch() so the placeholder it writes is what
+        the second pass's resume gate actually reads.
+        """
+        spoonmap.output_path = str(tmp_path)
+        targets_file = tmp_path / 'discovery' / 'resolved_targets.txt'
+        targets_file.parent.mkdir(parents=True)
+        targets_file.write_text('10.0.0.1\n')
+        os.utime(str(targets_file), (1000, 1000))
+
+        batch_cmds = []
+
+        def fake_popen(cmd, **kwargs):
+            out_path = cmd[cmd.index('-oX') + 1]
+            if '/batch_' in out_path:
+                batch_cmds.append(cmd)
+            Path(out_path).write_text('')  # masscan found no open ports
+            proc = MagicMock()
+            proc.wait.return_value = 0
+            proc.returncode = 0
+            proc.pid = 12345
+            # Finite stderr so _stream_masscan_progress()'s read(1) loop ends.
+            proc.stderr = io.BytesIO(b'')
+            return proc
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            mass_scan('All', ['80', '443'], '53', '10000',
+                      str(targets_file), '', batch_size=10, resume=False)
+            first_pass_batches = len(batch_cmds)
+            batch_cmds.clear()
+            mass_scan('All', ['80', '443'], '53', '10000',
+                      str(targets_file), '', batch_size=10, resume=True)
+
+        assert first_pass_batches >= 1, 'first pass should have run a main batch'
+        assert batch_cmds == [], 'an empty-but-completed batch must not re-run'
+        assert 'skipping completed batch' in capsys.readouterr().out
+
     def test_leftover_live_hosts_file_merged_into_fresh_batch_results(self, tmp_path):
         """A pre-existing live_hosts file for a port (e.g. left over from an
         interrupted prior run) is merged with, not replaced by, this batch's
@@ -5694,6 +5738,45 @@ class TestNmapScan:
         assert 're-running port 80 banner scan' in out
         assert 'already been scanned' not in out
 
+    def _setup_nse_cache(self, tmp_path, nse_xml_text):
+        """Complete banner result plus an NSE result holding *nse_xml_text*."""
+        self._setup_banner_cache(tmp_path, '<nmaprun/>')
+        (Path(tmp_path) / 'nse_results' / 'port80.xml').write_text(nse_xml_text)
+
+    def test_both_passes_complete_skips_port(self, tmp_path, capsys):
+        # Load-bearing direction for the NSE half: valid banner + valid NSE
+        # output must stay skipped under script_scan=True.
+        self._setup_nse_cache(tmp_path, '<nmaprun/>')
+
+        with patch('spoonmap.nmap_worker') as mock_worker, \
+             patch('spoonmap._get_scripts_for_port', return_value='ftp-anon'):
+            nmap_scan('88', max_threads=2, script_scan=True)
+
+        assert not mock_worker.called
+        assert 'already been scanned' in capsys.readouterr().out
+
+    def test_zero_length_nse_xml_is_rescanned(self, tmp_path, capsys):
+        self._setup_nse_cache(tmp_path, '')
+
+        with patch('spoonmap.nmap_worker', side_effect=_fake_worker_drain) as mock_worker, \
+             patch('spoonmap._get_scripts_for_port', return_value='ftp-anon'):
+            nmap_scan('88', max_threads=2, script_scan=True)
+
+        assert mock_worker.called
+        out = capsys.readouterr().out
+        assert 're-running port 80 NSE scan' in out
+        assert 'already been scanned' not in out
+
+    def test_unparseable_nse_xml_is_rescanned(self, tmp_path, capsys):
+        self._setup_nse_cache(tmp_path, '<nmaprun><host>')  # unclosed tags
+
+        with patch('spoonmap.nmap_worker', side_effect=_fake_worker_drain) as mock_worker, \
+             patch('spoonmap._get_scripts_for_port', return_value='ftp-anon'):
+            nmap_scan('88', max_threads=2, script_scan=True)
+
+        assert mock_worker.called
+        assert 're-running port 80 NSE scan' in capsys.readouterr().out
+
     def test_unscanned_ports_dispatched_to_workers(self, tmp_path):
         spoonmap.output_path = str(tmp_path)
         os.makedirs(f'{tmp_path}/discovery/live_hosts')
@@ -6467,11 +6550,22 @@ class TestParseResultXml:
         assert [h.find('address').attrib['addr'] for h in root.findall('host')] == ['10.0.0.1']
 
     def test_empty_file_returns_none(self, tmp_path):
-        # A zero-length -oX file is how masscan records a batch with no open
-        # ports; _run_masscan_batch() returns {} for it rather than erroring.
+        # A zero-length -oX file means the scan died before writing: masscan
+        # writes nothing when it finds nothing, but _run_masscan_batch() stamps
+        # _EMPTY_RESULT_XML over that on its success path, so a file still empty
+        # here was never completed.
         f = tmp_path / 'batch_0.xml'
         f.write_text('')
         assert _parse_result_xml(str(f)) is None
+
+    def test_empty_result_placeholder_parses_to_zero_hosts(self, tmp_path):
+        # The placeholder must be usable output that yields no hosts, so every
+        # consumer behaves as it did for the old zero-length file.
+        f = tmp_path / 'batch_0.xml'
+        f.write_text(spoonmap._EMPTY_RESULT_XML)
+        root = _parse_result_xml(str(f))
+        assert root is not None
+        assert root.findall('host') == []
 
     def test_truncated_file_returns_none(self, tmp_path):
         # A killed nmap leaves the prologue with no closing </nmaprun>.
@@ -6918,6 +7012,84 @@ class TestRunMasscanBatchBehavior:
                                          '/fake/targets.txt', None, None)
 
         assert results == {'445': {'10.0.0.1'}}
+
+    def test_empty_output_after_success_gets_placeholder(self, tmp_path):
+        """A successful batch that found nothing must leave usable empty XML.
+
+        masscan writes nothing to -oX when no port is open, which is
+        indistinguishable on disk from being killed before the first write.
+        Stamping a minimal document lets the resume gates skip an
+        honestly-empty batch instead of redoing it on every resume.
+        """
+        output_xml = tmp_path / 'out.xml'
+
+        def fake_popen(cmd, **kwargs):
+            output_xml.write_text('')  # masscan found nothing
+            return self._make_mock_proc(returncode=0)
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            results = _run_masscan_batch(['445'], '1000', str(output_xml),
+                                         '/fake/targets.txt', None, None)
+
+        assert results == {}
+        # Still reads as "no results" downstream, but now as usable output.
+        assert _parse_result_xml(str(output_xml)).findall('host') == []
+        assert _resume_cache_usable(str(output_xml), 0, 'batch 1/1 (445)') is True
+
+    def test_placeholder_write_leaves_no_temp_file(self, tmp_path):
+        """The placeholder goes through _atomic_write, so no .tmp is left behind."""
+        output_xml = tmp_path / 'out.xml'
+
+        def fake_popen(cmd, **kwargs):
+            output_xml.write_text('')
+            return self._make_mock_proc(returncode=0)
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            _run_masscan_batch(['445'], '1000', str(output_xml),
+                               '/fake/targets.txt', None, None)
+
+        assert [p.name for p in tmp_path.iterdir()] == ['out.xml']
+
+    def test_nonzero_exit_leaves_empty_output_empty(self, tmp_path):
+        """A failed run must NOT be stamped — that would cache the failure."""
+        output_xml = tmp_path / 'out.xml'
+
+        def fake_popen(cmd, **kwargs):
+            output_xml.write_text('')
+            return self._make_mock_proc(returncode=1)
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            with pytest.raises(SystemExit):
+                _run_masscan_batch(['445'], '1000', str(output_xml),
+                                   '/fake/targets.txt', None, None)
+
+        assert output_xml.read_text() == ''
+        assert _resume_cache_usable(str(output_xml), 0, 'batch 1/1 (445)') is False
+
+    def test_interrupt_leaves_empty_output_empty(self, tmp_path):
+        """Same for a Ctrl-C: the batch did not complete, so no placeholder."""
+        output_xml = tmp_path / 'out.xml'
+        output_xml.write_text('')
+
+        def fake_popen(cmd, **kwargs):
+            proc = self._make_mock_proc(returncode=0)
+            proc.wait.side_effect = KeyboardInterrupt
+            return proc
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            with pytest.raises(KeyboardInterrupt):
+                _run_masscan_batch(['445'], '1000', str(output_xml),
+                                   '/fake/targets.txt', None, None)
+
+        assert output_xml.read_text() == ''
 
 
 class TestFlagSuspectedTarpits:
