@@ -1800,6 +1800,16 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 work_queue.task_done()
                 break
 
+            # task_done() must fire exactly once per successful get().  The inner
+            # `finally` below and the outer `except Exception` both called it, so
+            # an exception raised *inside* one of the inner handlers (a failing
+            # print, say) reached the outer handler after the finally had already
+            # run — a second call raises ValueError('task_done() called too many
+            # times') and, worse, over-decrements the queue's unfinished counter,
+            # so work_queue.join() returns as though every port had been scanned.
+            # That turns a visible hang into a silently incomplete scan.
+            task_done_called = False
+
             dest_port = _fname_port((host_file.split('.')[0])[4:])
             output_file = f'{output_path}/nmap_results/port{_port_fname(dest_port)}.xml'
             input_file = f'{_disc(output_path)}/live_hosts/port{_port_fname(dest_port)}.txt'
@@ -1897,12 +1907,20 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 with lock:
                     print(_COLOR_ERROR + f'Error running nmap for port {dest_port}: {e}' + _COLOR_RESET)
             finally:
+                # Flag set before the call so a raising task_done() cannot be
+                # retried by the outer handler either.
+                task_done_called = True
                 work_queue.task_done()
 
         except Exception as e:
-            with lock:
-                print(_COLOR_ERROR + f'Worker thread error: {e}' + _COLOR_RESET)
-            work_queue.task_done()
+            try:
+                with lock:
+                    print(_COLOR_ERROR + f'Worker thread error: {e}' + _COLOR_RESET)
+            finally:
+                # Only for failures before the inner try/finally was entered
+                # (queue item parsing, hostname target file creation).
+                if not task_done_called:
+                    work_queue.task_done()
 
 def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
               script_scan=False, target_scan='Internal'):

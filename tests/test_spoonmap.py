@@ -5677,6 +5677,85 @@ class TestNmapWorker:
 
         assert 'Worker thread error' in capsys.readouterr().out
 
+    def test_exception_inside_inner_handler_calls_task_done_once(self, tmp_path, capsys):
+        """An exception raised *inside* an inner except handler must not double
+        up task_done().
+
+        The inner `finally` and the outer `except Exception` both called it, so
+        this path decremented the queue's unfinished counter twice for a single
+        get().  The second call raises ValueError('task_done() called too many
+        times') and kills the worker while the counter has been over-decremented,
+        so work_queue.join() returns as though every port had been scanned —
+        turning a visible hang into a silently incomplete scan.
+        """
+        class _CountingQueue(Queue):
+            """Records unfinished_tasks after each task_done()."""
+            def __init__(self):
+                super().__init__()
+                self.task_done_calls = 0
+                self.remaining_after = []
+
+            def task_done(self):
+                self.task_done_calls += 1
+                super().task_done()
+                self.remaining_after.append(self.unfinished_tasks)
+
+        class _ExplodingLock:
+            """Raises on the Nth acquisition, to blow up inside a print()."""
+            def __init__(self, fail_on):
+                self.fail_on = fail_on
+                self.calls = 0
+
+            def __enter__(self):
+                self.calls += 1
+                if self.calls == self.fail_on:
+                    raise RuntimeError('print inside handler blew up')
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/nmap_results', exist_ok=True)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts', exist_ok=True)
+        live = Path(tmp_path) / 'discovery' / 'live_hosts'
+        (live / 'port80.txt').write_text('10.0.0.1\n')
+        (live / 'port443.txt').write_text('10.0.0.1\n')
+
+        work_queue = _CountingQueue()
+        work_queue.put('port80.txt')
+        work_queue.put('port443.txt')
+        work_queue.put(None)  # poison pill
+        completed_count = [0]
+        interrupt_event = threading.Event()
+
+        # Acquisition 1: port80's "Grabbing service banners".  Acquisition 2: the
+        # inner `except Exception` handler reporting the Popen failure — that is
+        # the one that must not leave task_done() to the outer handler as well.
+        lock = _ExplodingLock(fail_on=2)
+        popen_calls = []
+
+        def fake_popen(*args, **kwargs):
+            popen_calls.append(args)
+            if len(popen_calls) == 1:
+                raise RuntimeError('boom')
+            return self._make_finished_proc()
+
+        with patch('spoonmap._build_nmap_cmd', return_value=['nmap', 'fake']), \
+             patch('spoonmap._get_scripts_for_port', return_value=''), \
+             patch('spoonmap.subprocess.Popen', side_effect=fake_popen):
+            nmap_worker(work_queue, completed_count, 2, '88', lock,
+                        interrupt_event, None)
+
+        assert work_queue.task_done_calls == 3   # one per get(), no more
+        # Decisive: after port80 finished, port443 and the pill were still
+        # outstanding.  A doubled task_done() would show 1 here, and
+        # work_queue.join() would have returned with port443 unscanned.
+        assert work_queue.remaining_after == [2, 1, 0]
+        assert work_queue.unfinished_tasks == 0
+        out = capsys.readouterr().out
+        assert 'Worker thread error' in out
+
     def test_poison_pill_stops_worker_without_processing(self, tmp_path):
         """A lone poison pill (no work item) exits the loop cleanly."""
         spoonmap.output_path = str(tmp_path)
