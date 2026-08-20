@@ -56,6 +56,8 @@ from spoonmap import (
     _atomic_write,
     _combine_live_hosts,
     _load_config,
+    _read_config_file,
+    _write_artifact,
     _write_combined_results,
     _write_if_changed,
     _write_interactive_config,
@@ -610,6 +612,27 @@ class TestLineCount:
         assert 'Error reading file' in capsys.readouterr().out
 
 
+# ── _write_artifact ───────────────────────────────────────────────────────────
+
+class TestWriteArtifact:
+    """_write_artifact() must never let one unwritable path raise out."""
+
+    def test_writes_content_and_reports_success(self, tmp_path):
+        target = tmp_path / 'artifact.txt'
+        assert _write_artifact(str(target), 'body\n') is True
+        assert target.read_text() == 'body\n'
+
+    def test_os_error_is_reported_not_raised(self, tmp_path, capsys):
+        target = str(tmp_path / 'artifact.txt')
+        with patch('spoonmap._atomic_write',
+                   side_effect=OSError('No space left on device')):
+            assert _write_artifact(target, 'body\n') is False
+        out = capsys.readouterr().out
+        assert 'could not write' in out
+        assert target in out                    # names the path
+        assert 'No space left on device' in out  # names the error
+
+
 # ── _write_findings_txt ───────────────────────────────────────────────────────
 
 SAMPLE_FINDINGS = [
@@ -693,6 +716,14 @@ class TestWriteFindingsTxt:
         content = (tmp_path / 'findings.txt').read_text()
         assert f'--script {spoonmap._DIR}/nse/ldap-signing-check.nse' in content
         assert '--script spoonmap/nse/' not in content  # not the old relative path
+
+    def test_write_failure_is_reported_not_raised(self, tmp_path, capsys):
+        # A read-only output dir must not unwind main() and lose findings.md/.json.
+        with patch('spoonmap._atomic_write', side_effect=OSError('Read-only file system')):
+            _write_findings_txt(str(tmp_path), 'Internal', SAMPLE_FINDINGS)
+        out = capsys.readouterr().out
+        assert 'findings.txt' in out
+        assert 'Read-only file system' in out
 
 
 class TestBuildReproCmd:
@@ -780,6 +811,13 @@ class TestWriteFindingsMd:
         assert '### Weak SSH Auth' in content
         assert content.count('| Host | Port | Detail |') == 2
 
+    def test_write_failure_is_reported_not_raised(self, tmp_path, capsys):
+        with patch('spoonmap._atomic_write', side_effect=OSError('Disk quota exceeded')):
+            _write_findings_md(str(tmp_path), 'Internal', SAMPLE_FINDINGS)
+        out = capsys.readouterr().out
+        assert 'findings.md' in out
+        assert 'Disk quota exceeded' in out
+
 
 # ── _write_findings_json ──────────────────────────────────────────────────────
 
@@ -803,6 +841,35 @@ class TestWriteFindingsJson:
         assert len(data) == len(SAMPLE_FINDINGS)
         for record in data:
             assert set(record.keys()) == {'severity', 'host', 'port', 'title', 'detail'}
+
+    def test_write_failure_is_reported_not_raised(self, tmp_path, capsys):
+        with patch('spoonmap._atomic_write', side_effect=OSError('Stale file handle')):
+            _write_findings_json(str(tmp_path), SAMPLE_FINDINGS)
+        out = capsys.readouterr().out
+        assert 'findings.json' in out
+        assert 'Stale file handle' in out
+
+
+class TestGenerateFindingsWriteFailureIsolation:
+    """One unwritable findings artifact must not cost the other two."""
+
+    def test_txt_failure_still_writes_md_and_json(self, tmp_path, capsys):
+        txt_path = f'{tmp_path}/findings.txt'
+        real_atomic_write = spoonmap._atomic_write
+
+        def fail_txt_only(path, content):
+            if path == txt_path:
+                raise OSError('Read-only file system')
+            return real_atomic_write(path, content)
+
+        with patch('spoonmap._atomic_write', side_effect=fail_txt_only):
+            _write_findings_txt(str(tmp_path), 'Internal', SAMPLE_FINDINGS)
+            _write_findings_md(str(tmp_path), 'Internal', SAMPLE_FINDINGS)
+            _write_findings_json(str(tmp_path), SAMPLE_FINDINGS)
+        assert not (tmp_path / 'findings.txt').exists()
+        assert (tmp_path / 'findings.md').exists()
+        assert (tmp_path / 'findings.json').exists()
+        assert 'findings.txt' in capsys.readouterr().out
 
 
 # ── generate_findings ─────────────────────────────────────────────────────────
@@ -2098,6 +2165,86 @@ class TestLoadConfig:
         assert cfg['max_rate'] == '20000'
         assert cfg['scan_categories'] == ['Web']
 
+    # ---- JSON-native booleans (config.json.sample quotes booleans but not
+    # ints, so operators reasonably write real JSON true/false) --------------
+
+    def test_json_native_true_enables_script_scan(self):
+        # Regression: == 'True' made a real JSON `true` evaluate to False, so
+        # "script_scan": true silently ran no script scan and warned nobody.
+        assert _load_config(_config_dict(script_scan=True), '/t')['script_scan'] is True
+
+    def test_json_native_false_disables_script_scan(self):
+        assert _load_config(_config_dict(script_scan=False), '/t')['script_scan'] is False
+
+    def test_json_native_true_enables_banner_scan(self):
+        assert _load_config(_config_dict(banner_scan=True), '/t')['banner_scan'] is True
+
+    def test_json_native_false_disables_host_discovery(self):
+        cfg = _load_config(_config_dict(host_discovery=False), '/t')
+        assert cfg['host_discovery'] is False
+
+    def test_json_native_false_resume_does_not_raise(self):
+        # .strip() on a bool raised AttributeError before the coercion helper.
+        assert _load_config(_config_dict(resume=False), '/t')['resume'] is False
+
+    def test_json_native_true_resume(self):
+        assert _load_config(_config_dict(resume=True), '/t')['resume'] is True
+
+    def test_legacy_string_resume_still_works(self):
+        assert _load_config(_config_dict(resume='False'), '/t')['resume'] is False
+
+    def test_null_boolean_falls_back_to_default(self):
+        cfg = _load_config(_config_dict(host_discovery=None, script_scan=None), '/t')
+        assert cfg['host_discovery'] is True
+        assert cfg['script_scan'] is False
+
+    def test_unparseable_boolean_warns_and_uses_default(self, capsys):
+        cfg = _load_config(_config_dict(host_discovery='maybe'), '/t')
+        assert cfg['host_discovery'] is True
+        out = capsys.readouterr().out
+        assert 'host_discovery' in out
+        assert 'not a boolean' in out
+
+    # ---- numeric coercion --------------------------------------------------
+
+    def test_max_rate_json_number_coerced_to_str(self):
+        # _discover_external_masscan passes max_rate straight to Popen(), which
+        # rejects an int with a bare TypeError.
+        assert _load_config(_config_dict(max_rate=2000), '/t')['max_rate'] == '2000'
+
+    def test_non_numeric_nmap_threads_warns_and_uses_default(self, capsys):
+        cfg = _load_config(_config_dict(nmap_threads='lots'), '/t')
+        assert cfg['nmap_threads'] == 5
+        out = capsys.readouterr().out
+        assert 'nmap_threads' in out
+        assert 'not a number' in out
+
+    def test_null_masscan_batch_size_warns_and_uses_default(self, capsys):
+        cfg = _load_config(_config_dict(masscan_batch_size=None), '/t')
+        assert cfg['masscan_batch_size'] == 5
+        assert 'masscan_batch_size' in capsys.readouterr().out
+
+    # ---- required-key validation -------------------------------------------
+
+    def test_missing_target_scan_reports_key_and_exits(self, capsys):
+        cfg = _config_dict()
+        del cfg['target_scan']
+        with pytest.raises(SystemExit) as exc:
+            _load_config(cfg, '/t')
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert 'target_scan' in out
+        assert 'missing required key' in out
+
+    def test_every_missing_key_named_in_one_message(self, capsys):
+        # Not one crash at a time: all missing keys in a single message.
+        with pytest.raises(SystemExit):
+            _load_config({'target_scan': 'Internal'}, '/t')
+        out = capsys.readouterr().out
+        for key in ('banner_scan', 'max_rate', 'target_file', 'output_path'):
+            assert key in out
+        assert 'missing required keys' in out
+
 
 # ── Config: Full scan_categories ──────────────────────────────────────────────
 
@@ -2790,6 +2937,55 @@ class TestHandlePreviousResults:
         assert (delete_choice, append_choice) == ('d', 'a')
 
 
+# ── _read_config_file ─────────────────────────────────────────────────────────
+
+class TestReadConfigFile:
+    """config.json is written non-atomically, so a truncated file must not
+    turn both normal startup and --cleanup into identical tracebacks."""
+
+    def test_valid_object_is_returned(self, tmp_path):
+        cfg = tmp_path / 'config.json'
+        cfg.write_text('{"output_path": "/out"}')
+        assert _read_config_file(str(cfg)) == {'output_path': '/out'}
+
+    def test_malformed_json_reports_path_and_exits(self, tmp_path, capsys):
+        cfg = tmp_path / 'config.json'
+        cfg.write_text('{"output_path": "/out",}')  # trailing comma
+        with pytest.raises(SystemExit) as exc:
+            _read_config_file(str(cfg))
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert 'could not parse' in out
+        assert str(cfg) in out
+
+    def test_empty_file_reports_path_and_exits(self, tmp_path, capsys):
+        cfg = tmp_path / 'config.json'
+        cfg.write_text('')
+        with pytest.raises(SystemExit) as exc:
+            _read_config_file(str(cfg))
+        assert exc.value.code == 1
+        assert 'could not parse' in capsys.readouterr().out
+
+    def test_unreadable_file_reports_path_and_exits(self, tmp_path, capsys):
+        cfg = str(tmp_path / 'config.json')
+        with patch('spoonmap.open', side_effect=PermissionError('Permission denied')):
+            with pytest.raises(SystemExit) as exc:
+                _read_config_file(cfg)
+        assert exc.value.code == 1
+        out = capsys.readouterr().out
+        assert 'could not read' in out
+        assert cfg in out
+
+    def test_json_array_rejected_as_not_an_object(self, tmp_path, capsys):
+        # A list has no .get(), so this would be an AttributeError later.
+        cfg = tmp_path / 'config.json'
+        cfg.write_text('[]')
+        with pytest.raises(SystemExit) as exc:
+            _read_config_file(str(cfg))
+        assert exc.value.code == 1
+        assert 'must contain a JSON object' in capsys.readouterr().out
+
+
 # ── _cleanup_cmd ──────────────────────────────────────────────────────────────
 
 class TestCleanupCmd:
@@ -2834,6 +3030,16 @@ class TestCleanupCmd:
                 _cleanup_cmd(str(tmp_path))
         assert exc.value.code == 0
         assert not _previous_results_exist(str(out_dir))
+
+    def test_cleanup_with_malformed_config_reports_error(self, tmp_path, capsys):
+        # --cleanup is the documented recovery command; a truncated config.json
+        # must not make it fail with the same traceback as normal startup.
+        (tmp_path / 'config.json').write_text('{"output_path":')
+        with patch('sys.argv', ['spoonmap.py', '--cleanup']):
+            with pytest.raises(SystemExit) as exc:
+                _cleanup_cmd(str(tmp_path))
+        assert exc.value.code == 1
+        assert 'could not parse' in capsys.readouterr().out
 
     def test_cleanup_no_data_exits_cleanly(self, tmp_path, capsys):
         with patch('sys.argv', ['spoonmap.py', '--cleanup', str(tmp_path)]):
@@ -5980,6 +6186,55 @@ class TestCombineLiveHosts:
         _combine_live_hosts(disc, str(tmp_path))
         assert (tmp_path / 'all_live_hosts.txt').read_text() == ''
 
+    def test_hostname_files_are_excluded(self, tmp_path):
+        # create_hostname_target_file() writes port{N}_hostnames.txt into the
+        # same directory; those hold hostnames, not IPs, so all_live_hosts.txt
+        # used to interleave them and list every resolved host twice.
+        disc = self._make_live_hosts(tmp_path, {
+            'port80.txt': '10.0.0.1\n10.0.0.2\n',
+            'port80_hostnames.txt': 'web1.corp.local\nweb2.corp.local\n',
+        })
+        _combine_live_hosts(disc, str(tmp_path))
+        written = (tmp_path / 'all_live_hosts.txt').read_text()
+        assert sorted(written.split()) == ['10.0.0.1', '10.0.0.2']
+        assert 'web1.corp.local' not in written
+
+    def test_non_port_files_are_ignored(self, tmp_path):
+        disc = self._make_live_hosts(tmp_path, {
+            'port80.txt': '10.0.0.1\n',
+            'notes.md': 'scratch\n',
+        })
+        _combine_live_hosts(disc, str(tmp_path))
+        written = (tmp_path / 'all_live_hosts.txt').read_text()
+        assert sorted(written.split()) == ['10.0.0.1']
+
+    def test_unreadable_entry_does_not_lose_other_ports(self, tmp_path, capsys):
+        # A directory named portNN.txt raises IsADirectoryError on open().
+        disc = self._make_live_hosts(tmp_path, {'port80.txt': '10.0.0.1\n'})
+        (tmp_path / 'discovery' / 'live_hosts' / 'port443.txt').mkdir()
+        _combine_live_hosts(disc, str(tmp_path))
+        written = (tmp_path / 'all_live_hosts.txt').read_text()
+        assert sorted(written.split()) == ['10.0.0.1']
+        assert 'port443.txt' in capsys.readouterr().out
+
+    def test_unlistable_live_hosts_dir_is_reported(self, tmp_path, capsys):
+        disc = self._make_live_hosts(tmp_path, {})
+        with patch('spoonmap.os.listdir',
+                   side_effect=PermissionError('Permission denied')):
+            _combine_live_hosts(disc, str(tmp_path))
+        out = capsys.readouterr().out
+        assert 'could not list' in out
+        assert 'live_hosts' in out
+        assert not (tmp_path / 'all_live_hosts.txt').exists()
+
+    def test_write_failure_is_reported_not_raised(self, tmp_path, capsys):
+        disc = self._make_live_hosts(tmp_path, {'port80.txt': '10.0.0.1\n'})
+        with patch('spoonmap._atomic_write', side_effect=OSError('No space left on device')):
+            _combine_live_hosts(disc, str(tmp_path))
+        out = capsys.readouterr().out
+        assert 'all_live_hosts.txt' in out
+        assert 'No space left on device' in out
+
 
 # ── _write_combined_results ───────────────────────────────────────────────────
 
@@ -6011,6 +6266,45 @@ class TestWriteCombinedResults:
         _write_combined_results(str(tmp_path), [], hosts)
         root = etree.parse(str(tmp_path / 'spoonmap_output.xml')).getroot()
         assert {h.find('address').get('addr') for h in root.findall('host')} == set(hosts)
+
+    def _fail_one(self, tmp_path, failing_name):
+        """side_effect that fails _atomic_write for one artifact only."""
+        failing = f'{tmp_path}/{failing_name}'
+        real_atomic_write = spoonmap._atomic_write
+
+        def side_effect(path, content):
+            if path == failing:
+                raise OSError('No space left on device')
+            return real_atomic_write(path, content)
+        return side_effect
+
+    def test_xml_failure_still_writes_json(self, tmp_path, capsys):
+        # The two expensive artifacts are guarded independently: losing the XML
+        # must not also lose the JSON.
+        with patch('spoonmap._atomic_write',
+                   side_effect=self._fail_one(tmp_path, 'spoonmap_output.xml')):
+            _write_combined_results(str(tmp_path), [{'ip': '10.0.0.1'}], {})
+        assert not (tmp_path / 'spoonmap_output.xml').exists()
+        with open(str(tmp_path / 'spoonmap_output.json')) as fh:
+            assert json.load(fh) == [{'ip': '10.0.0.1'}]
+        out = capsys.readouterr().out
+        assert 'spoonmap_output.xml' in out
+        assert 'No space left on device' in out
+
+    def test_json_failure_still_writes_xml(self, tmp_path, capsys):
+        with patch('spoonmap._atomic_write',
+                   side_effect=self._fail_one(tmp_path, 'spoonmap_output.json')):
+            _write_combined_results(str(tmp_path), [], {})
+        assert (tmp_path / 'spoonmap_output.xml').exists()
+        assert not (tmp_path / 'spoonmap_output.json').exists()
+        assert 'could not write' in capsys.readouterr().out
+
+    def test_both_failures_suppress_success_message(self, tmp_path, capsys):
+        with patch('spoonmap._atomic_write', side_effect=OSError('Read-only file system')):
+            _write_combined_results(str(tmp_path), [], {})
+        out = capsys.readouterr().out
+        assert 'Results written to' not in out
+        assert out.count('could not write') == 2
 
 
 # ── TestRunMasscanBatchWaitMinimum ─────────────────────────────────────────────

@@ -3711,6 +3711,23 @@ def _build_repro_cmd(title, port_str, host):
     return f'nmap {udp_flag}-p {pnum} {flags} {host}'
 
 
+def _write_artifact(path, content):
+    """Write *content* to *path*, downgrading a write failure to a warning.
+
+    Every output artifact goes through here so that one unwritable path (full
+    disk after a large -sV/NSE run, a dropped SMB/NFS mount, a read-only
+    remount, a root-owned file left by a prior sudo run) cannot unwind main()
+    and discard the *rest* of a completed scan's output.  Returns True if the
+    file was written.
+    """
+    try:
+        _atomic_write(path, content)
+        return True
+    except OSError as exc:
+        print(_COLOR_ERROR + f'ERROR: could not write {path}: {exc}' + _COLOR_RESET)
+        return False
+
+
 def _write_findings_txt(output_path, target_scan, findings):
     today = datetime.date.today()
     lines = [
@@ -3782,8 +3799,7 @@ def _write_findings_txt(output_path, target_scan, findings):
             lines.append('')
 
     lines.append(f'Total findings: {len(groups)}')
-    with open(f'{output_path}/findings.txt', 'w') as fh:
-        fh.write('\n'.join(lines) + '\n')
+    _write_artifact(f'{output_path}/findings.txt', '\n'.join(lines) + '\n')
 
 
 def _write_findings_md(output_path, target_scan, findings):
@@ -3812,8 +3828,7 @@ def _write_findings_md(output_path, target_scan, findings):
                 lines.append(f'| `{host}` | {port} | {detail_safe} |')
             lines.append('')
     lines.append(f'**Total findings:** {len(findings)}')
-    with open(f'{output_path}/findings.md', 'w') as fh:
-        fh.write('\n'.join(lines) + '\n')
+    _write_artifact(f'{output_path}/findings.md', '\n'.join(lines) + '\n')
 
 
 def _write_findings_json(output_path, findings):
@@ -3822,8 +3837,7 @@ def _write_findings_json(output_path, findings):
         {'severity': sev, 'host': host, 'port': port, 'title': title, 'detail': detail}
         for sev, host, port, title, detail in findings
     ]
-    with open(f'{output_path}/findings.json', 'w') as fh:
-        json.dump(records, fh, indent=2)
+    _write_artifact(f'{output_path}/findings.json', json.dumps(records, indent=2))
 
 
 def _host_elem_to_dict(host_elem, ip_to_hostname=None):
@@ -3935,21 +3949,37 @@ def _aggregate_result_dir(result_dir, ip_to_hostname):
 
 
 def _combine_live_hosts(disc, output_path):
-    """Write output_path/all_live_hosts.txt from every file in disc/live_hosts.
+    """Write output_path/all_live_hosts.txt from disc/live_hosts/portNN.txt.
 
-    Each per-port live-host file holds newline-terminated IPs; the union is
-    written back out as-is (lines keep their trailing newline), deduplicated
-    across ports.
+    Only port*.txt files are read.  create_hostname_target_file() also writes
+    port{N}_hostnames.txt into this same directory and those hold *hostnames*,
+    not IPs, so reading the directory unfiltered put hostnames into a file
+    documented as a list of live IPs and listed every resolved host twice.
+
+    Each per-port file holds newline-terminated IPs; the union is written back
+    out as-is (lines keep their trailing newline), deduplicated across ports.
     """
     all_ips = set()
-    host_files = os.listdir(f'{disc}/live_hosts')
+    live_dir = f'{disc}/live_hosts'
+    try:
+        host_files = sorted(os.listdir(live_dir))
+    except OSError as exc:
+        print(_COLOR_ERROR + f'ERROR: could not list {live_dir}: {exc}' + _COLOR_RESET)
+        return
     for host_file in host_files:
-        with open(f'{disc}/live_hosts/{host_file}') as input_file:
-            for line in input_file:
-                all_ips.add(line)
-    with open(f'{output_path}/all_live_hosts.txt', 'w') as output_file:
-        for ip in all_ips:
-            output_file.write(ip)
+        if not (host_file.startswith('port') and host_file.endswith('.txt')
+                and not host_file.endswith('_hostnames.txt')):
+            continue
+        host_path = f'{live_dir}/{host_file}'
+        try:
+            with open(host_path) as input_file:
+                for line in input_file:
+                    all_ips.add(line)
+        except OSError as exc:
+            # A directory or an unreadable file in here must not cost us the
+            # IPs from every other port's file.
+            print(_COLOR_ERROR + f'Warning: could not read {host_path}: {exc}' + _COLOR_RESET)
+    _write_artifact(f'{output_path}/all_live_hosts.txt', ''.join(all_ips))
 
 
 def _write_combined_results(output_path, hosts_json, xml_hosts):
@@ -3958,16 +3988,46 @@ def _write_combined_results(output_path, hosts_json, xml_hosts):
     *xml_hosts* / *hosts_json* come from _aggregate_result_dir(); the XML is
     the merged <host> elements wrapped in a minimal <nmaprun> document so the
     result loads in tools that expect nmap output.
+
+    The two writes are guarded independently: these are the two most expensive
+    artifacts to regenerate, so an unwritable .xml must not also cost the .json.
     """
     xml_result = '<?xml version="1.0"?>\n<!-- SpooNMAP -->\n<nmaprun>\n'
     for host_elem in xml_hosts.values():
         xml_result += etree.tostring(host_elem, encoding="unicode", method="xml")
     xml_result += '</nmaprun>'
-    with open(f'{output_path}/spoonmap_output.xml', 'w+') as spoonmap_output:
-        spoonmap_output.write(xml_result)
-    with open(f'{output_path}/spoonmap_output.json', 'w') as f:
-        json.dump(hosts_json, f, indent=2)
-    print(_COLOR_RESULT + f'\nResults written to {output_path}/spoonmap_output.xml / .json' + _COLOR_RESET)
+    wrote_xml = _write_artifact(f'{output_path}/spoonmap_output.xml', xml_result)
+    wrote_json = _write_artifact(f'{output_path}/spoonmap_output.json',
+                                json.dumps(hosts_json, indent=2))
+    if wrote_xml or wrote_json:
+        print(_COLOR_RESULT + f'\nResults written to {output_path}/spoonmap_output.xml / .json' + _COLOR_RESET)
+
+
+def _read_config_file(path):
+    """Parse *path* as a JSON object, or print a clear diagnostic and exit.
+
+    config.json is written non-atomically elsewhere, so an interrupted write can
+    leave it empty or truncated.  An unguarded json.load() then turns *both*
+    normal startup and --cleanup -- the documented recovery command -- into the
+    same raw traceback, which is the worst possible time to lose the error
+    message.  json.JSONDecodeError subclasses ValueError; OSError covers an
+    unreadable or root-owned file.
+    """
+    try:
+        with open(path) as fh:
+            config_parser = json.load(fh)
+    except ValueError as exc:
+        print(_COLOR_ERROR + f'ERROR: could not parse {path}: {exc}' + _COLOR_RESET)
+        print(f'Fix the JSON syntax in {path}, or delete it to be prompted instead.')
+        sys.exit(1)
+    except OSError as exc:
+        print(_COLOR_ERROR + f'ERROR: could not read {path}: {exc}' + _COLOR_RESET)
+        sys.exit(1)
+    if not isinstance(config_parser, dict):
+        print(_COLOR_ERROR + f'ERROR: {path} must contain a JSON object, '
+                             f'got {type(config_parser).__name__}.' + _COLOR_RESET)
+        sys.exit(1)
+    return config_parser
 
 
 def _cleanup_cmd(dir_path):
@@ -3979,8 +4039,7 @@ def _cleanup_cmd(dir_path):
     else:
         cfg_file = os.path.join(dir_path, 'config.json')
         if os.path.exists(cfg_file):
-            with open(cfg_file) as fh:
-                cfg = json.load(fh)
+            cfg = _read_config_file(cfg_file)
             cleanup_path = cfg.get('output_path', '')
             if cleanup_path and not os.path.isabs(cleanup_path):
                 cleanup_path = os.path.join(dir_path, cleanup_path)
@@ -4370,6 +4429,52 @@ def _handle_previous_results(output_path, resume, prompt_fn=input):
     return False, 'a'
 
 
+# config.json keys that have no sane default: without them there is nothing to
+# scan, nowhere to write, and no way to guess what the operator meant.
+_CONFIG_REQUIRED_KEYS = ('banner_scan', 'target_scan', 'max_rate',
+                         'target_file', 'output_path')
+
+_CONFIG_TRUE_STRINGS = ('true', 'yes', 'on', '1')
+_CONFIG_FALSE_STRINGS = ('false', 'no', 'off', '0', '')
+
+
+def _config_bool(key, value, default):
+    """Coerce a config.json boolean-ish *value*, accepting both spellings.
+
+    config.json.sample quotes its booleans ("resume": "False") but leaves
+    integers bare, which invites JSON-native true/false.  The old code compared
+    == 'True', so a real JSON `true` evaluated to False: setting
+    "script_scan": true silently got you no script scan and no warning.  Legacy
+    "True"/"False" strings must keep working, so both forms are accepted here.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in _CONFIG_TRUE_STRINGS:
+        return True
+    if text in _CONFIG_FALSE_STRINGS:
+        return False
+    print(_COLOR_ERROR + f'Warning: config.json: {key} = {value!r} is not a '
+                         f'boolean; using {default}.' + _COLOR_RESET)
+    return default
+
+
+def _config_int(key, value, default):
+    """Coerce a config.json integer *value*, warning instead of crashing.
+
+    A bare int() raised ValueError on a non-numeric string and TypeError on a
+    JSON null, aborting the run before any scanning happened.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        print(_COLOR_ERROR + f'Warning: config.json: {key} = {value!r} is not a '
+                             f'number; using {default}.' + _COLOR_RESET)
+        return default
+
+
 def _load_config(config_parser, dir_path, resume=False):
     """Derive every scan setting from an already-parsed config.json dict.
 
@@ -4379,7 +4484,19 @@ def _load_config(config_parser, dir_path, resume=False):
     into it so the flag can never be turned back off by the file.  Returns the
     derived settings as a dict; the caller assigns 'output_path' to the module
     global of the same name.
+
+    Missing required keys are reported all at once and then exit: reporting them
+    one crash at a time made fixing a hand-written config a guessing game.
     """
+    missing = [k for k in _CONFIG_REQUIRED_KEYS if k not in config_parser]
+    if missing:
+        print(_COLOR_ERROR + 'ERROR: config.json is missing required '
+                             f'{"key" if len(missing) == 1 else "keys"}: '
+                             + ', '.join(missing) + _COLOR_RESET)
+        print('See config.json.sample for the expected keys, or delete '
+              'config.json to be prompted instead.')
+        sys.exit(1)
+
     scan_categories = config_parser.get('scan_categories', 'All')
     if scan_categories == 'All' or scan_categories == ['All']:
         scan_type = 'All'
@@ -4401,25 +4518,27 @@ def _load_config(config_parser, dir_path, resume=False):
     if config_parser.get('dest_ports'):
         dest_ports = config_parser['dest_ports']
         scan_type = 'Custom'
-    banner_scan = config_parser['banner_scan']
-    if banner_scan == 'True':
-        banner_scan = True
-    else:
-        banner_scan = False
+    banner_scan = _config_bool('banner_scan', config_parser['banner_scan'], False)
     target_scan = config_parser['target_scan']
     source_port = ''
-    max_rate = config_parser['max_rate']
+    # Coerced to str here because _discover_external_masscan() passes max_rate
+    # straight to Popen(), which rejects an int with a bare TypeError.
+    max_rate = str(config_parser['max_rate'])
     target_file = config_parser['target_file']
     output_path = config_parser['output_path']
     # Absent or empty means "no exclusions" — normalize to None so it is
     # neither re-prompted nor passed as an empty --excludefile.
     exclusions_file = config_parser.get('exclusions_file') or None
-    nmap_threads = int(config_parser.get('nmap_threads', 5))
-    masscan_batch_size = int(config_parser.get('masscan_batch_size', 5))
-    nmap_threshold = int(config_parser.get('nmap_threshold', 5_000_000))
-    script_scan = config_parser.get('script_scan', 'False') == 'True'
-    host_discovery = config_parser.get('host_discovery', 'True') == 'True'
-    resume = resume or config_parser.get('resume', 'False').strip().lower() == 'true'
+    nmap_threads = _config_int('nmap_threads', config_parser.get('nmap_threads', 5), 5)
+    masscan_batch_size = _config_int(
+        'masscan_batch_size', config_parser.get('masscan_batch_size', 5), 5)
+    nmap_threshold = _config_int(
+        'nmap_threshold', config_parser.get('nmap_threshold', 5_000_000), 5_000_000)
+    script_scan = _config_bool('script_scan', config_parser.get('script_scan'), False)
+    host_discovery = _config_bool(
+        'host_discovery', config_parser.get('host_discovery'), True)
+    # ORed, never overwritten: --resume can't be turned back off by the file.
+    resume = resume or _config_bool('resume', config_parser.get('resume'), False)
     config_generated = bool(config_parser.get(_CONFIG_GENERATED_KEY))
 
     # Resolve relative paths in config relative to the script directory
@@ -4493,8 +4612,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         config_generated = False
         if os.path.exists(f'{dir_path}/config.json'):
             config_loaded = True
-            with open(f'{dir_path}/config.json') as config:
-                config_parser = json.load(config)
+            config_parser = _read_config_file(f'{dir_path}/config.json')
 
             cfg = _load_config(config_parser, dir_path, resume)
             scan_categories    = cfg['scan_categories']
@@ -4918,15 +5036,18 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         # Combine all live hosts into one file
         disc = _disc(output_path)
         if os.path.exists(f'{disc}/live_hosts'):
-            _combine_live_hosts(disc, output_path)
-
-            # Combine all XML results into one file
+            # Combine all XML results into one file.  These two are the
+            # expensive artifacts, so they are written *before* the trivially
+            # regenerable all_live_hosts.txt -- the old order let a failure on
+            # the cheapest artifact abort before either of them was reached.
             if banner_scan or script_scan:
                 result_dir = f'{output_path}/nmap_results/'
             else:
                 result_dir = f'{disc}/masscan_results/'
             hosts_json, xml_hosts = _aggregate_result_dir(result_dir, ip_to_hostname)
             _write_combined_results(output_path, hosts_json, xml_hosts)
+
+            _combine_live_hosts(disc, output_path)
 
             if script_scan:
                 generate_findings(output_path, target_scan, snmp_any_validated=snmp_any_validated)
