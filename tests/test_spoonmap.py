@@ -6177,6 +6177,26 @@ class TestNmapWorker:
         assert work_queue.get.call_count == 2
         assert work_queue.task_done.call_count == 1  # only for the poison pill
 
+    def test_non_empty_exception_from_get_is_reported_not_swallowed(self, tmp_path, capsys):
+        """The handler around the timed get() used to be a bare `except:`, so it
+        caught BaseException: SystemExit, KeyboardInterrupt and any genuine
+        failure inside get() alike all became a silent `continue`. Only
+        queue.Empty is expected there; anything else must reach the worker's own
+        error handler and be printed."""
+        spoonmap.output_path = str(tmp_path)
+        work_queue = MagicMock()
+        # Fails once, then hands over the poison pill so the worker can exit.
+        work_queue.get.side_effect = [RuntimeError('queue is broken'), None]
+        interrupt_event = threading.Event()
+
+        with patch('spoonmap.subprocess.Popen') as mock_popen:
+            nmap_worker(work_queue, [0], 1, '88', threading.Lock(),
+                        interrupt_event, None)
+
+        assert not mock_popen.called
+        assert 'Worker thread error: queue is broken' in capsys.readouterr().out
+        assert work_queue.get.call_count == 2
+
     def test_interrupt_during_nse_scan_kills_nse_process(self, tmp_path):
         """Banner pass completes normally; the NSE pass gets interrupted mid-run."""
         created_procs = []

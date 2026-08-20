@@ -21,6 +21,7 @@ import tempfile
 import termios
 import threading
 import time
+import queue
 from queue import Queue
 import xml.etree.ElementTree as etree
 
@@ -1906,13 +1907,26 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
             if stderr_output.strip():
                 print(_COLOR_ERROR + stderr_output.strip() + _COLOR_RESET)
 
+    # Bound before the loop, not just after each successful get(): the outer
+    # `except Exception` handler below reads it, and once the get() handler stopped
+    # swallowing non-Empty errors, a failure *inside* get() on the very first
+    # iteration reached that handler with the name still unbound — turning a
+    # reportable queue error into an UnboundLocalError from within a finally.
+    task_done_called = False
+
     while not interrupt_event.is_set():
         try:
             # Get work item with timeout to check interrupt_event periodically
             try:
                 host_file = work_queue.get(timeout=0.5)
-            except:
-                # Queue is empty or timeout occurred
+            except queue.Empty:
+                # Nothing queued within the timeout — loop to re-check
+                # interrupt_event.  Narrowed from a bare `except:`, which caught
+                # BaseException: SystemExit and KeyboardInterrupt were swallowed
+                # into `continue`, and so was any genuine error from get(). Not a
+                # live bug (KeyboardInterrupt is not delivered to non-main
+                # threads and shutdown goes through interrupt_event), but a bare
+                # except here could only ever hide something worth seeing.
                 continue
 
             if host_file is None:  # Poison pill to stop worker
