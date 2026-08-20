@@ -1551,6 +1551,20 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         os.makedirs(f'{disc}/live_hosts', exist_ok=True)
         for port_key in probe_ports_used:
             combined = fast_results.get(port_key, set()) | slow_results.get(port_key, set())
+            # Union with the cached per-port file instead of replacing it, exactly
+            # as the batch phase below does ("loading existing data for resume").
+            # The probe has no resume gate, so a resumed run always re-probes —
+            # and it probes probe_target, a narrower set than the batch target,
+            # at a rate whose packet loss varies run to run.  Writing only this
+            # probe's hits therefore deleted every host an earlier run had already
+            # confirmed on this port: out of live_hosts/portN.txt, and so out of
+            # all_live_hosts.txt and out of the nmap banner phase's input file.
+            # Losing a completed scan's output is this tool's worst failure mode,
+            # and it happened silently, with a smaller host count as the only tell.
+            live_host_file = f'{disc}/live_hosts/port{_port_fname(port_key)}.txt'
+            if os.path.exists(live_host_file):
+                with open(live_host_file, 'r') as file:
+                    combined.update(line.strip() for line in file if line.strip())
             if combined:
                 port_ips[port_key] = combined
                 _atomic_write(f'{disc}/live_hosts/port{_port_fname(port_key)}.txt',

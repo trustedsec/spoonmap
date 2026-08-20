@@ -4139,6 +4139,96 @@ class TestMassScanProbe:
         combined = tmp_path / 'discovery' / 'live_hosts_combined.txt'
         assert combined.read_text().split() == ['10.0.0.2', '10.0.0.10', 'fe80::1']
 
+    # ── probe/cache union on resume ──────────────────────────────────────────
+
+    def test_probe_unions_with_cached_live_hosts_file(self, tmp_path):
+        """A re-probe that finds fewer hosts than the cached file must not delete
+        the difference.  The probe has no resume gate, so every resumed run
+        re-probes; it probes the narrower probe_target and its packet loss varies,
+        so returning a subset of the cached hosts is normal.  Overwriting
+        live_hosts/portN.txt with only the probe's hits lost confirmed hosts from
+        all_live_hosts.txt and from the nmap banner phase's input."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.0.0.2\n10.0.0.3\n')
+
+        responses = [
+            {'443': {'10.0.0.2'}},   # probe_fast_0 — hit, but only 1 of the 3
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            result = mass_scan('All', ['443', '3306'], '53', '10000',
+                               '/fake/targets.txt', '', batch_size=1)
+
+        written = (live_hosts / 'port443.txt').read_text().split()
+        assert sorted(written) == ['10.0.0.1', '10.0.0.2', '10.0.0.3']
+        assert 'Hosts Found on Port 443: 3' in result
+
+    def test_probe_only_hosts_added_to_cached_live_hosts_file(self, tmp_path):
+        """The union is in both directions: a host the probe found for the first
+        time is added to the cached file rather than discarded."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n')
+
+        responses = [
+            {'443': {'10.0.0.7'}},   # probe_fast_0 — a host not in the cache
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      '/fake/targets.txt', '', batch_size=1)
+
+        written = (live_hosts / 'port443.txt').read_text().split()
+        assert sorted(written) == ['10.0.0.1', '10.0.0.7']
+
+    def test_probe_miss_does_not_truncate_cached_live_hosts_file(self, tmp_path):
+        """A probe that finds nothing at either rate must leave the cached file
+        alone.  This is the worst version of the bug: an empty probe result set
+        wrote an empty (or absent) port file over a full one."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.0.0.2\n')
+
+        responses = [
+            {},   # probe_fast_0 (443) — miss
+            {},   # probe_slow_0 (443) — miss
+            {},   # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      '/fake/targets.txt', '', batch_size=1)
+
+        written = (live_hosts / 'port443.txt').read_text().split()
+        assert sorted(written) == ['10.0.0.1', '10.0.0.2']
+
+    def test_batch_size_gt1_probe_unions_with_cached_live_hosts_file(self, tmp_path):
+        """The legacy two-call probe path shares the same write loop, so it must
+        union with the cache too."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.0.0.4\n')
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast
+            {'443': {'10.0.0.1'}},   # probe_slow — no new IPs
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '80', '3306'], '53', '10000',
+                      '/fake/targets.txt', '', batch_size=2)
+
+        written = (live_hosts / 'port443.txt').read_text().split()
+        assert sorted(written) == ['10.0.0.1', '10.0.0.4']
+
     # ── batch_size > 1 (legacy two-call probe) ───────────────────────────────
 
     def test_batch5_uses_legacy_two_call_probe(self, tmp_path):
