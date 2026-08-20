@@ -560,6 +560,8 @@ def _tcp_framed(payload: bytes) -> bytes:
 
 @pytest.mark.skipif(not _udp_port_is_free(_OPENVPN_PORT),
                     reason=f'udp port {_OPENVPN_PORT} already in use — stub tests require a free port')
+@pytest.mark.skipif(os.geteuid() != 0,
+                    reason='requires root for -sU raw socket scan')
 class TestOpenvpnDetectNseUdp:
     def test_detects_openvpn_server_v2(self):
         """Stub replies with a P_CONTROL_HARD_RESET_SERVER_V2 -> script confirms OpenVPN over udp."""
