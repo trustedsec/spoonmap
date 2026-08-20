@@ -38,6 +38,7 @@ from spoonmap import (
     _build_nmap_cmd,
     _build_repro_cmd,
     _classify_sql,
+    _config_int,
     _count_hosts_in_file,
     _count_unmatched_service_ports,
     _external_exposure_scripts,
@@ -2553,6 +2554,42 @@ class TestLoadConfig:
         with pytest.raises(SystemExit):
             _load_config(_config_dict(target_scan=None), '/t')
         assert 'target_scan' in capsys.readouterr().out
+
+
+# ── _config_int ───────────────────────────────────────────────────────────────
+
+class TestConfigInt:
+    """_config_int() called directly, for the contract no current call site can
+    reach: every one of the four passes a default at or above its minimum."""
+
+    def test_non_numeric_input_clamps_the_fallback_default(self, capsys):
+        # The whole point of `minimum` is that returning a smaller number breaks
+        # the caller (nmap_threads=0 hangs work_queue.join(); batch_size=0 raises
+        # out of range()). Clamping only the parsed value left the fallback path
+        # able to return exactly the value the clamp exists to prevent.
+        assert _config_int('nmap_threads', 'lots', 0, minimum=1) == 1
+        assert 'nmap_threads' in capsys.readouterr().out
+
+    def test_null_input_clamps_the_fallback_default(self, capsys):
+        assert _config_int('masscan_batch_size', None, -5, minimum=1) == 1
+        assert 'not a number' in capsys.readouterr().out
+
+    def test_warning_reports_the_clamped_value_actually_used(self, capsys):
+        _config_int('nmap_threads', 'lots', 0, minimum=3)
+        # Reporting the raw default would name a value the run never used.
+        assert 'using 3' in capsys.readouterr().out
+
+    def test_default_at_or_above_minimum_is_returned_unchanged(self, capsys):
+        assert _config_int('nmap_threads', 'lots', 5, minimum=1) == 5
+        assert 'using 5' in capsys.readouterr().out
+
+    def test_parsed_value_is_still_clamped(self, capsys):
+        assert _config_int('nmap_threads', 0, 5, minimum=1) == 1
+        assert 'below the minimum' in capsys.readouterr().out
+
+    def test_valid_value_passes_through_without_a_warning(self, capsys):
+        assert _config_int('nmap_threads', '8', 5, minimum=1) == 8
+        assert capsys.readouterr().out == ''
 
 
 # ── Config: Full scan_categories ──────────────────────────────────────────────

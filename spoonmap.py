@@ -4870,13 +4870,21 @@ def _config_int(key, value, default, minimum=1):
     workers and hangs forever in work_queue.join(), masscan_batch_size=0 raises
     "range() arg 3 must not be zero" out of main() mid-scan, and max_rate=0
     silently runs masscan at --max-rate 0.
+
+    *minimum* is applied to *default* as well.  Clamping only the parsed value
+    meant a caller could hand in a default below its own stated minimum and have
+    it returned intact on any non-numeric input — the exact failure this function
+    exists to prevent, reachable through the fallback path instead of the parse
+    path.  All four current call sites pass defaults >= 1, so this is a latent
+    trap for the next one rather than a live bug.
     """
+    minimum_default = max(default, minimum)
     try:
         parsed = int(value)
     except (TypeError, ValueError):
         print(_COLOR_ERROR + f'Warning: config.json: {key} = {value!r} is not a '
-                             f'number; using {default}.' + _COLOR_RESET)
-        return default
+                             f'number; using {minimum_default}.' + _COLOR_RESET)
+        return minimum_default
     if parsed < minimum:
         print(_COLOR_ERROR + f'Warning: config.json: {key} = {value!r} is below the '
                              f'minimum of {minimum}; using {minimum}.' + _COLOR_RESET)
