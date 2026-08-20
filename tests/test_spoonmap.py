@@ -5944,6 +5944,9 @@ class TestNmapPortDiscovery:
         return f'<?xml version="1.0"?><nmaprun>{hosts}</nmaprun>'
 
     def test_resume_reloads_from_live_hosts_dir(self, tmp_path):
+        # targets.txt must be created before portDirect.xml so that
+        # os.path.getmtime(output_file) >= targets_mtime holds and the resume
+        # branch in _nmap_port_discovery() is actually taken.
         target = tmp_path / 'targets.txt'
         target.write_text('10.0.0.1\n')
         disc = tmp_path / 'discovery'
@@ -5961,6 +5964,9 @@ class TestNmapPortDiscovery:
         assert 'Hosts Found on Port 80: 2' in summary
 
     def test_resume_skips_hostnames_file(self, tmp_path):
+        # targets.txt must be created before portDirect.xml so that
+        # os.path.getmtime(output_file) >= targets_mtime holds and the resume
+        # branch in _nmap_port_discovery() is actually taken.
         target = tmp_path / 'targets.txt'
         target.write_text('10.0.0.1\n')
         disc = tmp_path / 'discovery'
