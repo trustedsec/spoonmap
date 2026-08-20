@@ -1077,15 +1077,27 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
             if re.search(r'About\s+[\d.]+%\s+done', line):
                 print(_COLOR_PROGRESS + f'  [nmap] {line}' + _COLOR_RESET, flush=True)
 
+    stderr_lines = []
+
+    def _stderr_reader(stderr_stream):
+        # Must run concurrently with proc.wait(): nmap emits one stderr line per
+        # failed packet send, and if nobody drains the pipe it blocks in write()
+        # once the ~64 KB buffer fills, so wait() would never return.
+        for line in stderr_stream:
+            stderr_lines.append(line)
+
     term_state = save_terminal_state()
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
         _t = threading.Thread(target=_progress_reader, args=(proc.stdout,), daemon=True)
         _t.start()
+        _et = threading.Thread(target=_stderr_reader, args=(proc.stderr,), daemon=True)
+        _et.start()
         proc.wait()
         _t.join()
-        stderr_output = proc.stderr.read()
+        _et.join()
+        stderr_output = ''.join(stderr_lines)
     except KeyboardInterrupt:
         proc.kill()
         proc.wait()

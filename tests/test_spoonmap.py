@@ -6225,8 +6225,9 @@ class TestNmapPortDiscovery:
         mock_proc.wait.return_value = 0
         mock_proc.returncode = returncode
         mock_proc.stdout = stdout_lines or []
-        mock_proc.stderr = MagicMock()
-        mock_proc.stderr.read.return_value = stderr
+        # Iterable (not a bare MagicMock) because _nmap_port_discovery() drains
+        # stderr line by line in a concurrent reader thread.
+        mock_proc.stderr = io.StringIO(stderr)
         return mock_proc
 
     def _xml_with_open_ports(self, *entries):
@@ -6493,6 +6494,78 @@ class TestNmapPortDiscovery:
             _nmap_port_discovery(['80'], str(target), '', None, scan_type='Custom')
 
         assert 'Scan group 1:' in capsys.readouterr().out
+
+    def test_stderr_is_drained_before_wait_returns(self, tmp_path):
+        """Regression (#25): stderr must be drained concurrently with proc.wait().
+
+        Real nmap writes per-packet errors to stderr; once it fills the ~64 KB
+        pipe buffer it blocks in write() and never exits, so a wait() that runs
+        before anything reads stderr never returns. A MagicMock is not a real
+        pipe, so this asserts the structural property instead: wait() does not
+        return until stderr has been touched. With the pre-fix code (read after
+        wait) the call deadlocks and the worker thread is still alive after the
+        bounded join.
+        """
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
+        spoonmap.output_path = str(tmp_path)
+
+        stderr_touched = threading.Event()
+
+        class _WatchedStderr(io.StringIO):
+            """Signals as soon as anything starts consuming the stream."""
+
+            def __iter__(self):
+                stderr_touched.set()
+                return io.StringIO.__iter__(self)
+
+            def read(self, *args, **kwargs):
+                stderr_touched.set()
+                return io.StringIO.read(self, *args, **kwargs)
+
+        mock_proc = self._make_mock_proc()
+        # ~64 KB+ of the errors a restrictive local firewall produces.
+        mock_proc.stderr = _WatchedStderr(
+            'sendto in send_ip_packet_sd: sendto(4, packet, 44, 0, 10.0.0.1, 16)'
+            ' => Operation not permitted\n' * 1000)
+        # Stand-in for the kernel blocking nmap's stderr write(): wait() cannot
+        # complete until a reader has arrived. The 10 s cap is only so a
+        # regression fails the assert below instead of wedging the suite.
+        mock_proc.wait.side_effect = lambda *a, **kw: stderr_touched.wait(timeout=10)
+
+        def _run():
+            with patch('spoonmap.subprocess.Popen', return_value=mock_proc), \
+                 patch('spoonmap.save_terminal_state', return_value=None), \
+                 patch('spoonmap.restore_terminal_state'):
+                _nmap_port_discovery(['80'], str(target), '', None, scan_type='Custom')
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert stderr_touched.is_set()
+
+    def test_multiline_stderr_preserved_for_privilege_hint(self, tmp_path, capsys):
+        """The concurrent drain still yields stderr as one full string."""
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
+        spoonmap.output_path = str(tmp_path)
+        mock_proc = self._make_mock_proc(
+            returncode=1,
+            stderr='sendto failed\nYou requested a scan type which requires'
+                   ' root privileges.\nQUITTING!\n')
+
+        with patch('spoonmap.subprocess.Popen', return_value=mock_proc), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            summary = _nmap_port_discovery(['80'], str(target), '', None, scan_type='Custom')
+
+        assert summary == '\nSummary'
+        out = capsys.readouterr().out
+        assert 'Run as root/sudo' in out
+        assert 'sendto failed' in out
+        assert 'QUITTING!' in out
 
 
 class TestMassScanUdp:
