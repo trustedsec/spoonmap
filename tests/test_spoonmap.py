@@ -4,6 +4,7 @@ import io
 import json
 import os
 import readline
+import subprocess
 import textwrap
 import threading
 from pathlib import Path
@@ -2936,6 +2937,63 @@ class TestValidateSnmpAnyCommunity:
 
         assert validated == {}
         assert not mock_run.called
+
+    def test_timeout_expired_caught_and_warning_printed(self, tmp_path, capsys):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        (nmap_results / 'port161.xml').write_text(self._snmp_brute_xml('10.0.0.10', 5))
+
+        with patch('spoonmap.subprocess.run', side_effect=subprocess.TimeoutExpired(cmd='nmap', timeout=60)):
+            validated = _validate_snmp_any_community(str(tmp_path), 'Internal')
+
+        assert validated == {}
+        output = capsys.readouterr().out
+        assert '10.0.0.10' in output
+        assert 'validation skipped' in output
+
+    def test_file_not_found_error_caught_and_warning_printed(self, tmp_path, capsys):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        (nmap_results / 'port161.xml').write_text(self._snmp_brute_xml('10.0.0.11', 5))
+
+        with patch('spoonmap.subprocess.run', side_effect=FileNotFoundError('nmap not found')):
+            validated = _validate_snmp_any_community(str(tmp_path), 'Internal')
+
+        assert validated == {}
+        output = capsys.readouterr().out
+        assert '10.0.0.11' in output
+        assert 'validation skipped' in output
+
+    def test_timeout_on_first_host_succeeds_on_second(self, tmp_path, capsys):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.12" addrtype="ipv4"/>'
+            '<ports><port protocol="udp" portid="161">'
+            '<script id="snmp-brute" output="a - Valid credentials\nb - Valid credentials'
+            '\nc - Valid credentials\nd - Valid credentials\ne - Valid credentials"/>'
+            '</port></ports></host>'
+            '<host><address addr="10.0.0.13" addrtype="ipv4"/>'
+            '<ports><port protocol="udp" portid="161">'
+            '<script id="snmp-brute" output="a - Valid credentials\nb - Valid credentials'
+            '\nc - Valid credentials\nd - Valid credentials\ne - Valid credentials"/>'
+            '</port></ports></host>'
+            '</nmaprun>'
+        )
+        (nmap_results / 'port161.xml').write_text(xml)
+
+        mock_result = MagicMock()
+        mock_result.stdout = 'Valid credentials'
+        with patch('spoonmap.subprocess.run',
+                   side_effect=[subprocess.TimeoutExpired(cmd='nmap', timeout=60), mock_result]):
+            validated = _validate_snmp_any_community(str(tmp_path), 'Internal')
+
+        assert validated == {'10.0.0.13': True}
+        assert '10.0.0.12' not in validated
+        output = capsys.readouterr().out
+        assert '10.0.0.12' in output
+        assert 'validation skipped' in output
 
 
 # ── SNMP severity and detail tests ───────────────────────────────────────────
