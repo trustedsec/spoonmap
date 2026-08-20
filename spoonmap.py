@@ -3,6 +3,7 @@
 # Author: Spoonman (Larry.Spohn@TrustedSec.com)
 # QA and Personal Pythonian Consultant: Bandrel (Justin.Bollinger@TrustedSec.com)
 
+import bisect
 import collections
 import contextlib
 import datetime
@@ -21,6 +22,7 @@ import tempfile
 import termios
 import threading
 import time
+import queue
 from queue import Queue
 import xml.etree.ElementTree as etree
 
@@ -109,9 +111,19 @@ def _count_hosts_in_file(filepath):
     """Return total IP address count for all entries in a target/exclusions file.
 
     Each line may be a bare IP, a CIDR, or a hostname.
-    CIDRs are expanded to their full address count via ipaddress.
+    IPv4 CIDRs are expanded to their full address count via ipaddress.
     Hostnames count as 1. Blank lines and # comments are skipped.
     Returns None if the file cannot be opened.
+
+    Non-IPv4 entries count as 0, matching _parse_ranges(), which rejects them at
+    parse time because SpooNMAP scans IPv4 only.  ipaddress.ip_network() happily
+    parses IPv6, so counting it at face value meant one ``::/0`` line contributed
+    2**128 hosts.  This count drives the discovery port-list trim against
+    INTERNAL_DISCOVERY_STATE_CEILING and _calc_scan_wait(), so a single stray IPv6
+    line in ranges.txt cut an all-IPv4 scan's port list from 10 ports to 5 and
+    skewed the inter-scan wait — no crash and no lost output, but it silently
+    changed what got scanned.  _parse_ranges() already names the offending line,
+    so no second warning is printed here.
     """
     count = 0
     try:
@@ -121,9 +133,12 @@ def _count_hosts_in_file(filepath):
                 if not line or line.startswith('#'):
                     continue
                 try:
-                    count += ipaddress.ip_network(line, strict=False).num_addresses
+                    net = ipaddress.ip_network(line, strict=False)
                 except ValueError:
                     count += 1   # hostname — resolves to one IP
+                else:
+                    if net.version == 4:
+                        count += net.num_addresses
     except OSError:
         return None
     return count
@@ -148,6 +163,155 @@ def _ip_sort_key(value):
         return (1, 0, str(value))
 
 
+def _parse_target_ranges(filepath):
+    """Parse IPs/CIDRs/ranges from a masscan-style target or exclude file.
+
+    Returns a list of inclusive ``(start_int, end_int)`` IPv4 bounds.
+
+    Handles three formats masscan accepts but ipaddress rejects:
+      - Inline comments:    10.0.0.0/8 # note
+      - Range notation:     10.0.0.1-10.0.0.254
+      - Netmask notation:   10.0.0.0 255.255.0.0
+
+    SpooNMAP is IPv4-only, so an IPv6 entry is reported by file and line
+    number and skipped here.  ipaddress.ip_network() happily parses IPv6, so
+    without this check the bounds were stored and only blew up several hundred
+    lines later, in _build_discovery_target_file()'s summarize_address_range()
+    call, as an AddressValueError for a value >= 2**32 — and only when an
+    exclusions file happened to be configured, since the no-exclusions path
+    returns early.  Naming the offending line beats that traceback.
+
+    Module level rather than nested inside _build_discovery_target_file()
+    because mass_scan() needs the same parse to decide whether a cached
+    live_hosts entry is still inside the operator's current scope.  One parser
+    for "what does this target file actually cover", not two.
+    """
+    ranges = []
+    try:
+        with open(filepath) as fh:
+            for lineno, line in enumerate(fh, 1):
+                # Strip inline comments before parsing
+                line = line.split('#')[0].strip()
+                if not line:
+                    continue
+                # Standard CIDR or bare IP
+                try:
+                    net = ipaddress.ip_network(line, strict=False)
+                except ValueError:
+                    net = None
+                if net is not None:
+                    if net.version != 4:
+                        print(_COLOR_ERROR
+                              + f'Warning: {filepath} line {lineno}: '
+                              + f'ignoring non-IPv4 target "{line}" '
+                              + '— SpooNMAP scans IPv4 only.'
+                              + _COLOR_RESET)
+                        continue
+                    ranges.append((int(net.network_address),
+                                   int(net.broadcast_address)))
+                    continue
+                # Range notation: A.B.C.D-E.F.G.H
+                if '-' in line:
+                    parts = line.split('-', 1)
+                    try:
+                        start = int(ipaddress.IPv4Address(parts[0].strip()))
+                        end   = int(ipaddress.IPv4Address(parts[1].strip()))
+                        if start <= end:
+                            ranges.append((start, end))
+                        continue
+                    except ValueError:
+                        pass
+                # Netmask notation: A.B.C.D M.M.M.M
+                parts = line.split()
+                if len(parts) == 2:
+                    try:
+                        net = ipaddress.ip_network(f'{parts[0]}/{parts[1]}', strict=False)
+                        ranges.append((int(net.network_address),
+                                       int(net.broadcast_address)))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return ranges
+
+
+def _merge_ranges(ranges):
+    """Coalesce overlapping/adjacent ``(start, end)`` bounds, sorted by start."""
+    out = []
+    for s, e in sorted(ranges):
+        if out and s <= out[-1][1] + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], e))
+        else:
+            out.append((s, e))
+    return out
+
+
+def _ip_in_ranges(value, merged_ranges):
+    """Return True if IPv4 string *value* falls inside *merged_ranges*.
+
+    *merged_ranges* must come from _merge_ranges(): disjoint and sorted, so a
+    bisect finds the only range that could contain the address.  Never raises —
+    anything that is not a plain IPv4 address (an unresolved hostname, an IPv6
+    literal, a truncated line read back from a resume file) reads as out of
+    range, so it is excluded rather than crashing the caller.  This gates what
+    gets *scanned*, so failing closed is the only safe direction.
+    """
+    try:
+        addr = int(ipaddress.IPv4Address(value))
+    except ValueError:
+        return False
+    idx = bisect.bisect_right(merged_ranges, (addr, float('inf'))) - 1
+    if idx < 0:
+        return False
+    start, end = merged_ranges[idx]
+    return start <= addr <= end
+
+
+def _report_out_of_scope_retained(port_ips, scope_ranges, target_file,
+                                  examples=3):
+    """Warn about retained hosts that fall outside the current target scope.
+
+    Cached ``live_hosts/portN.txt`` entries are unioned into this run's results
+    and are deliberately never deleted — losing a completed scan's output is this
+    tool's worst failure mode, so a narrowed ``ranges.txt`` does not prune them.
+    But ``all_live_hosts.txt`` and ``spoonmap_output.*`` feed engagement
+    deliverables, and a host outside the current scope sitting in those files is
+    a host the operator may report on or pivot to believing it was authorised for
+    this engagement.  Rules-of-engagement violations start exactly there, and it
+    used to be entirely silent.
+
+    So: disclose, never delete, and never filter what gets written.  This prints
+    and returns the offending set; it mutates nothing.  Anything that is not a
+    plain IPv4 address counts as out of scope, because it cannot be shown to be
+    inside it (see _ip_in_ranges).
+
+    An empty *scope_ranges* means there is no parseable authorisation to compare
+    against, so nothing is claimed either way.
+    """
+    if not scope_ranges:
+        return set()
+    stale = {ip
+             for ips in port_ips.values()
+             for ip in ips
+             if not _ip_in_ranges(ip, scope_ranges)}
+    if not stale:
+        return set()
+    shown = sorted(stale, key=_ip_sort_key)[:examples]
+    remainder = len(stale) - len(shown)
+    sample = ', '.join(shown) + (f' (+{remainder} more)' if remainder else '')
+    print(_COLOR_ERROR
+          + f'Warning: {len(stale)} retained host(s) are OUTSIDE the current '
+            f'target scope and were NOT scanned this run: {sample}. These are '
+            'cached results from an earlier run against a wider scope. '
+            'They are kept in live_hosts/ and all_live_hosts.txt on purpose — '
+            'completed scan results are never deleted — but they are not in '
+            f'{target_file}, and nothing was sent to them this run. Confirm they '
+            'are in scope for this engagement before reporting on or pivoting to '
+            'them.'
+          + _COLOR_RESET)
+    return stale
+
+
 def _build_discovery_target_file(target_file, exclusions_file, disc):
     """Pre-subtract exclusions from target ranges and write a masscan-ready file.
 
@@ -160,79 +324,6 @@ def _build_discovery_target_file(target_file, exclusions_file, disc):
     Returns (filtered_file_path, accurate_host_count).  If no exclusions apply,
     returns (target_file, raw_count) unchanged so callers omit --excludefile.
     """
-    def _parse_ranges(filepath):
-        """Parse IPs/CIDRs/ranges from a masscan-style target or exclude file.
-
-        Handles three formats masscan accepts but ipaddress rejects:
-          - Inline comments:    10.0.0.0/8 # note
-          - Range notation:     10.0.0.1-10.0.0.254
-          - Netmask notation:   10.0.0.0 255.255.0.0
-
-        SpooNMAP is IPv4-only, so an IPv6 entry is reported by file and line
-        number and skipped here.  ipaddress.ip_network() happily parses IPv6, so
-        without this check the bounds were stored and only blew up several
-        hundred lines later, in the summarize_address_range() call below, as an
-        AddressValueError for a value >= 2**32 — and only when an exclusions
-        file happened to be configured, since the no-exclusions path returns
-        early.  Naming the offending line beats that traceback.
-        """
-        ranges = []
-        try:
-            with open(filepath) as fh:
-                for lineno, line in enumerate(fh, 1):
-                    # Strip inline comments before parsing
-                    line = line.split('#')[0].strip()
-                    if not line:
-                        continue
-                    # Standard CIDR or bare IP
-                    try:
-                        net = ipaddress.ip_network(line, strict=False)
-                    except ValueError:
-                        net = None
-                    if net is not None:
-                        if net.version != 4:
-                            print(_COLOR_ERROR
-                                  + f'Warning: {filepath} line {lineno}: '
-                                  + f'ignoring non-IPv4 target "{line}" '
-                                  + '— SpooNMAP scans IPv4 only.'
-                                  + _COLOR_RESET)
-                            continue
-                        ranges.append((int(net.network_address),
-                                       int(net.broadcast_address)))
-                        continue
-                    # Range notation: A.B.C.D-E.F.G.H
-                    if '-' in line:
-                        parts = line.split('-', 1)
-                        try:
-                            start = int(ipaddress.IPv4Address(parts[0].strip()))
-                            end   = int(ipaddress.IPv4Address(parts[1].strip()))
-                            if start <= end:
-                                ranges.append((start, end))
-                            continue
-                        except ValueError:
-                            pass
-                    # Netmask notation: A.B.C.D M.M.M.M
-                    parts = line.split()
-                    if len(parts) == 2:
-                        try:
-                            net = ipaddress.ip_network(f'{parts[0]}/{parts[1]}', strict=False)
-                            ranges.append((int(net.network_address),
-                                           int(net.broadcast_address)))
-                        except ValueError:
-                            pass
-        except OSError:
-            pass
-        return ranges
-
-    def _merge(ranges):
-        out = []
-        for s, e in sorted(ranges):
-            if out and s <= out[-1][1] + 1:
-                out[-1] = (out[-1][0], max(out[-1][1], e))
-            else:
-                out.append((s, e))
-        return out
-
     def _subtract(targets, excls):
         result = []
         ei = 0
@@ -253,7 +344,7 @@ def _build_discovery_target_file(target_file, exclusions_file, disc):
                 result.append((cur, te))
         return result
 
-    target_ranges = _parse_ranges(target_file)
+    target_ranges = _parse_target_ranges(target_file)
     if not target_ranges:
         return target_file, 0
 
@@ -262,11 +353,11 @@ def _build_discovery_target_file(target_file, exclusions_file, disc):
     if not exclusions_file or not os.path.exists(exclusions_file):
         return target_file, raw_count
 
-    excl_ranges = _parse_ranges(exclusions_file)
+    excl_ranges = _parse_target_ranges(exclusions_file)
     if not excl_ranges:
         return target_file, raw_count
 
-    remaining = _subtract(_merge(target_ranges), _merge(excl_ranges))
+    remaining = _subtract(_merge_ranges(target_ranges), _merge_ranges(excl_ranges))
     if not remaining:
         filtered_file = os.path.join(disc, 'discovery_targets_filtered.txt')
         open(filtered_file, 'w').close()
@@ -1171,6 +1262,13 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
     return ips
 
 
+# Upper bound on how long a caller waits for a _start_stderr_reader() thread
+# after the child has been reaped.  Normally the join returns instantly; the
+# timeout only matters when a grandchild inherited the stderr fd and is holding
+# the pipe open, which would otherwise hang the worker for the rest of the scan.
+_STDERR_JOIN_TIMEOUT = 5
+
+
 def _start_stderr_reader(stderr_stream):
     """Drain *stderr_stream* on a daemon thread; return ``(thread, lines)``.
 
@@ -1437,6 +1535,12 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                     if (discovery_file and os.path.exists(discovery_file))
                     else target_file)
 
+    # The operator's current authorised scope, parsed once per call: used both to
+    # decide which cached hosts may be folded into the batch target and to
+    # disclose the ones that are retained but out of scope.  Empty when
+    # target_file is absent or holds nothing parseable, which disables both.
+    scope_ranges = _merge_ranges(_parse_target_ranges(target_file))
+
     # Full port scan: skip adaptive probe, run single masscan over 1-65535
     disc = _disc(output_path)
     if scan_type == 'Full':
@@ -1470,6 +1574,9 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                         status_summary += status_update
                         print(_COLOR_PROGRESS + status_update + _COLOR_RESET)
             _report_suspected_tarpits(_flag_suspected_tarpits(full_results, 65535), disc)
+            # This path's results are read straight back off disk, so it is the
+            # most exposed to a live_hosts/ directory left over from a wider scope.
+            _report_out_of_scope_retained(full_results, scope_ranges, target_file)
             return status_summary
         print(_COLOR_INFO + 'Full port scan: running masscan 1-65535 (no probe)...' + _COLOR_RESET)
         full_results = _run_masscan_batch(['1-65535'], full_scan_rate, output_file,
@@ -1551,6 +1658,20 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         os.makedirs(f'{disc}/live_hosts', exist_ok=True)
         for port_key in probe_ports_used:
             combined = fast_results.get(port_key, set()) | slow_results.get(port_key, set())
+            # Union with the cached per-port file instead of replacing it, exactly
+            # as the batch phase below does ("loading existing data for resume").
+            # The probe has no resume gate, so a resumed run always re-probes —
+            # and it probes probe_target, a narrower set than the batch target,
+            # at a rate whose packet loss varies run to run.  Writing only this
+            # probe's hits therefore deleted every host an earlier run had already
+            # confirmed on this port: out of live_hosts/portN.txt, and so out of
+            # all_live_hosts.txt and out of the nmap banner phase's input file.
+            # Losing a completed scan's output is this tool's worst failure mode,
+            # and it happened silently, with a smaller host count as the only tell.
+            live_host_file = f'{disc}/live_hosts/port{_port_fname(port_key)}.txt'
+            if os.path.exists(live_host_file):
+                with open(live_host_file, 'r') as file:
+                    combined.update(line.strip() for line in file if line.strip())
             if combined:
                 port_ips[port_key] = combined
                 _atomic_write(f'{disc}/live_hosts/port{_port_fname(port_key)}.txt',
@@ -1592,6 +1713,38 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         if discovery_file and os.path.exists(discovery_file):
             with open(discovery_file) as fh:
                 _combined_ips.update(line.strip() for line in fh if line.strip())
+        # Fold in the cached hosts the probe loop just unioned into port_ips, so
+        # the -iL list the remaining batches scan covers every host we retain.
+        # Without this, retaining a cached host (see the probe write loop above)
+        # while leaving it out of the batch target meant it reached
+        # all_live_hosts.txt having been scanned for the probe ports only — output
+        # asserting coverage the scan never performed.  Reachable whenever this
+        # set is not already the whole live population: with host_discovery=False
+        # there is no discovery_file at all, so _combined_ips would otherwise be
+        # nothing but this run's probe hits.
+        #
+        # Filtered against target_file's ranges, never folded in blind.  Nothing
+        # prunes live_hosts/ when ranges.txt narrows — a --resume run deletes no
+        # prior output, and the mtime gate only forces phases to re-run — so a
+        # cached file can still hold hosts from a previous, wider engagement
+        # scope.  Handing those to masscan would scan outside the operator's
+        # current authorisation, which is far worse than under-scanning, so an
+        # out-of-scope cached host keeps its place in live_hosts/portN.txt but
+        # never becomes a target.  An unparseable target file yields no ranges
+        # and folds nothing, which is the pre-existing behaviour.
+        if scope_ranges:
+            _cached_in_scope = {
+                ip
+                for port_key in probe_ports_used
+                for ip in port_ips.get(port_key, ())
+                if ip not in _combined_ips and _ip_in_ranges(ip, scope_ranges)
+            }
+            if _cached_in_scope:
+                _combined_ips.update(_cached_in_scope)
+                print(_COLOR_INFO
+                      + f'Combined target: added {len(_cached_in_scope)} cached '
+                        'host(s) from previous runs (in current scope).'
+                      + _COLOR_RESET)
         if _combined_ips:
             combined_path = os.path.join(disc, 'live_hosts_combined.txt')
             # _atomic_write, not a plain open(): this file is the masscan -iL
@@ -1605,7 +1758,16 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                 _atomic_write(combined_path,
                               ''.join(ip + '\n' for ip in
                                       sorted(_combined_ips, key=_ip_sort_key)))
-            except OSError as e:
+            # `Exception`, not `OSError`: _atomic_write() cleans up and re-raises
+            # whatever it caught, so a non-OSError failure (a TypeError from a
+            # non-str entry that leaked into the set, a rename hook raising
+            # something else) still unwound mass_scan() and lost the whole run's
+            # aggregation — the very outcome the fallback was added to prevent.
+            # Deliberately not BaseException: a KeyboardInterrupt here means the
+            # operator wants the scan stopped, and swallowing it into "carry on
+            # with the full target file" would make Ctrl-C escalate the scan
+            # instead of ending it.
+            except Exception as e:
                 print(_COLOR_ERROR
                       + f'Warning: could not write combined target list ({e}); '
                         'falling back to the full target file for remaining batches.'
@@ -1735,6 +1897,11 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         else:
             print(_COLOR_INFO
                   + f'No hosts found on UDP port {udp_port[2:]}' + _COLOR_RESET)
+
+    # Last, so it covers everything retained — probe ports, batch ports (which
+    # union with their cached files too) and UDP — and so the warning is the final
+    # thing on screen rather than buried above the per-port counts.
+    _report_out_of_scope_retained(port_ips, scope_ranges, target_file)
 
     return status_summary
 
@@ -1879,13 +2046,26 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
             if stderr_output.strip():
                 print(_COLOR_ERROR + stderr_output.strip() + _COLOR_RESET)
 
+    # Bound before the loop, not just after each successful get(): the outer
+    # `except Exception` handler below reads it, and once the get() handler stopped
+    # swallowing non-Empty errors, a failure *inside* get() on the very first
+    # iteration reached that handler with the name still unbound — turning a
+    # reportable queue error into an UnboundLocalError from within a finally.
+    task_done_called = False
+
     while not interrupt_event.is_set():
         try:
             # Get work item with timeout to check interrupt_event periodically
             try:
                 host_file = work_queue.get(timeout=0.5)
-            except:
-                # Queue is empty or timeout occurred
+            except queue.Empty:
+                # Nothing queued within the timeout — loop to re-check
+                # interrupt_event.  Narrowed from a bare `except:`, which caught
+                # BaseException: SystemExit and KeyboardInterrupt were swallowed
+                # into `continue`, and so was any genuine error from get(). Not a
+                # live bug (KeyboardInterrupt is not delivered to non-main
+                # threads and shutdown goes through interrupt_event), but a bare
+                # except here could only ever hide something worth seeing.
                 continue
 
             if host_file is None:  # Poison pill to stop worker
@@ -1945,13 +2125,22 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 while nmap_process.poll() is None and not interrupt_event.is_set():
                     interrupt_event.wait(0.1)
 
+                # Bounded joins.  The child is always reaped first, so the
+                # reader's loop has already ended and these return immediately
+                # in every normal case — but the fd can outlive the child if a
+                # grandchild inherited it (nmap's own helper processes), which
+                # would hold the pipe open and hang this worker forever.  The
+                # thread is a daemon and its accumulated lines are already usable
+                # either way, so waiting is only ever a courtesy.  Do NOT move
+                # the reader's start below the poll loop to "simplify" this: that
+                # reintroduces the pipe-buffer deadlock of issue #25.
                 if interrupt_event.is_set() and nmap_process.poll() is None:
                     nmap_process.kill()
                     nmap_process.wait()
-                    nmap_err_thread.join()
+                    nmap_err_thread.join(timeout=_STDERR_JOIN_TIMEOUT)
                 else:
                     nmap_process.wait()
-                    nmap_err_thread.join()
+                    nmap_err_thread.join(timeout=_STDERR_JOIN_TIMEOUT)
 
                     if interrupt_event.is_set():
                         # Exited on its own during an interrupt — neither a
@@ -1998,7 +2187,8 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                         if interrupt_event.is_set() and nse_process.poll() is None:
                             nse_process.kill()
                         nse_process.wait()
-                        nse_err_thread.join()
+                        # Bounded for the same reason as the banner pass above.
+                        nse_err_thread.join(timeout=_STDERR_JOIN_TIMEOUT)
                         # A killed process also exits non-zero, so only report
                         # when no interrupt is in flight.
                         if nse_process.returncode != 0 and not interrupt_event.is_set():
@@ -2480,11 +2670,13 @@ def _scan_extra_sql_ports(output_path, source_port):
                 # <address> child, and KeyError on one with no addr=.  Both were
                 # swallowed by the broad guard below, which abandons the rest of
                 # the file — so one unusable host element lost every other SQL
-                # named instance in it.  Prefer the IPv4 address explicitly and
-                # skip the host when there is no usable identifier.
+                # named instance in it.  Require the IPv4 address and skip the
+                # host when there is none: the fallback to find('address') that
+                # used to sit here returned a MAC or an IPv6 literal on a
+                # dual-stacked host, and this ip becomes an nmap scan target
+                # below — a MAC address there is an unresolvable target, not a
+                # degraded one.
                 addr_elem = host.find("address[@addrtype='ipv4']")
-                if addr_elem is None:
-                    addr_elem = host.find('address')
                 ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
                 if not ip:
                     continue
@@ -2559,7 +2751,15 @@ def _validate_snmp_any_community(nmap_dir, scan_type):
         except Exception:
             continue
         for host_elem in tree.findall('.//host'):
-            addr = host_elem.find('address')
+            # addrtype="ipv4" filter, as every other parser in this module does.
+            # An unfiltered find('address') returns the first <address> child
+            # whatever its type, and on a dual-stacked or ARP-resolved host that
+            # is routinely the MAC or the IPv6 literal.  This ip is not just a
+            # label — it is handed straight to nmap below as the scan target, so
+            # the "confirm it accepts any community" re-scan aimed at a MAC
+            # address, failed to resolve, and the host was quietly dropped from
+            # validated{} instead of being reported as accepting any community.
+            addr = host_elem.find("address[@addrtype='ipv4']")
             if addr is None:
                 continue
             ip = addr.attrib.get('addr', '')
@@ -4267,8 +4467,14 @@ def _combine_live_hosts(disc, output_path):
     not IPs, so reading the directory unfiltered put hostnames into a file
     documented as a list of live IPs and listed every resolved host twice.
 
-    Each per-port file holds newline-terminated IPs; the union is written back
-    out as-is (lines keep their trailing newline), deduplicated across ports.
+    Each per-port file holds one IP per line; lines are stripped before being
+    added to the set and blanks are dropped, then the union is written back out
+    newline-terminated and in IP order.  Deduplicating the *raw* lines instead
+    meant '10.0.0.1' and '10.0.0.1\\n' were different set members, so a file whose
+    last line had no trailing newline — every internal writer newline-terminates
+    via _atomic_write(), but an operator-supplied or externally generated port
+    file need not — listed that IP twice in a file documented as a deduplicated
+    list.  Sorting also makes the output stable rather than set-iteration order.
     """
     all_ips = set()
     live_dir = f'{disc}/live_hosts'
@@ -4285,12 +4491,15 @@ def _combine_live_hosts(disc, output_path):
         try:
             with open(host_path) as input_file:
                 for line in input_file:
-                    all_ips.add(line)
+                    line = line.strip()
+                    if line:
+                        all_ips.add(line)
         except OSError as exc:
             # A directory or an unreadable file in here must not cost us the
             # IPs from every other port's file.
             print(_COLOR_ERROR + f'Warning: could not read {host_path}: {exc}' + _COLOR_RESET)
-    _write_artifact(f'{output_path}/all_live_hosts.txt', ''.join(all_ips))
+    _write_artifact(f'{output_path}/all_live_hosts.txt',
+                    ''.join(f'{ip}\n' for ip in sorted(all_ips, key=_ip_sort_key)))
 
 
 def _write_combined_results(output_path, hosts_json, xml_hosts):
@@ -4515,8 +4724,17 @@ _CONFIG_DOCS = {
          'Optional: overrides scan_categories with an explicit port list. '
          'Use U: prefix for UDP (e.g. U:53).'),
     ],
+    'masscan_batch_size': [
+        ('__numeric_fields_note__',
+         'masscan_batch_size, max_rate, nmap_threads and nmap_threshold accept a '
+         'JSON number or a quoted number. A non-numeric or null value falls back to '
+         'the default, and a value below the minimum of 1 is raised to 1; both print '
+         'a warning rather than failing mid-scan.'),
+    ],
     'banner_scan': [
-        ('__banner_scan_choices__', 'True, False'),
+        ('__banner_scan_choices__',
+         'true, false (JSON booleans; legacy quoted "True"/"False" '
+         'still accepted)'),
         ('__banner_scan_udp_warning__',
          'WARNING: When scanning UDP ports (U:* prefixed) with banner_scan=False, '
          'hosts will not undergo NSE confirmation. All open|filtered UDP hosts '
@@ -4524,10 +4742,14 @@ _CONFIG_DOCS = {
          'significantly. Enable banner_scan or script_scan when using UDP ports.'),
     ],
     'script_scan': [
-        ('__script_scan_choices__', 'True, False'),
+        ('__script_scan_choices__',
+         'true, false (JSON booleans; legacy quoted "True"/"False" '
+         'still accepted)'),
     ],
     'host_discovery': [
-        ('__host_discovery_choices__', 'True, False'),
+        ('__host_discovery_choices__',
+         'true, false (JSON booleans; legacy quoted "True"/"False" '
+         'still accepted)'),
         ('__host_discovery_note__',
          'When False, no host discovery sweep runs and every target is port-scanned '
          'directly. No source-port override is used in any phase. Independent of this '
@@ -4538,10 +4760,14 @@ _CONFIG_DOCS = {
          '(~60K concurrent entries max).'),
     ],
     'resume': [
-        ('__resume_choices__', 'True, False'),
+        ('__resume_choices__',
+         'true, false (JSON booleans; legacy quoted "True"/"False" '
+         'still accepted)'),
     ],
     'target_scan': [
-        ('__target_scan_choices__', 'External, Internal'),
+        ('__target_scan_choices__',
+         'External, Internal (case-insensitive; any other value stops the run '
+         'rather than scanning with the Internal-only checks silently skipped)'),
     ],
     'max_rate': [
         ('__max_rate_external_recommendation__',
@@ -4579,9 +4805,16 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
     The result round-trips through main()'s config loader: reloading it
     reproduces the same scan without prompting.  A custom port list is stored
     under ``dest_ports``; an All/Full/category selection under
-    ``scan_categories``.  ``resume`` is written as ``"False"`` so a plain
-    re-run still surfaces the delete/append prompt — resuming is opt-in via the
+    ``scan_categories``.  ``resume`` is written as ``false`` so a plain re-run
+    still surfaces the delete/append prompt — resuming is opt-in via the
     ``--resume`` flag.
+
+    Booleans are written as JSON booleans, matching config.json.sample.  They
+    used to be the quoted ``"True"``/``"False"`` strings the sample once used,
+    which meant a generated config disagreed with the documented spelling and
+    with the ``true, false`` its own ``__*_choices__`` notes advertised.  Both
+    spellings still load (see _config_bool), so this is about the two files
+    telling an operator the same thing.
 
     Keys are emitted in ``_CONFIG_FIELD_ORDER`` with their ``_CONFIG_DOCS``
     entries interleaved, so the written file documents its editable fields the
@@ -4590,10 +4823,10 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
     ``scan_categories`` one.
     """
     values = {
-        'banner_scan': 'True' if banner_scan else 'False',
-        'script_scan': 'True' if script_scan else 'False',
-        'host_discovery': 'True' if host_discovery else 'False',
-        'resume': 'False',
+        'banner_scan': bool(banner_scan),
+        'script_scan': bool(script_scan),
+        'host_discovery': bool(host_discovery),
+        'resume': False,
         'target_scan': target_scan,
         'max_rate': str(max_rate),
         'nmap_threads': int(nmap_threads),
@@ -4760,11 +4993,13 @@ _CONFIG_FALSE_STRINGS = ('false', 'no', 'off', '0', '')
 def _config_bool(key, value, default):
     """Coerce a config.json boolean-ish *value*, accepting both spellings.
 
-    config.json.sample quotes its booleans ("resume": "False") but leaves
-    integers bare, which invites JSON-native true/false.  The old code compared
-    == 'True', so a real JSON `true` evaluated to False: setting
-    "script_scan": true silently got you no script scan and no warning.  Legacy
-    "True"/"False" strings must keep working, so both forms are accepted here.
+    config.json.sample used to quote its booleans ("resume": "False") while
+    leaving integers bare, which invited JSON-native true/false.  The old code
+    compared == 'True', so a real JSON `true` evaluated to False: setting
+    "script_scan": true silently got you no script scan and no warning.  The
+    sample and the generated config now both use JSON booleans, but every
+    hand-edited config.json out there still carries the quoted strings, so both
+    forms are accepted here indefinitely.
     """
     if isinstance(value, bool):
         return value
@@ -4793,13 +5028,21 @@ def _config_int(key, value, default, minimum=1):
     workers and hangs forever in work_queue.join(), masscan_batch_size=0 raises
     "range() arg 3 must not be zero" out of main() mid-scan, and max_rate=0
     silently runs masscan at --max-rate 0.
+
+    *minimum* is applied to *default* as well.  Clamping only the parsed value
+    meant a caller could hand in a default below its own stated minimum and have
+    it returned intact on any non-numeric input — the exact failure this function
+    exists to prevent, reachable through the fallback path instead of the parse
+    path.  All four current call sites pass defaults >= 1, so this is a latent
+    trap for the next one rather than a live bug.
     """
+    minimum_default = max(default, minimum)
     try:
         parsed = int(value)
     except (TypeError, ValueError):
         print(_COLOR_ERROR + f'Warning: config.json: {key} = {value!r} is not a '
-                             f'number; using {default}.' + _COLOR_RESET)
-        return default
+                             f'number; using {minimum_default}.' + _COLOR_RESET)
+        return minimum_default
     if parsed < minimum:
         print(_COLOR_ERROR + f'Warning: config.json: {key} = {value!r} is below the '
                              f'minimum of {minimum}; using {minimum}.' + _COLOR_RESET)

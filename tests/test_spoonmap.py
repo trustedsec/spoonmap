@@ -38,6 +38,7 @@ from spoonmap import (
     _build_nmap_cmd,
     _build_repro_cmd,
     _classify_sql,
+    _config_int,
     _count_hosts_in_file,
     _count_unmatched_service_ports,
     _external_exposure_scripts,
@@ -242,6 +243,21 @@ class TestCountHostsInFile:
 
     def test_missing_file_returns_none(self, tmp_path):
         assert _count_hosts_in_file(str(tmp_path / 'nonexistent.txt')) is None
+
+    def test_ipv6_entries_count_as_zero(self, tmp_path):
+        """ipaddress parses IPv6 happily, so ``::/0`` used to contribute 2**128.
+        That count drives the INTERNAL_DISCOVERY_STATE_CEILING port-list trim and
+        _calc_scan_wait(), so one stray v6 line silently halved an all-IPv4
+        scan's port list.  SpooNMAP is IPv4-only; _parse_ranges() already skips
+        these, and this must agree."""
+        f = tmp_path / 'targets.txt'
+        f.write_text('10.0.0.1\n::/0\n2001:db8::1\nfe80::/64\n')
+        assert _count_hosts_in_file(str(f)) == 1
+
+    def test_ipv6_only_file_counts_zero_not_a_huge_number(self, tmp_path):
+        f = tmp_path / 'targets.txt'
+        f.write_text('2001:db8::/32\n')
+        assert _count_hosts_in_file(str(f)) == 0
 
 
 class TestBuildDiscoveryTargetFile:
@@ -2540,6 +2556,42 @@ class TestLoadConfig:
         assert 'target_scan' in capsys.readouterr().out
 
 
+# ── _config_int ───────────────────────────────────────────────────────────────
+
+class TestConfigInt:
+    """_config_int() called directly, for the contract no current call site can
+    reach: every one of the four passes a default at or above its minimum."""
+
+    def test_non_numeric_input_clamps_the_fallback_default(self, capsys):
+        # The whole point of `minimum` is that returning a smaller number breaks
+        # the caller (nmap_threads=0 hangs work_queue.join(); batch_size=0 raises
+        # out of range()). Clamping only the parsed value left the fallback path
+        # able to return exactly the value the clamp exists to prevent.
+        assert _config_int('nmap_threads', 'lots', 0, minimum=1) == 1
+        assert 'nmap_threads' in capsys.readouterr().out
+
+    def test_null_input_clamps_the_fallback_default(self, capsys):
+        assert _config_int('masscan_batch_size', None, -5, minimum=1) == 1
+        assert 'not a number' in capsys.readouterr().out
+
+    def test_warning_reports_the_clamped_value_actually_used(self, capsys):
+        _config_int('nmap_threads', 'lots', 0, minimum=3)
+        # Reporting the raw default would name a value the run never used.
+        assert 'using 3' in capsys.readouterr().out
+
+    def test_default_at_or_above_minimum_is_returned_unchanged(self, capsys):
+        assert _config_int('nmap_threads', 'lots', 5, minimum=1) == 5
+        assert 'using 5' in capsys.readouterr().out
+
+    def test_parsed_value_is_still_clamped(self, capsys):
+        assert _config_int('nmap_threads', 0, 5, minimum=1) == 1
+        assert 'below the minimum' in capsys.readouterr().out
+
+    def test_valid_value_passes_through_without_a_warning(self, capsys):
+        assert _config_int('nmap_threads', '8', 5, minimum=1) == 8
+        assert capsys.readouterr().out == ''
+
+
 # ── Config: Full scan_categories ──────────────────────────────────────────────
 
 class TestConfigFullScanCategory:
@@ -2632,15 +2684,35 @@ class TestBuildInteractiveConfig:
         assert 'scan_categories' not in cfg
         assert self._resolve(cfg) == ('Custom', ['80', '443', 'U:53'])
 
-    def test_booleans_and_rate_serialize_as_strings(self):
+    def test_booleans_serialize_as_json_booleans_and_rate_as_a_string(self):
+        """Booleans match config.json.sample's spelling (and what the generated
+        file's own __*_choices__ notes advertise) rather than the quoted strings
+        the sample used to carry; max_rate stays a string because
+        _discover_external_masscan() hands it straight to Popen()."""
         cfg = _build_interactive_config(
             'All', [], 'All', True, False, 'Internal', 2000,
             'r', 'o', None, 5, 5, 5_000_000, False)
-        assert cfg['banner_scan'] == 'True'
-        assert cfg['script_scan'] == 'False'
-        assert cfg['host_discovery'] == 'False'
+        assert cfg['banner_scan'] is True
+        assert cfg['script_scan'] is False
+        assert cfg['host_discovery'] is False
         assert cfg['max_rate'] == '2000'
-        assert cfg['resume'] == 'False'
+        assert cfg['resume'] is False
+
+    def test_generated_booleans_survive_a_json_round_trip(self, tmp_path):
+        """The generated file is read back by main()'s loader, so the booleans
+        must mean the same thing after json.dump/json.load as they did in the
+        dict — this is the pairing that silently broke when the loader compared
+        == 'True' and an operator wrote a JSON-native true."""
+        cfg = _build_interactive_config(
+            'All', [], 'All', True, True, 'Internal', '2000',
+            '/t/r', '/t/o', None, 5, 5, 5_000_000, False)
+        path = tmp_path / 'config.json'
+        assert _write_interactive_config(str(path), cfg) is True
+        reloaded = _load_config(json.loads(path.read_text()), '/t')
+        assert reloaded['banner_scan'] is True
+        assert reloaded['script_scan'] is True
+        assert reloaded['host_discovery'] is False
+        assert reloaded['resume'] is False
 
     def test_exclusions_none_becomes_empty_string(self):
         cfg = _build_interactive_config(
@@ -3799,6 +3871,53 @@ class TestValidateSnmpAnyCommunity:
         assert '10.0.0.12' in output
         assert 'validation skipped' in output
 
+    def test_mac_address_is_not_used_as_the_scan_target(self, tmp_path):
+        """The unfiltered find('address') took the first <address> child whatever
+        its type.  On an ARP-resolved internal host that is the MAC, and this ip
+        goes straight to nmap as a scan target — so the follow-up probe aimed at
+        a MAC address.  The ipv4 child must win regardless of document order."""
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun><host>'
+            '<address addr="AA:BB:CC:DD:EE:FF" addrtype="mac"/>'
+            '<address addr="10.0.0.21" addrtype="ipv4"/>'
+            '<ports><port protocol="udp" portid="161">'
+            '<script id="snmp-brute" output="a - Valid credentials\nb - Valid credentials'
+            '\nc - Valid credentials\nd - Valid credentials\ne - Valid credentials"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nmap_results / 'port161.xml').write_text(xml)
+
+        mock_result = MagicMock()
+        mock_result.stdout = 'Valid credentials'
+        with patch('spoonmap.subprocess.run', return_value=mock_result) as mock_run:
+            validated = _validate_snmp_any_community(str(tmp_path), 'Internal')
+
+        assert validated == {'10.0.0.21': True}
+        assert mock_run.call_args[0][0][-1] == '10.0.0.21'
+
+    def test_host_with_no_ipv4_address_is_skipped(self, tmp_path):
+        """An IPv6-only <host> has no usable IPv4 target, so it must be skipped
+        rather than handing nmap a v6 literal this IPv4-only tool cannot scan."""
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun><host>'
+            '<address addr="fe80::1" addrtype="ipv6"/>'
+            '<ports><port protocol="udp" portid="161">'
+            '<script id="snmp-brute" output="a - Valid credentials\nb - Valid credentials'
+            '\nc - Valid credentials\nd - Valid credentials\ne - Valid credentials"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nmap_results / 'port161.xml').write_text(xml)
+
+        with patch('spoonmap.subprocess.run') as mock_run:
+            validated = _validate_snmp_any_community(str(tmp_path), 'Internal')
+
+        assert validated == {}
+        assert not mock_run.called
+
 
 # ── SNMP severity and detail tests ───────────────────────────────────────────
 
@@ -4139,6 +4258,309 @@ class TestMassScanProbe:
         combined = tmp_path / 'discovery' / 'live_hosts_combined.txt'
         assert combined.read_text().split() == ['10.0.0.2', '10.0.0.10', 'fe80::1']
 
+    # ── probe/cache union on resume ──────────────────────────────────────────
+
+    def test_probe_unions_with_cached_live_hosts_file(self, tmp_path):
+        """A re-probe that finds fewer hosts than the cached file must not delete
+        the difference.  The probe has no resume gate, so every resumed run
+        re-probes; it probes the narrower probe_target and its packet loss varies,
+        so returning a subset of the cached hosts is normal.  Overwriting
+        live_hosts/portN.txt with only the probe's hits lost confirmed hosts from
+        all_live_hosts.txt and from the nmap banner phase's input."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.0.0.2\n10.0.0.3\n')
+
+        responses = [
+            {'443': {'10.0.0.2'}},   # probe_fast_0 — hit, but only 1 of the 3
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            result = mass_scan('All', ['443', '3306'], '53', '10000',
+                               '/fake/targets.txt', '', batch_size=1)
+
+        written = (live_hosts / 'port443.txt').read_text().split()
+        assert sorted(written) == ['10.0.0.1', '10.0.0.2', '10.0.0.3']
+        assert 'Hosts Found on Port 443: 3' in result
+
+    def test_probe_only_hosts_added_to_cached_live_hosts_file(self, tmp_path):
+        """The union is in both directions: a host the probe found for the first
+        time is added to the cached file rather than discarded."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n')
+
+        responses = [
+            {'443': {'10.0.0.7'}},   # probe_fast_0 — a host not in the cache
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      '/fake/targets.txt', '', batch_size=1)
+
+        written = (live_hosts / 'port443.txt').read_text().split()
+        assert sorted(written) == ['10.0.0.1', '10.0.0.7']
+
+    def test_probe_miss_does_not_truncate_cached_live_hosts_file(self, tmp_path):
+        """A probe that finds nothing at either rate must leave the cached file
+        alone.  This is the worst version of the bug: an empty probe result set
+        wrote an empty (or absent) port file over a full one."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.0.0.2\n')
+
+        responses = [
+            {},   # probe_fast_0 (443) — miss
+            {},   # probe_slow_0 (443) — miss
+            {},   # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      '/fake/targets.txt', '', batch_size=1)
+
+        written = (live_hosts / 'port443.txt').read_text().split()
+        assert sorted(written) == ['10.0.0.1', '10.0.0.2']
+
+    def test_batch_size_gt1_probe_unions_with_cached_live_hosts_file(self, tmp_path):
+        """The legacy two-call probe path shares the same write loop, so it must
+        union with the cache too."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.0.0.4\n')
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast
+            {'443': {'10.0.0.1'}},   # probe_slow — no new IPs
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '80', '3306'], '53', '10000',
+                      '/fake/targets.txt', '', batch_size=2)
+
+        written = (live_hosts / 'port443.txt').read_text().split()
+        assert sorted(written) == ['10.0.0.1', '10.0.0.4']
+
+    # ── cached hosts folded into the combined batch target ───────────────────
+
+    def _write_scope(self, tmp_path, body='10.0.0.0/24\n'):
+        """Write a real target file so target_file defines a parseable scope."""
+        target_file = tmp_path / 'targets.txt'
+        target_file.write_text(body)
+        return str(target_file)
+
+    def test_cached_hosts_are_scanned_by_the_remaining_batches(self, tmp_path):
+        """host_discovery=False resume: with no discovery_file, the combined
+        target used to be this run's probe hits alone, so a cached host was
+        retained in live_hosts/portN.txt (and all_live_hosts.txt) while never
+        being scanned for any remaining port — output claiming coverage the scan
+        never performed."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.0.0.2\n10.0.0.3\n')
+        target_file = self._write_scope(tmp_path)
+
+        responses = [
+            {'443': {'10.0.0.2'}},   # probe_fast_0 — only one of the three
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)) as mock_b:
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      target_file, '', batch_size=1, resume=True)
+
+        combined_path = tmp_path / 'discovery' / 'live_hosts_combined.txt'
+        assert sorted(combined_path.read_text().split()) == [
+            '10.0.0.1', '10.0.0.2', '10.0.0.3']
+        # The remaining-port batch must actually be pointed at that list.
+        assert mock_b.call_args_list[1][0][3] == str(combined_path)
+
+    def test_cached_hosts_outside_current_scope_are_not_scanned(self, tmp_path):
+        """Nothing prunes live_hosts/ when ranges.txt narrows, so a cached file
+        can hold hosts from a previous, wider engagement. Those must never reach
+        masscan as targets — scanning out of scope is worse than under-scanning."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        # Both are leftovers from a previous, wider scope: one sorting above
+        # every current range and one below, which are separate paths through
+        # the bisect in _ip_in_ranges().
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.99.0.7\n9.1.1.1\n')
+        target_file = self._write_scope(tmp_path, '10.0.0.0/24\n')
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      target_file, '', batch_size=1, resume=True)
+
+        combined = (tmp_path / 'discovery' / 'live_hosts_combined.txt').read_text()
+        assert combined.split() == ['10.0.0.1']
+        assert '10.99.0.7' not in combined
+        assert '9.1.1.1' not in combined
+        # They keep their place in the retained host list — this gates scanning,
+        # not keeping.
+        retained = (live_hosts / 'port443.txt').read_text()
+        assert '10.99.0.7' in retained
+        assert '9.1.1.1' in retained
+
+    def test_narrowed_scope_warns_about_retained_out_of_scope_hosts(self, tmp_path, capsys):
+        """A narrowed ranges.txt on a resumed run must *say* that cached hosts
+        outside the new scope are still in the output, and must still write them.
+
+        Both halves matter. all_live_hosts.txt and spoonmap_output.* feed
+        engagement deliverables, so an out-of-scope host sitting there unannounced
+        is one an operator may report on or pivot to believing it was authorised —
+        that is where a rules-of-engagement violation starts. But deleting
+        confirmed results is the failure mode this whole area exists to prevent,
+        so the fix is disclosure, never pruning.
+        """
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        # Four leftovers from a previous /8 engagement, one in the current scope.
+        (live_hosts / 'port443.txt').write_text(
+            '10.0.0.1\n10.99.0.7\n10.99.0.8\n10.99.0.9\n10.99.0.10\n')
+        target_file = self._write_scope(tmp_path, '10.0.0.0/24\n')
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      target_file, '', batch_size=1, resume=True)
+
+        out = capsys.readouterr().out
+        assert '4 retained host(s) are OUTSIDE the current target scope' in out
+        assert 'NOT scanned this run' in out
+        assert '10.99.0.7' in out          # a named example
+        assert '(+1 more)' in out          # 4 found, 3 shown
+
+        # ...and every one of them is still retained, per-port and in the
+        # combined deliverable.
+        retained = (live_hosts / 'port443.txt').read_text().split()
+        assert sorted(retained) == ['10.0.0.1', '10.99.0.10', '10.99.0.7',
+                                    '10.99.0.8', '10.99.0.9']
+        _combine_live_hosts(str(tmp_path / 'discovery'), str(tmp_path))
+        combined_output = (tmp_path / 'all_live_hosts.txt').read_text().split()
+        assert sorted(combined_output) == sorted(retained)
+        # But they were never handed to masscan as targets.
+        batch_target = (tmp_path / 'discovery' / 'live_hosts_combined.txt').read_text()
+        assert batch_target.split() == ['10.0.0.1']
+
+    def test_no_warning_when_every_retained_host_is_in_scope(self, tmp_path, capsys):
+        """The warning must not cry wolf on an ordinary resumed scan."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.0.0.2\n')
+        target_file = self._write_scope(tmp_path, '10.0.0.0/24\n')
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      target_file, '', batch_size=1, resume=True)
+
+        assert 'OUTSIDE the current target scope' not in capsys.readouterr().out
+
+    def test_non_ipv4_cached_entry_is_not_folded_and_does_not_raise(self, tmp_path):
+        """A hostname or IPv6 literal that leaked into a resume file must read as
+        out of scope rather than crash the scope check."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\nfe80::1\nweb1.corp.local\n')
+        target_file = self._write_scope(tmp_path)
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      target_file, '', batch_size=1, resume=True)
+
+        combined = (tmp_path / 'discovery' / 'live_hosts_combined.txt').read_text()
+        assert '10.0.0.1' in combined
+        assert 'fe80::1' not in combined
+        assert 'web1.corp.local' not in combined
+
+    def test_fold_reports_how_many_cached_hosts_were_added(self, tmp_path, capsys):
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.0.0.2\n10.0.0.3\n')
+        target_file = self._write_scope(tmp_path)
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0 — 2 cached hosts are new
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      target_file, '', batch_size=1, resume=True)
+
+        assert 'added 2 cached host(s)' in capsys.readouterr().out
+
+    def test_no_cached_hosts_means_no_fold_message(self, tmp_path, capsys):
+        """Nothing cached beyond the probe's own hits — the combined target is
+        unchanged and the fold stays quiet."""
+        spoonmap.output_path = str(tmp_path)
+        target_file = self._write_scope(tmp_path)
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      target_file, '', batch_size=1)
+
+        out = capsys.readouterr().out
+        assert 'cached host(s)' not in out
+        combined = (tmp_path / 'discovery' / 'live_hosts_combined.txt').read_text()
+        assert combined.split() == ['10.0.0.1']
+
+    def test_unparseable_target_file_folds_nothing(self, tmp_path):
+        """No parseable scope means no way to prove a cached host is in scope, so
+        nothing is folded — the pre-existing behaviour, and the safe direction."""
+        spoonmap.output_path = str(tmp_path)
+        live_hosts = tmp_path / 'discovery' / 'live_hosts'
+        live_hosts.mkdir(parents=True)
+        (live_hosts / 'port443.txt').write_text('10.0.0.1\n10.0.0.9\n')
+
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0
+            {},                       # main batch ['3306']
+        ]
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)):
+            mass_scan('All', ['443', '3306'], '53', '10000',
+                      '/fake/targets.txt', '', batch_size=1, resume=True)
+
+        combined = (tmp_path / 'discovery' / 'live_hosts_combined.txt').read_text()
+        assert combined.split() == ['10.0.0.1']
+
     # ── batch_size > 1 (legacy two-call probe) ───────────────────────────────
 
     def test_batch5_uses_legacy_two_call_probe(self, tmp_path):
@@ -4231,6 +4653,55 @@ class TestMassScanProbe:
         # target_file positional arg of the remaining-port batch call
         assert mock_b.call_args_list[1][0][3] == '/fake/targets.txt'
         assert 'could not write combined target list' in capsys.readouterr().out
+
+    def test_non_oserror_combined_target_write_failure_also_falls_back(self, tmp_path, capsys):
+        """_atomic_write() re-raises whatever it caught after cleaning up, so
+        narrowing this handler to OSError left any other failure unwinding
+        mass_scan() and losing the whole run's aggregation — exactly the outcome
+        the fallback exists to prevent."""
+        spoonmap.output_path = str(tmp_path)
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0 — hit
+            {},                       # main batch ['3306']
+        ]
+        real_atomic_write = spoonmap._atomic_write
+
+        def fail_only_combined(path, content):
+            if path.endswith('live_hosts_combined.txt'):
+                raise RuntimeError('rename hook exploded')
+            return real_atomic_write(path, content)
+
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)) as mock_b, \
+             patch('spoonmap._atomic_write', side_effect=fail_only_combined):
+            result = mass_scan('All', ['443', '3306'], '53', '10000',
+                               '/fake/targets.txt', '', batch_size=1)
+
+        assert 'Hosts Found on Port 443' in result
+        assert mock_b.call_args_list[1][0][3] == '/fake/targets.txt'
+        assert 'could not write combined target list' in capsys.readouterr().out
+
+    def test_keyboardinterrupt_during_combined_target_write_still_propagates(self, tmp_path):
+        """The widened handler must not swallow Ctrl-C: an interrupt here means
+        stop the scan, not carry on against the full (larger) target file."""
+        spoonmap.output_path = str(tmp_path)
+        responses = [
+            {'443': {'10.0.0.1'}},   # probe_fast_0 — hit
+            {},                       # main batch ['3306']
+        ]
+        real_atomic_write = spoonmap._atomic_write
+
+        def interrupt_only_combined(path, content):
+            if path.endswith('live_hosts_combined.txt'):
+                raise KeyboardInterrupt
+            return real_atomic_write(path, content)
+
+        with patch('spoonmap._run_masscan_batch',
+                   side_effect=self._make_batch_side_effect(responses)), \
+             patch('spoonmap._atomic_write', side_effect=interrupt_only_combined):
+            with pytest.raises(KeyboardInterrupt):
+                mass_scan('All', ['443', '3306'], '53', '10000',
+                          '/fake/targets.txt', '', batch_size=1)
 
     # ── scan-type-aware probe port selection ─────────────────────────────────
 
@@ -5033,6 +5504,77 @@ class TestScanExtraSqlPorts:
         commands = [c[0][0] for c in mock_popen.call_args_list]
         assert commands, 'the third host\'s named instance must still be scanned'
         assert all('51234' in cmd for cmd in commands)
+
+    def test_mac_address_is_not_used_as_the_scan_target(self, tmp_path):
+        """ip becomes an nmap scan target, so it must be the IPv4 address and not
+        whichever <address> child came first — an ARP-resolved internal host
+        lists its MAC there, and a MAC is an unresolvable target."""
+        xml = textwrap.dedent("""\
+            <?xml version="1.0"?>
+            <nmaprun>
+              <host>
+                <address addr="AA:BB:CC:DD:EE:FF" addrtype="mac"/>
+                <address addr="192.168.1.10" addrtype="ipv4"/>
+                <ports>
+                  <port protocol="udp" portid="1434">
+                    <script id="ms-sql-info" output="SQL Server Express">
+                      <table key="192.168.1.10\\SQLEXPRESS">
+                        <elem key="TCP port">51234</elem>
+                      </table>
+                    </script>
+                  </port>
+                </ports>
+              </host>
+            </nmaprun>
+        """)
+        nse_dir = tmp_path / 'nse_results'
+        nse_dir.mkdir()
+        (nse_dir / 'portU_1434.xml').write_text(xml)
+
+        with patch('spoonmap.subprocess.Popen') as mock_popen, \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            mock_proc = MagicMock()
+            mock_proc.wait.return_value = 0
+            mock_popen.return_value = mock_proc
+            _scan_extra_sql_ports(str(tmp_path), '88')
+
+        commands = [c[0][0] for c in mock_popen.call_args_list]
+        assert commands
+        for cmd in commands:
+            assert '192.168.1.10' in cmd
+            assert 'AA:BB:CC:DD:EE:FF' not in cmd
+
+    def test_host_with_only_a_non_ipv4_address_is_skipped(self, tmp_path):
+        """No IPv4 child means no scannable target: skip the host rather than
+        handing nmap an IPv6 literal this IPv4-only tool cannot scan."""
+        xml = textwrap.dedent("""\
+            <?xml version="1.0"?>
+            <nmaprun>
+              <host>
+                <address addr="fe80::1" addrtype="ipv6"/>
+                <ports>
+                  <port protocol="udp" portid="1434">
+                    <script id="ms-sql-info" output="SQL Server Express">
+                      <table key="HOST\\SQLEXPRESS">
+                        <elem key="TCP port">51234</elem>
+                      </table>
+                    </script>
+                  </port>
+                </ports>
+              </host>
+            </nmaprun>
+        """)
+        nse_dir = tmp_path / 'nse_results'
+        nse_dir.mkdir()
+        (nse_dir / 'portU_1434.xml').write_text(xml)
+
+        with patch('spoonmap.subprocess.Popen') as mock_popen, \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            _scan_extra_sql_ports(str(tmp_path), '88')
+
+        assert not mock_popen.called
 
     def test_malformed_xml_logged_and_skipped(self, tmp_path, capsys):
         nse_dir = tmp_path / 'nse_results'
@@ -5954,6 +6496,26 @@ class TestNmapWorker:
         assert work_queue.get.call_count == 2
         assert work_queue.task_done.call_count == 1  # only for the poison pill
 
+    def test_non_empty_exception_from_get_is_reported_not_swallowed(self, tmp_path, capsys):
+        """The handler around the timed get() used to be a bare `except:`, so it
+        caught BaseException: SystemExit, KeyboardInterrupt and any genuine
+        failure inside get() alike all became a silent `continue`. Only
+        queue.Empty is expected there; anything else must reach the worker's own
+        error handler and be printed."""
+        spoonmap.output_path = str(tmp_path)
+        work_queue = MagicMock()
+        # Fails once, then hands over the poison pill so the worker can exit.
+        work_queue.get.side_effect = [RuntimeError('queue is broken'), None]
+        interrupt_event = threading.Event()
+
+        with patch('spoonmap.subprocess.Popen') as mock_popen:
+            nmap_worker(work_queue, [0], 1, '88', threading.Lock(),
+                        interrupt_event, None)
+
+        assert not mock_popen.called
+        assert 'Worker thread error: queue is broken' in capsys.readouterr().out
+        assert work_queue.get.call_count == 2
+
     def test_interrupt_during_nse_scan_kills_nse_process(self, tmp_path):
         """Banner pass completes normally; the NSE pass gets interrupted mid-run."""
         created_procs = []
@@ -6223,6 +6785,61 @@ class TestNmapWorker:
         assert not thread.is_alive()
         assert stderr_touched.is_set()
         assert completed_count[0] == 1
+
+    def test_worker_survives_a_stderr_reader_that_never_finishes(self, tmp_path):
+        """The stderr reader joins are bounded, so an fd held open past the
+        child's exit cannot strand the worker.
+
+        The child is reaped before every join, so the reader has normally already
+        ended — but nmap's own helper processes can inherit the stderr fd, and an
+        inherited write end keeps the read end from ever seeing EOF. An unbounded
+        join() there parks this worker for the rest of the scan while
+        work_queue.join() waits on it. The thread is a daemon and its lines are
+        already collected, so the wait was only ever a courtesy.
+        """
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/nmap_results', exist_ok=True)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts', exist_ok=True)
+        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n')
+
+        release_reader = threading.Event()
+
+        class _NeverClosedStderr:
+            """Models an inherited write end: iteration blocks, never hits EOF."""
+
+            def __iter__(self):
+                release_reader.wait(30)
+                return iter(())
+
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.wait.return_value = 0
+        proc.poll.return_value = 0
+        proc.stderr = _NeverClosedStderr()
+
+        work_queue = Queue()
+        work_queue.put('port80.txt')
+        work_queue.put(None)
+        completed_count = [0]
+        interrupt_event = threading.Event()
+
+        def _run():
+            with patch('spoonmap._build_nmap_cmd', return_value=['nmap', 'fake']), \
+                 patch('spoonmap._get_scripts_for_port', return_value=''), \
+                 patch('spoonmap._STDERR_JOIN_TIMEOUT', 0.2), \
+                 patch('spoonmap.subprocess.Popen', return_value=proc):
+                nmap_worker(work_queue, completed_count, 1, '88', threading.Lock(),
+                            interrupt_event, None)
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(timeout=5)
+        try:
+            assert not thread.is_alive()
+            assert completed_count[0] == 1
+        finally:
+            # Let the reader thread exit so it does not outlive the test.
+            release_reader.set()
 
 
 def _fake_worker_drain(work_queue, completed_count, total_count, source_port, lock,
@@ -7291,6 +7908,34 @@ class TestCombineLiveHosts:
         disc = self._make_live_hosts(tmp_path, {})
         _combine_live_hosts(disc, str(tmp_path))
         assert (tmp_path / 'all_live_hosts.txt').read_text() == ''
+
+    def test_missing_trailing_newline_does_not_duplicate_an_ip(self, tmp_path):
+        """Dedup used to run on raw lines, so '10.0.0.2' and '10.0.0.2\\n' were
+        different set members and an unterminated last line listed that IP twice
+        in a file documented as deduplicated.  Internal writers always terminate
+        via _atomic_write(), so it takes an externally authored port file."""
+        disc = self._make_live_hosts(tmp_path, {
+            'port80.txt': '10.0.0.1\n10.0.0.2',    # no trailing newline
+            'port443.txt': '10.0.0.2\n',
+        })
+        _combine_live_hosts(disc, str(tmp_path))
+        written = (tmp_path / 'all_live_hosts.txt').read_text()
+        assert written.split() == ['10.0.0.1', '10.0.0.2']
+        assert written.count('10.0.0.2') == 1
+
+    def test_blank_lines_are_dropped(self, tmp_path):
+        disc = self._make_live_hosts(tmp_path, {'port80.txt': '10.0.0.1\n\n   \n'})
+        _combine_live_hosts(disc, str(tmp_path))
+        assert (tmp_path / 'all_live_hosts.txt').read_text() == '10.0.0.1\n'
+
+    def test_output_is_newline_terminated_and_ip_sorted(self, tmp_path):
+        disc = self._make_live_hosts(tmp_path, {
+            'port80.txt': '10.0.0.10\n10.0.0.2\n',
+        })
+        _combine_live_hosts(disc, str(tmp_path))
+        # Numeric IP order, not lexical, and a trailing newline like every other
+        # host list this tool writes.
+        assert (tmp_path / 'all_live_hosts.txt').read_text() == '10.0.0.2\n10.0.0.10\n'
 
     def test_hostname_files_are_excluded(self, tmp_path):
         # create_hostname_target_file() writes port{N}_hostnames.txt into the
