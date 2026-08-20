@@ -2204,6 +2204,8 @@ def _validate_snmp_any_community(nmap_dir, scan_type):
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
                     if 'Valid credentials' in result.stdout:
                         validated[ip] = True
+                except (subprocess.TimeoutExpired, OSError):
+                    print(_COLOR_ERROR + f'SNMP validation probe timed out or failed for {ip}; validation skipped' + _COLOR_RESET)
                 finally:
                     Path(tmp_path).unlink(missing_ok=True)
     return validated
