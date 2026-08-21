@@ -145,6 +145,42 @@ uv run spoonmap.py --cleanup
 ./spoonmap.py --cleanup /path/to/output
 ```
 
+## Where Files Live
+
+Every operator-facing path resolves against the directory you run the command
+from — not the directory containing `spoonmap.py`. That covers `config.json`,
+`exclusions.txt`, the default output location, any relative `target_file` /
+`output_path` / `exclusions_file` value written inside `config.json`, and
+`--cleanup`'s search for a config to read `output_path` from. The reasoning is
+simple: your config and your scan results belong in the directory where you
+ran the engagement from, not wherever the program itself happens to sit on
+disk — those are frequently different places, and an operator has no reason to
+go looking in the latter for the former.
+
+**This is a behaviour change.** Previously these paths resolved against the
+directory containing `spoonmap.py` itself. If you always run `./spoonmap.py`
+or `uv run spoonmap.py` from inside the checkout, nothing changes — your CWD
+and the checkout are the same directory. But if you invoke it by an absolute
+or relative path from somewhere else —
+
+```bash
+cd /tmp
+/opt/spoonmap/spoonmap.py
+```
+
+— behaviour is different from before: this used to read `/opt/spoonmap/config.json`
+and write output under `/opt/spoonmap/`. It now reads `/tmp/config.json` and
+writes output under `/tmp/`. If you have a habit of invoking SpooNMAP from
+outside its own directory, check where your `config.json` and prior output
+actually are before your next run.
+
+**What does *not* follow this rule:** the bundled NSE scripts under `nse/`
+(`.nse` files invoked during `script_scan`) are program data, not operator
+data — they ship with SpooNMAP itself and always resolve from the directory
+containing `spoonmap.py`, regardless of your CWD. This is the one exception,
+and it exists so the script scan works identically no matter where you
+happen to run the tool from.
+
 ## Target File (ranges.txt)
 
 `ranges.txt` is committed to the repository as an empty placeholder and is marked `skip-worktree`, so git will never stage local edits to it. Fill it with your target ranges freely — they will never be accidentally committed.
@@ -171,7 +207,7 @@ git update-index --no-skip-worktree ranges.txt
 | `target_scan` | `"External"` / `"Internal"` | Selects discovery port lists and NSE script sets; no source-port override is applied |
 | `max_rate` | Packets/second string | See rate guidance below |
 | `target_file` | Path | One IP, CIDR, or hostname per line; `ranges.txt` is committed as a blank placeholder (see below) |
-| `output_path` | Path | Directory for all output; relative paths resolve to script dir |
+| `output_path` | Path | Directory for all output; relative paths resolve to the current working directory (see "Where Files Live" above) |
 | `exclusions_file` | Path | IPs/CIDRs to exclude; SpooNMAP pre-computes the set intersection with the target file and passes only the net target IPs to masscan (see below) |
 | `nmap_threads` | Integer | Concurrent nmap processes (default: 5); prompted under "Tune advanced settings" |
 | `masscan_batch_size` | Integer | Ports per masscan invocation (default: 5); prompted under "Tune advanced settings" |

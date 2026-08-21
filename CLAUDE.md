@@ -16,6 +16,32 @@ cp config.json.sample config.json
 ./spoonmap.py
 ```
 
+### Operator path resolution
+
+Every operator-facing path — `config.json`, `exclusions.txt`, the default
+output location, relative `target_file`/`output_path`/`exclusions_file`
+values read out of `config.json`, and `--cleanup`'s search for a config to
+read `output_path` from — resolves against the current working directory the
+command was run from, via `_operator_dir()` (a thin wrapper around
+`os.getcwd()`, kept as its own module-level helper so it is testable outside
+`main()`'s `# pragma: no cover` region). An operator's config and scan output
+belong in the directory they ran the engagement from, not wherever the
+program happens to be installed — those are frequently different places, and
+this is true independent of how (or whether) the tool is installed.
+
+This is a behaviour change from resolving against `os.path.dirname(os.path.realpath(__file__))`:
+invoking by absolute path from another directory (`cd /tmp &&
+/opt/spoonmap/spoonmap.py`) previously read `/opt/spoonmap/config.json` and
+wrote output there; it now resolves against `/tmp`. The documented invocation
+— running `./spoonmap.py` or `uv run spoonmap.py` from inside the checkout —
+is unaffected, since CWD and checkout are the same directory there.
+
+This is a different anchor from `_DIR`/`_NSE_DIR` (`spoonmap.py:2459`), which
+stay `__file__`-relative on purpose: the bundled NSE scripts under `nse/` are
+program data that ships with SpooNMAP itself, not operator data, and must
+resolve identically regardless of the caller's CWD. `_operator_dir()` and
+`_DIR` are deliberately two separate anchors — do not collapse them into one.
+
 Run the test suite with:
 
 ```bash
