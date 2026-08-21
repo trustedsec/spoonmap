@@ -25,6 +25,12 @@ uv run pytest tests/test_spoonmap.py::TestGenerateFindings  # single class
 
 `tests/test_nse_integration.py` binds real local ports and shells out to real `nmap`, so its results depend on the machine. A class names the port it needs with a `required_tcp_port` / `required_udp_port` attribute and `pytest_runtest_setup()` in `tests/conftest.py` skips it if that port is occupied — checked immediately before each test, not at import, because a port free during collection can be taken by the time the test runs (that race produced spurious failures). A skip there always means a port conflict or missing root, never an NSE result; the assertions themselves are unconditional.
 
+CI (`.github/workflows/ci.yml`) runs that same suite on every pull request and on
+pushes to `main`: Python 3.8–3.13 on Ubuntu (with nmap installed, so the NSE
+integration tests run rather than skip) plus Python 3.12 on macOS, and a
+`uv lock --check` step. The 95% coverage floor is enforced by pytest's `addopts`,
+so CI inherits it without restating it.
+
 Pass `--cleanup [dir]` to remove prior scan output non-interactively (reads `output_path` from `config.json` if no directory is given).
 
 ## Architecture
