@@ -7,6 +7,46 @@ This script is a wrapper for masscan and nmap. nmap handles host discovery and (
 
 Python 3.8+ is required (`requires-python` in `pyproject.toml`; CI floors at 3.8).
 
+## Installation
+
+SpooNMAP can be run straight from a checkout — no installation step needed, see
+"Usage" below — or installed as a standalone command with
+[uv](https://docs.astral.sh/uv/):
+
+```bash
+uv tool install git+https://github.com/trustedsec/spoonmap
+```
+
+This puts a `spoonmap` executable on your `PATH`, so you can invoke it as
+`spoonmap` from any directory instead of cloning the repo and running
+`./spoonmap.py`. **There is no PyPI package** — the command above installs
+directly from the git repository, not from `pypi.org`. `uv tool install
+spoonmap` (naming the package instead of the git URL) will not work: the name
+`spoonmap` is unclaimed on PyPI and this project has never published to it.
+If you see that failure, it means you dropped the `git+...` URL, not that
+something is broken.
+
+To update to the latest commit:
+
+```bash
+uv tool upgrade spoonmap
+```
+
+Installing this way does not make SpooNMAP a self-contained scanner:
+`masscan` and `nmap` are still separate system tools that must be installed
+independently (see "Dependencies" above), exactly as when running from a
+checkout — `uv tool install` only packages SpooNMAP's own Python code and its
+bundled NSE scripts, not the external binaries it shells out to.
+
+The one thing worth understanding before installing this way: an installed
+`spoonmap`'s Python module lives wherever `uv` put its managed tool
+environment — not in a directory you would ever think to look in for a
+config file or scan output. That is exactly the scenario the "Where Files
+Live" section below is about — read that section for what resolves against
+your current directory and why; installing via `uv tool install` doesn't
+change the rule, it just makes the rule matter, since there is no checkout
+directory left for a config or output path to fall back to by habit.
+
 ## Usage
 Simply executing the script will prompt you for all required options.
 

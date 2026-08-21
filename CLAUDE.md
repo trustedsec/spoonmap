@@ -42,6 +42,12 @@ program data that ships with SpooNMAP itself, not operator data, and must
 resolve identically regardless of the caller's CWD. `_operator_dir()` and
 `_DIR` are deliberately two separate anchors — do not collapse them into one.
 
+The wheel built by `pyproject.toml`'s hatch config is a supported consumption
+path (`uv tool install git+https://github.com/trustedsec/spoonmap`; see
+README.md for the end-user walkthrough), so a change here must keep
+`config.json.sample` and every bundled `nse/` script landing in the wheel —
+the `build` CI job asserts this.
+
 Run the test suite with:
 
 ```bash
