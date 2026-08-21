@@ -1,8 +1,10 @@
 """Tests for spoonmap.py"""
 import datetime
+import inspect
 import io
 import json
 import os
+import re
 import readline
 import subprocess
 import textwrap
@@ -11115,6 +11117,19 @@ class TestNseDirResolution:
         installed-wheel branch."""
         assert _resolve_nse_dir(str(tmp_path)) == f'{tmp_path}/spoonmap_nse'
 
-    def test_resolver_prefers_nse_subdir_when_present(self, tmp_path):
-        (tmp_path / 'nse').mkdir()
-        assert _resolve_nse_dir(str(tmp_path)) == f'{tmp_path}/nse'
+    def test_no_call_site_reverts_to_dir_relative_nse_path(self):
+        """CI's wheel-contents check (.github/workflows/ci.yml) only walks
+        INTERNAL_PORT_SCRIPTS and EXTERNAL_PORT_SCRIPTS, not the other ~45 of
+        the 65 _NSE_DIR call sites living in _FINDING_REPRO and
+        _scan_extra_sql_ports(). A revert of any one of those back to a
+        `_DIR`-relative `nse/` literal (bypassing _resolve_nse_dir(), and thus
+        breaking once installed from the wheel) would be invisible to that
+        check. Assert on the module's own source text instead, so every call
+        site is covered at once regardless of which one regresses."""
+        source = inspect.getsource(spoonmap)
+        offenders = re.findall(r"_DIR\}/nse/[\w.\-]+\.nse", source)
+        assert not offenders, (
+            'found _DIR-relative nse/ path(s); bundled scripts must be '
+            'referenced via _NSE_DIR so they resolve in an installed wheel: '
+            + str(offenders)
+        )
