@@ -465,7 +465,18 @@ always an environment conflict, never an NSE result.
 
 ### Continuous integration
 
-`.github/workflows/ci.yml` runs on every pull request and on pushes to `main`:
-the suite is exercised on Python 3.8–3.13 on Ubuntu plus Python 3.12 on macOS,
+`.github/workflows/ci.yml` runs on every pull request and on pushes to `main`,
 with nmap installed on the Ubuntu jobs so the NSE integration tests actually
-run. It also checks that `uv.lock` is in sync with `pyproject.toml`.
+run:
+
+- **`test`** — Python 3.10–3.13 on Ubuntu plus Python 3.12 on macOS, using the
+  locked toolchain (`uv run --frozen`), and checking that `uv.lock` is in sync
+  with `pyproject.toml`.
+- **`test-legacy`** — Python 3.8 and 3.9, resolving pytest fresh outside the
+  project (`uv run --isolated --no-project`).
+
+The split exists because `pytest` only ships the fix for CVE-2025-71176 in
+9.0.3+, which requires Python 3.10+. `uv.lock` therefore resolves for 3.10+
+only (`[tool.uv] environments`), so no vulnerable version is locked, while
+`requires-python` stays at `>=3.8` — `spoonmap.py` is dependency-free stdlib and
+still runs on older interpreters, which the `test-legacy` jobs keep honest.

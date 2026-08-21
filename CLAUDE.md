@@ -26,10 +26,17 @@ uv run pytest tests/test_spoonmap.py::TestGenerateFindings  # single class
 `tests/test_nse_integration.py` binds real local ports and shells out to real `nmap`, so its results depend on the machine. A class names the port it needs with a `required_tcp_port` / `required_udp_port` attribute and `pytest_runtest_setup()` in `tests/conftest.py` skips it if that port is occupied — checked immediately before each test, not at import, because a port free during collection can be taken by the time the test runs (that race produced spurious failures). A skip there always means a port conflict or missing root, never an NSE result; the assertions themselves are unconditional.
 
 CI (`.github/workflows/ci.yml`) runs that same suite on every pull request and on
-pushes to `main`: Python 3.8–3.13 on Ubuntu (with nmap installed, so the NSE
-integration tests run rather than skip) plus Python 3.12 on macOS, and a
-`uv lock --check` step. The 95% coverage floor is enforced by pytest's `addopts`,
-so CI inherits it without restating it.
+pushes to `main`, with nmap installed on the Ubuntu jobs so the NSE integration
+tests run rather than skip. Two jobs, because the test toolchain and the tool
+have different Python floors: `test` covers 3.10–3.13 on Ubuntu plus 3.12 on
+macOS against `uv.lock` (`uv run --frozen`, plus `uv lock --check`), and
+`test-legacy` covers 3.8/3.9 with pytest resolved fresh outside the project
+(`uv run --isolated --no-project`). `uv.lock` is deliberately scoped to 3.10+ via
+`[tool.uv] environments` so it can hold a pytest patched for CVE-2025-71176
+(fixed in 9.0.3, which needs Python 3.10+) instead of pinning a vulnerable 8.x
+for 3.8/3.9; `requires-python` stays `>=3.8` because `spoonmap.py` itself is
+dependency-free stdlib. The 95% coverage floor is enforced by pytest's `addopts`,
+so every job inherits it without restating it.
 
 Pass `--cleanup [dir]` to remove prior scan output non-interactively (reads `output_path` from `config.json` if no directory is given).
 

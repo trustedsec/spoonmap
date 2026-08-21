@@ -21,8 +21,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        # pyproject declares requires-python >=3.8; every claimed version is tested.
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+        # uv.lock resolves for 3.10+ only, so pytest can stay on a version
+        # patched for CVE-2025-71176. 3.8 and 3.9 are covered by test-legacy.
+        python-version: ['3.10', '3.11', '3.12', '3.13']
         include:
           # The tool is developed on macOS, which has its own termios/stty paths.
           - os: macos-latest
@@ -52,3 +53,35 @@ jobs:
       # in pyproject.toml, so a coverage regression fails this step too.
       - name: Run tests
         run: uv run --frozen pytest tests/ -v
+
+  # spoonmap.py is dependency-free stdlib and README claims Python 3.6+, so the
+  # oldest versions pyproject declares still need testing. They cannot use
+  # uv.lock (it resolves for 3.10+), so the test toolchain is resolved fresh
+  # here, outside the project. That means pytest 8.x on these two jobs — the
+  # CVE-2025-71176 tmpdir issue is a local-user attack on a throwaway runner,
+  # and nothing vulnerable enters uv.lock, which is what the repo ships.
+  test-legacy:
+    name: tests (ubuntu-latest, py${{ matrix.python-version }}, unlocked)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.8', '3.9']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nmap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nmap
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Run tests
+        run: >
+          uv run --isolated --no-project --python ${{ matrix.python-version }}
+          --with pytest --with pytest-cov
+          pytest tests/ -v
