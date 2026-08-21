@@ -5,7 +5,7 @@
 ## Dependencies
 This script is a wrapper for masscan and nmap. nmap handles host discovery and (for smaller scans) port discovery, service banner grabbing, and NSE scripts. Masscan is used for large-scale port discovery where raw speed matters. Install both from your favourite package manager or from source.
 
-Python 3.6+ is required (uses f-strings).
+Python 3.8+ is required (`requires-python` in `pyproject.toml`; CI floors at 3.8).
 
 ## Usage
 Simply executing the script will prompt you for all required options.
@@ -497,21 +497,50 @@ always an environment conflict, never an NSE result.
 ### Continuous integration
 
 `.github/workflows/ci.yml` runs on every pull request and on pushes to `main`,
-with nmap installed on the Ubuntu jobs so the NSE integration tests actually
-run:
+with nmap installed on every job that needs it (Ubuntu via `apt`, macOS via
+`brew`) so the NSE integration tests actually run rather than skip:
 
 - **`test`** — Python 3.10–3.13 on Ubuntu plus Python 3.12 on macOS, using the
-  locked toolchain (`uv run --frozen`), and checking that `uv.lock` is in sync
-  with `pyproject.toml`.
+  locked toolchain (`uv run --frozen`). Both OSes install nmap: the tool is
+  developed on macOS, and until this job installed nmap there too, all 26 NSE
+  integration tests silently skipped on that platform.
 - **`test-legacy`** — Python 3.8 and 3.9, resolving pytest fresh outside the
   project (`uv run --isolated --no-project`).
-- **`lint`** — `ruff check spoonmap.py tests/`. Run it locally with
-  `uv run ruff check spoonmap.py tests/`.
+- **`lint`** — `ruff check spoonmap.py tests/`, plus the single `uv lock
+  --check` for the whole workflow (it doesn't vary per interpreter version, so
+  running it on every leg of the `test` matrix was five copies of the same
+  answer). Run ruff locally with `uv run ruff check spoonmap.py tests/`.
 - **`bandit`** — SAST against the committed `.bandit-baseline.json`, so only a
   *new* finding fails the build.
+- **`nse-root`** — runs only `tests/test_nse_integration.py`, as root, via
+  `sudo -E env "PATH=$PATH" uv run --frozen pytest ... --no-cov`.
+  `TestOpenvpnDetectNseUdp` (the `-sU` NSE path) is gated on
+  `os.geteuid() == 0` and is skipped in every other job, so this is the only
+  place it runs. `sudo` resets `PATH`, dropping the `uv` `setup-uv` just
+  installed, hence the explicit re-injection; coverage is disabled for this
+  job specifically because the 95% floor applies to the whole suite and a
+  single-module run can't meet it — the floor itself is untouched.
+- **`workflow-lint`** — `actionlint` (YAML/expression errors in the workflow
+  file) and `zizmor` (Actions-specific security auditing: unpinned actions,
+  script injection, credential persistence). The workflow is hand-edited often
+  and carries several hand-maintained SHA pins, so it gets linted too.
+- **`build`** — builds the sdist and wheel with `uv build` and asserts on
+  their actual contents: that the sdist excludes local scratch files, that the
+  wheel contains every bundled `.nse` script, and that a clean venv with the
+  wheel installed resolves every NSE path on disk.
+
+Every job has `timeout-minutes` set: the suite exercises `work_queue.join()`,
+`threading.Event` polling and `KeyboardInterrupt` handling, and a past bug in
+that area failed as a hang rather than a clean failure. `.github/dependabot.yml`
+proposes weekly bumps for both the SHA-pinned actions and the `uv`-managed
+`dev` group, since a hand-maintained pin only gets a security fix if something
+proposes it.
 
 Actions are pinned to commit SHAs (with the tag in a trailing comment) rather
-than mutable tags, and every checkout uses `persist-credentials: false`.
+than mutable tags, and every checkout uses `persist-credentials: false`. The
+`concurrency` cancellation that supersedes a running build on a new push is
+scoped to `pull_request` events only — cancelling an in-progress `main` build
+because a later commit landed would erase that earlier commit's green check.
 
 The ruff ruleset is deliberately narrow — `E4`, `E7`, `E9`, `F` — and the ruff
 version is exact-pinned in the `dev` group so a ruff release cannot fail CI on
@@ -521,18 +550,21 @@ its own. `ruff format` is **not** used: reformatting a 4.6k-line module and an
 
 `bandit` reports 32 reviewed findings on `spoonmap.py` — list-form `subprocess`
 calls and `xml.etree` parsing of output from tools we invoked ourselves — which
-is why they are baselined instead of suppressed inline. To re-baseline after an
-intentional change:
+is why they are baselined instead of suppressed inline. `bandit[toml]==1.9.4`
+is exact-pinned in the `dev` group (the same reasoning as ruff, so its
+transitive dependencies are locked rather than floating), and CI runs it via
+`uv run --frozen bandit`. To re-baseline after an intentional change:
 
 ```bash
-uvx --from 'bandit[toml]==1.9.4' bandit -r spoonmap.py -c pyproject.toml \
+uv run --frozen bandit -r spoonmap.py -c pyproject.toml \
     -f json -o .bandit-baseline.json
 ```
 
 Say in the commit message why each newly added finding is acceptable.
 
-The split exists because `pytest` only ships the fix for CVE-2025-71176 in
-9.0.3+, which requires Python 3.10+. `uv.lock` therefore resolves for 3.10+
-only (`[tool.uv] environments`), so no vulnerable version is locked, while
-`requires-python` stays at `>=3.8` — `spoonmap.py` is dependency-free stdlib and
-still runs on older interpreters, which the `test-legacy` jobs keep honest.
+The `test`/`test-legacy` split exists because `pytest` only ships the fix for
+CVE-2025-71176 in 9.0.3+, which requires Python 3.10+. `uv.lock` therefore
+resolves for 3.10+ only (`[tool.uv] environments`), so no vulnerable version is
+locked, while `requires-python` stays at `>=3.8` — `spoonmap.py` is
+dependency-free stdlib and still runs on older interpreters, which the
+`test-legacy` jobs keep honest.

@@ -2,7 +2,7 @@
 
 ## Overview
 
-SpooNMAP is a Python 3.6+ wrapper that orchestrates masscan (fast port discovery) followed by nmap (service banner grabbing). Both external tools must be installed separately.
+SpooNMAP is a Python 3.8+ wrapper that orchestrates masscan (fast port discovery) followed by nmap (service banner grabbing). Both external tools must be installed separately.
 
 ## Running the Tool
 
@@ -26,30 +26,72 @@ uv run pytest tests/test_spoonmap.py::TestGenerateFindings  # single class
 `tests/test_nse_integration.py` binds real local ports and shells out to real `nmap`, so its results depend on the machine. A class names the port it needs with a `required_tcp_port` / `required_udp_port` attribute and `pytest_runtest_setup()` in `tests/conftest.py` skips it if that port is occupied — checked immediately before each test, not at import, because a port free during collection can be taken by the time the test runs (that race produced spurious failures). A skip there always means a port conflict or missing root, never an NSE result; the assertions themselves are unconditional.
 
 CI (`.github/workflows/ci.yml`) runs that same suite on every pull request and on
-pushes to `main`, with nmap installed on the Ubuntu jobs so the NSE integration
-tests run rather than skip. Two jobs, because the test toolchain and the tool
-have different Python floors: `test` covers 3.10–3.13 on Ubuntu plus 3.12 on
-macOS against `uv.lock` (`uv run --frozen`, plus `uv lock --check`), and
+pushes to `main`, with nmap installed on every job that needs it — `apt` on
+Ubuntu, `brew` on macOS, since the tool is developed on macOS and until that
+install was added there too, all 26 NSE integration tests silently skipped on
+that platform. Each such job also asserts `shutil.which('nmap')` is not `None`
+before running, so a broken install fails the job instead of quietly turning
+those assertions into skips. Two jobs cover the suite itself, because the test
+toolchain and the tool have different Python floors: `test` covers 3.10–3.13 on
+Ubuntu plus 3.12 on macOS against `uv.lock` (`uv run --frozen`), and
 `test-legacy` covers 3.8/3.9 with pytest resolved fresh outside the project
 (`uv run --isolated --no-project`). `uv.lock` is deliberately scoped to 3.10+ via
 `[tool.uv] environments` so it can hold a pytest patched for CVE-2025-71176
 (fixed in 9.0.3, which needs Python 3.10+) instead of pinning a vulnerable 8.x
 for 3.8/3.9; `requires-python` stays `>=3.8` because `spoonmap.py` itself is
 dependency-free stdlib. The 95% coverage floor is enforced by pytest's `addopts`,
-so every job inherits it without restating it.
+so every job inherits it without restating it. Both jobs pass `-rs` to pytest so
+a test that starts skipping shows up in the log instead of vanishing into a
+bare count. `uv lock --check` runs exactly once, in the `lint` job, rather than
+once per `test` matrix leg — the lock file's freshness doesn't vary by
+interpreter version, so five copies of the check were five copies of the same
+answer.
 
-Two more jobs guard style and security: `lint` runs `ruff check spoonmap.py
-tests/` against a narrow `E4`/`E7`/`E9`/`F` ruleset with ruff exact-pinned in the
-`dev` group (a linter that grows an opinion should not fail an unrelated PR), and
-`bandit` runs SAST against the committed `.bandit-baseline.json`. `ruff format` is
-deliberately **not** adopted — reformatting the module and the 11k-line test file
-would bury every future diff, and `E501` alone flags 288 existing lines. The
-bandit baseline holds 32 reviewed findings (list-form `subprocess` calls,
-`xml.etree` parsing of masscan/nmap output we invoked ourselves), so only a *new*
-finding fails; regenerate it deliberately and justify additions in the commit
-message rather than adding inline `# nosec` suppressions. Actions are pinned to
-commit SHAs with the tag in a trailing comment, and every checkout sets
-`persist-credentials: false`.
+A dedicated `nse-root` job runs only `tests/test_nse_integration.py`, as root,
+via `sudo -E env "PATH=$PATH" uv run --frozen pytest ... --no-cov`:
+`TestOpenvpnDetectNseUdp`, the `-sU` NSE path, is gated on `os.geteuid() == 0`
+and is skipped everywhere else, so this is the only job that actually exercises
+it. `sudo` resets `PATH`, dropping the `uv` that `setup-uv` had just installed,
+hence the explicit re-injection rather than relying on `sudo`'s own (`uv`-less)
+`secure_path`. Coverage is disabled for this job specifically — the 95% floor
+in `pyproject.toml` applies to the whole suite and a single-module run can't
+meet it — without touching the floor itself; the rest of the suite is already
+covered, with coverage, by `test` and `test-legacy`.
+
+Three more jobs guard style, security, and the workflow file itself. `lint`
+runs `ruff check spoonmap.py tests/` against a narrow `E4`/`E7`/`E9`/`F`
+ruleset with ruff exact-pinned in the `dev` group (a linter that grows an
+opinion should not fail an unrelated PR). `bandit` runs SAST against the
+committed `.bandit-baseline.json` via `uv run --frozen bandit`; `bandit[toml]`
+is exact-pinned in the `dev` group too (same reasoning as ruff — a bare `uvx
+--from` pin on bandit itself let its transitive dependencies float). `ruff
+format` is deliberately **not** adopted — reformatting the module and the
+11k-line test file would bury every future diff, and `E501` alone flags 288
+existing lines. The bandit baseline holds 32 reviewed findings (list-form
+`subprocess` calls, `xml.etree` parsing of masscan/nmap output we invoked
+ourselves), so only a *new* finding fails; regenerate it deliberately and
+justify additions in the commit message rather than adding inline `# nosec`
+suppressions. `workflow-lint` runs `actionlint` (YAML/expression errors) and
+`zizmor` (Actions-specific security auditing — unpinned actions, script
+injection, credential persistence) against `ci.yml` itself, since the workflow
+is hand-edited often and carries several hand-maintained SHA pins.
+
+A `build` job (added for wheel/sdist packaging; see the job itself and
+`pyproject.toml`'s `[tool.hatch.build.targets.*]`) builds both artifacts with
+`uv build` and asserts on their actual contents rather than trusting the config
+says what it means.
+
+Every job declares `timeout-minutes`, generous but bounded, instead of relying
+on the 6-hour default: this suite exercises `work_queue.join()`,
+`threading.Event` polling, and `KeyboardInterrupt` handling, and a past bug in
+that area failed as a hang rather than a clean failure. `.github/dependabot.yml`
+proposes weekly bumps for the SHA-pinned actions and for the `uv`-managed `dev`
+group, since a hand-maintained pin only gets a security fix if something
+proposes the bump. Actions are pinned to commit SHAs with the tag in a trailing
+comment, and every checkout sets `persist-credentials: false`. The
+`concurrency` group's `cancel-in-progress` is scoped to `pull_request` events
+only, so a fast follow-up merge to `main` can no longer cancel the previous
+commit's in-progress run and erase its green check.
 
 Pass `--cleanup [dir]` to remove prior scan output non-interactively (reads `output_path` from `config.json` if no directory is given).
 
