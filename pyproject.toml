@@ -64,9 +64,35 @@ exclude_lines = [
 ]
 
 [tool.hatch.build.targets.wheel]
-# Include the sample config and empty exclusions template alongside the module
-artifacts = [
+only-include = ["spoonmap.py"]
+
+# `artifacts` was a no-op here: it only un-excludes VCS-ignored files that
+# already match an include pattern, so the wheel shipped spoonmap.py alone
+# while _NSE_DIR pointed at a directory that was never packaged. force-include
+# is what actually adds the tree. It lands as `spoonmap_nse/` rather than
+# `nse/` because the wheel installs into site-packages, where a bare top-level
+# `nse/` would be a name collision waiting to happen.
+[tool.hatch.build.targets.wheel.force-include]
+"nse" = "spoonmap_nse"
+
+# An explicit allowlist, not an exclude list. hatchling honours neither nested
+# .gitignore files nor .git/info/exclude, so the default sdist swept in
+# .remember/, .superpowers/sdd/ and .claude/ — 54 of 91 entries of local
+# session scratch. A blocklist would have to predict every future scratch
+# directory; an allowlist fails closed. `ranges.txt` and `config.json` are
+# deliberately absent: both are empty or ignored in git but hold real
+# engagement scope and scan configuration on an operator's working checkout.
+[tool.hatch.build.targets.sdist]
+include = [
+    "spoonmap.py",
+    "nse/",
+    "tests/",
+    "README.md",
+    "CLAUDE.md",
     "config.json.sample",
     "exclusions.txt",
-    "nse/cisco-siet.nse",
+    "pyproject.toml",
+    "uv.lock",
+    ".bandit-baseline.json",
+    ".github/workflows/",
 ]
