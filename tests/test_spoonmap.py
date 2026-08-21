@@ -88,6 +88,7 @@ from spoonmap import (
     _parse_nmap_sn_xml,
     _parse_result_xml,
     _quarantine_failed_output,
+    _resolve_nse_dir,
     _aggregate_result_dir,
     _path_completion,
     _run_masscan_batch,
@@ -11077,3 +11078,43 @@ class TestQuarantineQuarantinesGnmap:
         xml = tmp_path / 'port80.xml'
         xml.write_text('<nmaprun></nmaprun>')
         assert _quarantine_failed_output(str(xml)) == str(xml) + '.failed'
+
+
+class TestNseDirResolution:
+    """Bundled NSE scripts must resolve to a real, packaged path both in a
+    checkout and once installed from the wheel (see pyproject.toml's
+    force-include of nse/ -> spoonmap_nse/)."""
+
+    def _nse_paths(self, port_scripts):
+        """Pull out every comma-separated token that looks like a bundled
+        script path — the maps mix bare nmap script names (e.g.
+        'ms-sql-ntlm-info') with absolute paths to files under _NSE_DIR, and
+        only the latter are ours to ship."""
+        paths = []
+        for flags in port_scripts.values():
+            for token in flags.split(','):
+                if token.endswith('.nse'):
+                    paths.append(token)
+        return paths
+
+    def test_every_bundled_nse_path_exists_on_disk(self):
+        paths = self._nse_paths(INTERNAL_PORT_SCRIPTS) + \
+            self._nse_paths(EXTERNAL_PORT_SCRIPTS)
+        assert paths, 'expected at least one bundled .nse path to check'
+        for path in paths:
+            assert os.path.isfile(path), f'missing bundled NSE script: {path}'
+
+    def test_nse_dir_prefers_checkout_directory(self):
+        """A normal checkout ships nse/ alongside spoonmap.py, so that must
+        win over the installed-wheel fallback."""
+        assert spoonmap._NSE_DIR == f'{spoonmap._DIR}/nse'
+
+    def test_resolver_falls_back_when_checkout_nse_dir_absent(self, tmp_path):
+        """Test the resolver as a unit against a tmp_path with no nse/
+        subdirectory, rather than touching the real checkout, to force the
+        installed-wheel branch."""
+        assert _resolve_nse_dir(str(tmp_path)) == f'{tmp_path}/spoonmap_nse'
+
+    def test_resolver_prefers_nse_subdir_when_present(self, tmp_path):
+        (tmp_path / 'nse').mkdir()
+        assert _resolve_nse_dir(str(tmp_path)) == f'{tmp_path}/nse'
