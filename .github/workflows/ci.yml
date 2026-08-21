@@ -5,10 +5,13 @@ on:
   push:
     branches: [main]
 
-# A new push to the same PR supersedes the previous run.
+# A new push to the same PR supersedes the previous run. Scoped to pull_request
+# only: on `main`, cancelling the previous commit's in-progress run because a
+# fast follow-up merge landed would erase that earlier commit's green check,
+# and a push to `main` is not something a later push should be allowed to hide.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -17,6 +20,11 @@ jobs:
   test:
     name: tests (${{ matrix.os }}, py${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
+    # This suite exercises work_queue.join(), threading.Event polling and
+    # KeyboardInterrupt handling; a past bug in that area failed as a hang
+    # rather than a clean failure, so every job gets a bound well under the
+    # 6-hour default instead of relying on the runner to notice.
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -37,12 +45,24 @@ jobs:
 
       # tests/test_nse_integration.py shells out to real nmap against local stub
       # servers. Without nmap the whole module skips itself, so installing it is
-      # what makes the NSE assertions actually run.
-      - name: Install nmap
+      # what makes the NSE assertions actually run — on every OS this job
+      # covers, not just Linux: the tool is developed on macOS, and until this
+      # job installed nmap there too, all 26 NSE integration tests silently
+      # skipped on the platform used for day-to-day development.
+      - name: Install nmap (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends nmap
+
+      - name: Install nmap (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nmap
+
+      # A broken nmap install would otherwise just turn 26 assertions into
+      # silent skips instead of failing the job.
+      - name: Verify nmap is on PATH
+        run: python3 -c "import shutil, sys; sys.exit(0 if shutil.which('nmap') else 1)"
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
@@ -50,16 +70,15 @@ jobs:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
 
-      - name: Check uv.lock is up to date
-        run: uv lock --check
-
       # Coverage reporting and the 95% floor come from [tool.pytest.ini_options]
-      # in pyproject.toml, so a coverage regression fails this step too.
+      # in pyproject.toml, so a coverage regression fails this step too. -rs
+      # prints skip reasons, so a test that starts skipping here shows up in
+      # the log instead of vanishing into a bare count.
       - name: Run tests
-        run: uv run --frozen pytest tests/ -v
+        run: uv run --frozen pytest tests/ -v -rs
 
-  # spoonmap.py is dependency-free stdlib and README claims Python 3.6+, so the
-  # oldest versions pyproject declares still need testing. They cannot use
+  # spoonmap.py is dependency-free stdlib and requires-python floors at 3.8, so
+  # the oldest versions pyproject declares still need testing. They cannot use
   # uv.lock (it resolves for 3.10+), so the test toolchain is resolved fresh
   # here, outside the project. That means pytest 8.x on these two jobs — the
   # CVE-2025-71176 tmpdir issue is a local-user attack on a throwaway runner,
@@ -67,6 +86,7 @@ jobs:
   test-legacy:
     name: tests (ubuntu-latest, py${{ matrix.python-version }}, unlocked)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -83,6 +103,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends nmap
 
+      - name: Verify nmap is on PATH
+        run: python3 -c "import shutil, sys; sys.exit(0 if shutil.which('nmap') else 1)"
+
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
@@ -92,7 +115,7 @@ jobs:
         run: >
           uv run --isolated --no-project --python ${{ matrix.python-version }}
           --with pytest --with pytest-cov
-          pytest tests/ -v
+          pytest tests/ -v -rs
 
   # Separate job, not a step on `test`: a lint failure and a test failure are
   # different questions, and neither should hide the other behind a red X.
@@ -100,6 +123,7 @@ jobs:
   lint:
     name: ruff
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -111,19 +135,30 @@ jobs:
           python-version: '3.12'
           enable-cache: true
 
+      # Lives here rather than on every leg of the `test` matrix: the lock
+      # file's freshness doesn't vary per interpreter version, so checking it
+      # five times gave five copies of the same answer. This job runs once
+      # regardless of the test matrix's size, so it's the natural home.
+      - name: Check uv.lock is up to date
+        run: uv lock --check
+
       - name: Ruff
         run: uv run --frozen ruff check spoonmap.py tests/
 
   # SAST against a committed baseline: spoonmap shells out to masscan/nmap and
   # parses their XML, so a bare run reports 32 reviewed findings (subprocess
   # list-form calls, xml.etree on tool output we invoked ourselves) every time.
-  # Baselining them means only a NEW finding fails the build. Regenerate with
-  #   uvx --from 'bandit[toml]==1.9.4' bandit -r spoonmap.py -c pyproject.toml \
+  # Baselining them means only a NEW finding fails the build. bandit itself is
+  # exact-pinned in the `dev` group (same reasoning as ruff) so its transitive
+  # dependencies are locked too, rather than floating under a bare `uvx --from`
+  # pin on bandit alone. Regenerate the baseline with
+  #   uv run --frozen bandit -r spoonmap.py -c pyproject.toml \
   #       -f json -o .bandit-baseline.json
   # and say in the commit message why each added finding is acceptable.
   bandit:
     name: bandit
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -137,8 +172,70 @@ jobs:
 
       - name: Bandit
         run: >
-          uvx --from "bandit[toml]==1.9.4" bandit
+          uv run --frozen bandit
           -r spoonmap.py -c pyproject.toml -b .bandit-baseline.json
+
+  # TestOpenvpnDetectNseUdp (tests/test_nse_integration.py) is gated on
+  # os.geteuid() != 0, so the -sU NSE path it exercises is skipped in every
+  # other job in this workflow. This job runs as root so it actually executes.
+  nse-root:
+    name: NSE integration tests (root, -sU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install nmap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nmap
+
+      - name: Verify nmap is on PATH
+        run: python3 -c "import shutil, sys; sys.exit(0 if shutil.which('nmap') else 1)"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          python-version: '3.12'
+          enable-cache: true
+
+      # `sudo` resets PATH, dropping the `uv` that setup-uv just put on it —
+      # `sudo -E env "PATH=$PATH" ...` re-injects the invoking user's PATH
+      # into the root environment instead of relying on sudo's own (uv-less)
+      # secure_path. The 95% coverage floor in pyproject.toml's `addopts`
+      # applies to the whole suite, so a single-module run would fail it for
+      # a reason unrelated to this job's purpose — `--no-cov` disables it
+      # here without touching the floor itself. Only this one module is run:
+      # the rest of the suite is already covered, with coverage, by `test`
+      # and `test-legacy`.
+      - name: Run NSE integration tests as root
+        run: >
+          sudo -E env "PATH=$PATH" uv run --frozen pytest
+          tests/test_nse_integration.py -v -rs --no-cov
+
+  # The workflow file is hand-edited often and carries four hand-maintained
+  # SHA pins, so it gets the same linting rigor as the Python it drives.
+  # actionlint catches YAML and expression errors (bad `if:`, unknown
+  # contexts, malformed matrices); zizmor is Actions-specific security
+  # auditing (unpinned actions, script injection via untrusted input,
+  # credential persistence). One job for both, on the same reasoning as
+  # combining `test`/`test-legacy` under one workflow instead of two.
+  workflow-lint:
+    name: workflow lint (actionlint + zizmor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: actionlint
+        run: uvx --from "actionlint-py==1.7.12.24" actionlint .github/workflows/ci.yml
+
+      - name: zizmor
+        run: uvx zizmor==1.29.0 --persona=regular .github/workflows/ci.yml
 
   # The built artifacts are a claimed interface ([project.scripts] installs a
   # spoonmap entry point) that nothing else here exercises. This job builds
@@ -150,7 +247,7 @@ jobs:
   build:
     name: build artifacts
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -175,6 +272,14 @@ jobs:
           path = glob.glob('dist/*.tar.gz')[0]
           # config.json.sample is expected and must not trip this, so match
           # the config.json basename exactly rather than as a substring.
+          #
+          # Only 'ranges.txt' can actually fire in CI today: '.remember',
+          # '.superpowers', '.claude' and 'PR_ai_ports' are all untracked
+          # local scratch that a checkout never has, and this checkout has no
+          # committed config.json either. They stay in the list anyway as a
+          # guard against a future commit accidentally adding one of them —
+          # a passing run here is evidence about ranges.txt specifically, not
+          # proof that every banned pattern is exercised.
           banned_substrings = (
               '.remember', '.superpowers', '.claude', 'PR_ai_ports', 'ranges.txt',
           )
@@ -208,6 +313,8 @@ jobs:
               for name in os.listdir('nse')
               if name.endswith('.nse')
           )
+          if not expected:
+              sys.exit('expected at least one bundled .nse script to check')
           path = glob.glob('dist/*.whl')[0]
           with zipfile.ZipFile(path) as z:
               names = set(z.namelist())
@@ -231,7 +338,6 @@ jobs:
           import os
           import sys
 
-          import spoonmap
           from spoonmap import EXTERNAL_PORT_SCRIPTS, INTERNAL_PORT_SCRIPTS
 
 
