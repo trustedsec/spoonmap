@@ -1242,7 +1242,7 @@ def _fname_port(stem: str) -> str:
 # Result dirs and files written during a scan run.
 _RESULT_DIRS  = ('discovery', 'nmap_results', 'nse_results', 'live_hosts')
 _RESULT_FILES = ('all_live_hosts.txt', 'spoonmap_output.xml',
-                 'spoonmap_output.json',
+                 'spoonmap_output.json', 'spoonmap_output.gnmap',
                  'findings.txt', 'findings.md', 'findings.json')
 
 
@@ -2066,8 +2066,19 @@ def _build_nmap_cmd(dest_port, input_file, output_file, source_port,
         if source_port and not (script_scan and dest_port in _MULTI_SCRIPT_PORTS):
             cmd += ['--source-port', source_port]
 
-    cmd += ['-iL', input_file, '-oX', output_file]
+    # Greppable output alongside the XML, one file per port so that each has a
+    # single writer.  nmap_scan() runs several workers concurrently, so a shared
+    # -oG target with --append-output would interleave their writes into a
+    # plausible-looking but corrupt host list.  Banner pass only: the script pass
+    # writes to its own directory and its results are surfaced as findings.
+    cmd += ['-iL', input_file, '-oX', output_file,
+            '-oG', _gnmap_path(output_file)]
     return cmd
+
+
+def _gnmap_path(xml_path):
+    """Return the ``.gnmap`` sibling of an nmap ``.xml`` output path."""
+    return os.path.splitext(xml_path)[0] + '.gnmap'
 
 
 def _quarantine_failed_output(output_file):
@@ -2088,6 +2099,12 @@ def _quarantine_failed_output(output_file):
     Returns None when there was nothing to rename or the rename failed — a
     missing output file already fails the gate, so either way the port is
     re-scanned.
+
+    The sibling '.gnmap' is quarantined alongside it, for the same reason and to
+    the same '.failed' suffix.  Leaving it in place would let a port excluded
+    from spoonmap_output.xml still contribute its partial hosts to
+    spoonmap_output.gnmap, so the two artifacts would disagree about what was
+    scanned — and the greppable one would be the optimistic of the two.
     """
     if not os.path.exists(output_file):
         return None
@@ -2096,6 +2113,10 @@ def _quarantine_failed_output(output_file):
         os.replace(output_file, failed_path)
     except OSError:
         return None
+    gnmap = _gnmap_path(output_file)
+    if os.path.exists(gnmap):
+        with contextlib.suppress(OSError):
+            os.replace(gnmap, gnmap + '.failed')
     return failed_path
 
 
@@ -4647,6 +4668,126 @@ def _write_combined_results(output_path, hosts_json, xml_hosts):
         print(_COLOR_RESULT + f'\nResults written to {output_path}/spoonmap_output.xml / .json' + _COLOR_RESET)
 
 
+def _parse_gnmap_line(line):
+    """Split one grepable ``Host:`` line into ``(ip, host_field, port_entries)``.
+
+    Returns None for anything that is not a host line carrying ports: comment
+    lines, and the ``Status: Up`` form a host-discovery pass emits.  Fields are
+    tab-separated, which is what makes the format greppable in the first place.
+    """
+    if not line.startswith('Host: '):
+        return None
+    fields = line.split('\t')
+    host_field = fields[0][len('Host: '):].strip()
+    if not host_field:
+        return None
+    ip = host_field.split()[0]
+    for field in fields[1:]:
+        if field.startswith('Ports: '):
+            entries = [e.strip() for e in field[len('Ports: '):].split(',')]
+            entries = [e for e in entries if e]
+            if entries:
+                return ip, host_field, entries
+            return None
+    return None
+
+
+def _gnmap_port_sort_key(entry):
+    """Order a grepable port entry (``22/open/tcp//ssh///``) by port number."""
+    try:
+        return (0, int(entry.split('/', 1)[0]))
+    except ValueError:
+        return (1, 0)
+
+
+def _aggregate_gnmap(result_dir):
+    """Merge ``*.gnmap`` in *result_dir* into one host line per host.
+
+    Each port is scanned by its own nmap run, so a host open on three ports
+    appears in three files.  Grepable output is one line per host, so the
+    per-port lines are merged rather than concatenated — otherwise anything
+    counting lines would over-count hosts, and the file would disagree with
+    spoonmap_output.xml/.json, which merge the same hosts.
+
+    Returns ``(lines, scanned_ports)``: the merged host lines in IP order, and
+    the set of port stems whose .gnmap was present.
+    """
+    merged = {}         # ip -> [host_field, {entry: None} used as ordered set]
+    scanned_ports = set()
+    try:
+        names = sorted(os.listdir(result_dir))
+    except OSError:
+        return [], scanned_ports
+    for fname in names:
+        if not fname.endswith('.gnmap'):
+            continue
+        scanned_ports.add(fname[:-len('.gnmap')])
+        try:
+            with open(os.path.join(result_dir, fname)) as fh:
+                content = fh.read()
+        except OSError as exc:
+            # One unreadable file must not cost the other ports' hosts.
+            print(_COLOR_ERROR + f'Warning: could not read {fname}: {exc}'
+                  + _COLOR_RESET)
+            continue
+        for line in content.splitlines():
+            parsed = _parse_gnmap_line(line.strip())
+            if parsed is None:
+                continue
+            ip, host_field, entries = parsed
+            if ip not in merged:
+                merged[ip] = [host_field, {}]
+            elif len(host_field) > len(merged[ip][0]):
+                # Prefer the form carrying a hostname over a bare address.
+                merged[ip][0] = host_field
+            for entry in entries:
+                merged[ip][1][entry] = None
+    lines = []
+    for ip in sorted(merged, key=_ip_sort_key):
+        host_field, entries = merged[ip]
+        ordered = sorted(entries, key=_gnmap_port_sort_key)
+        lines.append(f'Host: {host_field}\tPorts: {", ".join(ordered)}')
+    return lines, scanned_ports
+
+
+def _write_gnmap_result(output_path, result_dir):
+    """Write spoonmap_output.gnmap from the per-port .gnmap files.
+
+    Ports whose .xml is present but whose .gnmap is missing are named rather
+    than silently omitted: that is what a scan completed before greppable
+    output existed looks like on resume, and an artifact that quietly covers
+    fewer ports than the run did is a coverage claim the scan never made.
+    """
+    lines, scanned = _aggregate_gnmap(result_dir)
+    try:
+        # Only banner-pass outputs have a .gnmap sibling to be missing.
+        # _scan_extra_sql_ports() writes port{N}_sql.xml into this same
+        # directory with no -oG, so counting it here would warn about a gap
+        # that does not exist.
+        xml_stems = {f[:-len('.xml')] for f in os.listdir(result_dir)
+                     if f.startswith('port') and f.endswith('.xml')
+                     and not f.endswith('_sql.xml')}
+    except OSError:
+        xml_stems = set()
+    missing = sorted(xml_stems - scanned)
+    if not lines and not missing:
+        return
+    body = ('# SpooNMAP aggregated greppable output\n'
+            + ''.join(f'{line}\n' for line in lines)
+            + f'# SpooNMAP done: {len(lines)} hosts\n')
+    if _write_artifact(f'{output_path}/spoonmap_output.gnmap', body):
+        print(_COLOR_RESULT + f'\nGreppable output written to '
+              f'{output_path}/spoonmap_output.gnmap' + _COLOR_RESET)
+    if missing:
+        print(_COLOR_ERROR
+              + f'Warning: {len(missing)} port(s) have nmap XML but no greppable '
+              + 'output and are absent from spoonmap_output.gnmap: '
+              + ', '.join(missing[:5])
+              + (' ...' if len(missing) > 5 else '')
+              + '. Re-run those ports, or use spoonmap_output.xml, which covers them.'
+              + _COLOR_RESET)
+
+
 def _read_config_file(path):
     """Parse *path* as a JSON object, or print a clear diagnostic and exit.
 
@@ -5799,6 +5940,11 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 result_dir = f'{disc}/masscan_results/'
             hosts_json, xml_hosts = _aggregate_result_dir(result_dir, ip_to_hostname)
             _write_combined_results(output_path, hosts_json, xml_hosts)
+
+            # Greppable output only exists for the nmap banner pass; a
+            # masscan-only run has no -oG files to merge.
+            if banner_scan or script_scan:
+                _write_gnmap_result(output_path, result_dir)
 
             _combine_live_hosts(disc, output_path)
 

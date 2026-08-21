@@ -64,6 +64,11 @@ from spoonmap import (
     _combine_live_hosts,
     _load_config,
     _read_config_file,
+    _aggregate_gnmap,
+    _gnmap_path,
+    _gnmap_port_sort_key,
+    _parse_gnmap_line,
+    _write_gnmap_result,
     _write_artifact,
     _write_combined_results,
     _write_if_changed,
@@ -10830,3 +10835,244 @@ class TestWriteCliTargetFile:
     def test_atomic_leaves_no_temp_file(self, tmp_path):
         _write_cli_target_file(['10.0.0.5'], str(tmp_path))
         assert [p.name for p in tmp_path.iterdir()] == ['cli_targets.txt']
+
+
+# ── greppable (-oG) output ────────────────────────────────────────────────────
+
+class TestGnmapPath:
+    def test_swaps_xml_for_gnmap(self):
+        assert _gnmap_path('/out/nmap_results/port80.xml') == \
+            '/out/nmap_results/port80.gnmap'
+
+    def test_udp_port_filename(self):
+        assert _gnmap_path('/out/portU_161.xml') == '/out/portU_161.gnmap'
+
+
+class TestBannerPassGnmapFlag:
+    """Every banner pass gets its own -oG file; the script pass gets none."""
+
+    def test_tcp_banner_pass_includes_og(self):
+        cmd = _build_nmap_cmd('80', '/in.txt', '/out/port80.xml', '53',
+                              target_scan='External')
+        assert cmd[cmd.index('-oG') + 1] == '/out/port80.gnmap'
+
+    def test_udp_banner_pass_includes_og(self):
+        cmd = _build_nmap_cmd('U:161', '/in.txt', '/out/portU_161.xml', '53',
+                              target_scan='External')
+        assert cmd[cmd.index('-oG') + 1] == '/out/portU_161.gnmap'
+
+    def test_script_pass_has_no_og(self):
+        """A shared -oG across the script pass would duplicate the banner data."""
+        cmd = _build_nmap_cmd('80', '/in.txt', '/out/port80.xml', '53',
+                              script_scan=True, target_scan='External',
+                              script_only=True)
+        assert '-oG' not in cmd
+
+    def test_one_og_file_per_port(self):
+        """Distinct ports must not share an -oG target: concurrent workers
+        appending to one file interleave their writes."""
+        a = _build_nmap_cmd('22', '/in.txt', '/out/port22.xml', '53',
+                            target_scan='External')
+        b = _build_nmap_cmd('80', '/in.txt', '/out/port80.xml', '53',
+                            target_scan='External')
+        assert a[a.index('-oG') + 1] != b[b.index('-oG') + 1]
+        assert '--append-output' not in a
+
+
+class TestParseGnmapLine:
+    def test_host_with_ports(self):
+        ip, host_field, entries = _parse_gnmap_line(
+            'Host: 10.0.0.5 (web01)\tPorts: 22/open/tcp//ssh///'
+            '\tIgnored State: closed (1)')
+        assert ip == '10.0.0.5'
+        assert host_field == '10.0.0.5 (web01)'
+        assert entries == ['22/open/tcp//ssh///']
+
+    def test_multiple_ports_split_on_comma(self):
+        _, _, entries = _parse_gnmap_line(
+            'Host: 10.0.0.5 ()\tPorts: 22/open/tcp//ssh///, 80/open/tcp//http///')
+        assert entries == ['22/open/tcp//ssh///', '80/open/tcp//http///']
+
+    def test_status_up_line_ignored(self):
+        """A host-discovery line carries no ports and is not a scan result."""
+        assert _parse_gnmap_line('Host: 10.0.0.9 ()\tStatus: Up') is None
+
+    def test_comment_line_ignored(self):
+        assert _parse_gnmap_line('# Nmap 7.99 scan initiated') is None
+
+    def test_empty_host_field_ignored(self):
+        assert _parse_gnmap_line('Host: \tPorts: 22/open/tcp//ssh///') is None
+
+    def test_empty_ports_field_ignored(self):
+        assert _parse_gnmap_line('Host: 10.0.0.5 ()\tPorts: ') is None
+
+
+class TestGnmapPortSortKey:
+    def test_orders_numerically_not_lexically(self):
+        entries = ['443/open/tcp///', '80/open/tcp///', '8080/open/tcp///']
+        assert [e.split('/')[0] for e in sorted(entries, key=_gnmap_port_sort_key)] \
+            == ['80', '443', '8080']
+
+    def test_unparseable_entry_sorts_last_without_raising(self):
+        entries = ['garbage', '80/open/tcp///']
+        assert sorted(entries, key=_gnmap_port_sort_key)[0] == '80/open/tcp///'
+
+
+class TestAggregateGnmap:
+    def test_merges_one_line_per_host_across_ports(self, tmp_path):
+        """Each port is a separate nmap run, so a host open on two ports appears
+        in two files; grepable output is one line per host."""
+        (tmp_path / 'port22.gnmap').write_text(
+            'Host: 10.0.0.5 (web01)\tPorts: 22/open/tcp//ssh///\n')
+        (tmp_path / 'port80.gnmap').write_text(
+            'Host: 10.0.0.5 (web01)\tPorts: 80/open/tcp//http///\n')
+        lines, scanned = _aggregate_gnmap(str(tmp_path))
+        assert lines == [
+            'Host: 10.0.0.5 (web01)\tPorts: 22/open/tcp//ssh///, 80/open/tcp//http///']
+        assert scanned == {'port22', 'port80'}
+
+    def test_hosts_sorted_numerically(self, tmp_path):
+        (tmp_path / 'port22.gnmap').write_text(
+            'Host: 10.0.0.200 ()\tPorts: 22/open/tcp///\n'
+            'Host: 10.0.0.5 ()\tPorts: 22/open/tcp///\n')
+        lines, _ = _aggregate_gnmap(str(tmp_path))
+        assert lines[0].startswith('Host: 10.0.0.5')
+
+    def test_duplicate_port_entry_not_repeated(self, tmp_path):
+        (tmp_path / 'port22.gnmap').write_text(
+            'Host: 10.0.0.5 ()\tPorts: 22/open/tcp///\n')
+        (tmp_path / 'port22b.gnmap').write_text(
+            'Host: 10.0.0.5 ()\tPorts: 22/open/tcp///\n')
+        lines, _ = _aggregate_gnmap(str(tmp_path))
+        assert lines == ['Host: 10.0.0.5 ()\tPorts: 22/open/tcp///']
+
+    def test_hostname_form_preferred_over_bare_address(self, tmp_path):
+        (tmp_path / 'port22.gnmap').write_text(
+            'Host: 10.0.0.5 ()\tPorts: 22/open/tcp///\n')
+        (tmp_path / 'port80.gnmap').write_text(
+            'Host: 10.0.0.5 (web01)\tPorts: 80/open/tcp///\n')
+        lines, _ = _aggregate_gnmap(str(tmp_path))
+        assert lines[0].startswith('Host: 10.0.0.5 (web01)')
+
+    def test_non_gnmap_files_ignored(self, tmp_path):
+        (tmp_path / 'port22.xml').write_text('<nmaprun></nmaprun>')
+        (tmp_path / 'port22.gnmap.failed').write_text(
+            'Host: 10.9.9.9 ()\tPorts: 22/open/tcp///\n')
+        lines, scanned = _aggregate_gnmap(str(tmp_path))
+        assert lines == []
+        assert scanned == set()
+
+    def test_missing_directory_returns_empty(self, tmp_path):
+        lines, scanned = _aggregate_gnmap(str(tmp_path / 'nope'))
+        assert (lines, scanned) == ([], set())
+
+    def test_real_file_shape_comments_and_status_skipped(self, tmp_path):
+        """nmap always brackets -oG output with comment lines, and a host with
+        no open ports appears as 'Status: Up'."""
+        (tmp_path / 'port22.gnmap').write_text(
+            '# Nmap 7.99 scan initiated Thu Aug 21 11:00:00 2026 as: nmap -oG\n'
+            'Host: 10.0.0.5 (web01)\tPorts: 22/open/tcp//ssh///\tIgnored State: closed (1)\n'
+            'Host: 10.0.0.9 ()\tStatus: Up\n'
+            '# Nmap done at Thu Aug 21 11:00:04 2026 -- 2 IP addresses\n')
+        lines, _ = _aggregate_gnmap(str(tmp_path))
+        assert lines == [
+            'Host: 10.0.0.5 (web01)\tPorts: 22/open/tcp//ssh///']
+
+    def test_unreadable_file_does_not_lose_other_ports(self, tmp_path, capsys):
+        (tmp_path / 'port22.gnmap').write_text(
+            'Host: 10.0.0.5 ()\tPorts: 22/open/tcp///\n')
+        (tmp_path / 'port80.gnmap').mkdir()   # a directory reads as OSError
+        lines, _ = _aggregate_gnmap(str(tmp_path))
+        assert lines == ['Host: 10.0.0.5 ()\tPorts: 22/open/tcp///']
+        assert 'could not read' in capsys.readouterr().out
+
+
+class TestWriteGnmapResult:
+    def _results(self, tmp_path):
+        rd = tmp_path / 'nmap_results'
+        rd.mkdir()
+        return rd
+
+    def test_writes_aggregate_with_header_and_count(self, tmp_path):
+        rd = self._results(tmp_path)
+        (rd / 'port22.gnmap').write_text(
+            'Host: 10.0.0.5 ()\tPorts: 22/open/tcp///\n')
+        (rd / 'port22.xml').write_text('<nmaprun></nmaprun>')
+        _write_gnmap_result(str(tmp_path), str(rd))
+        content = (tmp_path / 'spoonmap_output.gnmap').read_text()
+        assert content.startswith('# SpooNMAP aggregated greppable output\n')
+        assert 'Host: 10.0.0.5 ()\tPorts: 22/open/tcp///' in content
+        assert content.endswith('# SpooNMAP done: 1 hosts\n')
+
+    def test_port_with_xml_but_no_gnmap_is_disclosed(self, tmp_path, capsys):
+        """A scan completed before -oG existed must not silently shrink the
+        artifact's coverage."""
+        rd = self._results(tmp_path)
+        (rd / 'port22.gnmap').write_text(
+            'Host: 10.0.0.5 ()\tPorts: 22/open/tcp///\n')
+        (rd / 'port22.xml').write_text('<nmaprun></nmaprun>')
+        (rd / 'port443.xml').write_text('<nmaprun></nmaprun>')
+        _write_gnmap_result(str(tmp_path), str(rd))
+        out = capsys.readouterr().out
+        assert 'port443' in out
+        assert '1 port(s)' in out
+
+    def test_sql_xml_not_reported_as_a_gap(self, tmp_path, capsys):
+        """_scan_extra_sql_ports writes port{N}_sql.xml with no -oG."""
+        rd = self._results(tmp_path)
+        (rd / 'port22.gnmap').write_text(
+            'Host: 10.0.0.5 ()\tPorts: 22/open/tcp///\n')
+        (rd / 'port22.xml').write_text('<nmaprun></nmaprun>')
+        (rd / 'port1433_sql.xml').write_text('<nmaprun></nmaprun>')
+        _write_gnmap_result(str(tmp_path), str(rd))
+        assert 'no greppable output' not in capsys.readouterr().out
+
+    def test_many_missing_ports_truncated(self, tmp_path, capsys):
+        rd = self._results(tmp_path)
+        for n in range(7):
+            (rd / f'port{100 + n}.xml').write_text('<nmaprun></nmaprun>')
+        _write_gnmap_result(str(tmp_path), str(rd))
+        out = capsys.readouterr().out
+        assert '7 port(s)' in out
+        assert '...' in out
+
+    def test_nothing_to_write_creates_no_file(self, tmp_path):
+        rd = self._results(tmp_path)
+        _write_gnmap_result(str(tmp_path), str(rd))
+        assert not (tmp_path / 'spoonmap_output.gnmap').exists()
+
+    def test_missing_result_dir_creates_no_file(self, tmp_path):
+        _write_gnmap_result(str(tmp_path), str(tmp_path / 'nope'))
+        assert not (tmp_path / 'spoonmap_output.gnmap').exists()
+
+    def test_gnmap_listed_for_cleanup(self):
+        """--cleanup must remove the new artifact along with the others."""
+        assert 'spoonmap_output.gnmap' in spoonmap._RESULT_FILES
+
+
+class TestQuarantineQuarantinesGnmap:
+    """A failed port's .gnmap must not outlive its quarantined .xml."""
+
+    def test_gnmap_sibling_renamed(self, tmp_path):
+        xml = tmp_path / 'port80.xml'
+        gnmap = tmp_path / 'port80.gnmap'
+        xml.write_text('<nmaprun></nmaprun>')
+        gnmap.write_text('Host: 10.0.0.5 ()\tPorts: 80/open/tcp///\n')
+        _quarantine_failed_output(str(xml))
+        assert not gnmap.exists()
+        assert (tmp_path / 'port80.gnmap.failed').exists()
+
+    def test_quarantined_gnmap_excluded_from_aggregate(self, tmp_path):
+        """The end the rename exists for: a failed port contributes nothing."""
+        xml = tmp_path / 'port80.xml'
+        xml.write_text('<nmaprun></nmaprun>')
+        (tmp_path / 'port80.gnmap').write_text(
+            'Host: 10.9.9.9 ()\tPorts: 80/open/tcp///\n')
+        _quarantine_failed_output(str(xml))
+        lines, _ = _aggregate_gnmap(str(tmp_path))
+        assert lines == []
+
+    def test_absent_gnmap_is_not_an_error(self, tmp_path):
+        xml = tmp_path / 'port80.xml'
+        xml.write_text('<nmaprun></nmaprun>')
+        assert _quarantine_failed_output(str(xml)) == str(xml) + '.failed'

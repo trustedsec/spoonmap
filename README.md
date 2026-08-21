@@ -297,14 +297,31 @@ Inter-scan wait: 29s (target ~256 hosts)
     masscan_results/portN.xml   # raw masscan XML per port (masscan port discovery path)
     live_hosts/portN.txt        # deduplicated IPs per port
   nmap_results/portN.xml        # nmap banner (-sV) XML per port
+  nmap_results/portN.gnmap      # nmap greppable (-oG) output per port
   nse_results/portN.xml         # nmap NSE script XML per port (script_scan only)
   all_live_hosts.txt            # union of all live IPs
   spoonmap_output.xml           # merged nmap XML (or masscan if no banner scan)
   spoonmap_output.json          # same data as JSON — list of host objects by IP
+  spoonmap_output.gnmap         # merged greppable output, one line per host (banner scan only)
   findings.txt                  # severity-sorted findings report (script_scan only)
   findings.md                   # same report in Markdown table format
   findings.json                 # same report as a JSON array (script_scan only)
 ```
+
+### Greppable output
+
+`spoonmap_output.gnmap` is nmap's grepable format — one line per host — merged across every port scanned in the banner pass:
+
+```
+# SpooNMAP aggregated greppable output
+Host: 10.0.0.5 (web01)	Ports: 22/open/tcp//ssh//OpenSSH 8.9p1/, 80/open/tcp//http//nginx 1.18/
+Host: 10.0.0.200 ()	Ports: 445/open/tcp//microsoft-ds///
+# SpooNMAP done: 2 hosts
+```
+
+Because each port is scanned by its own nmap invocation, nmap writes one `nmap_results/portN.gnmap` per port and SpooNMAP merges them, so a host open on three ports is one line with three port entries rather than three lines — matching how `spoonmap_output.xml`/`.json` merge the same hosts, and keeping line counts usable as host counts. Hosts are in numeric IP order and port entries in numeric port order, so the file is stable across runs and diffable between scans.
+
+Written for the banner scan only; a masscan-only run (`banner_scan` off) produces no grepable output. If a port has nmap XML but no `.gnmap` — a scan resumed from before this output existed — those ports are named in a warning rather than silently dropped from the aggregate.
 
 `spoonmap_output.json` consolidates hosts across all per-port files, merging ports for the same IP:
 
