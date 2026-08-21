@@ -1,0 +1,17 @@
+version: 2
+
+# ci.yml deliberately SHA-pins every action (a tag is a mutable, unaudited
+# third party with write access to this build), and pins bandit and ruff
+# exactly in pyproject.toml's `dev` group. Both are the right call, but a
+# hand-maintained pin never receives a security fix unless something proposes
+# the bump — Dependabot is that something, for both ecosystems it touches.
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
