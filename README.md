@@ -1,5 +1,7 @@
 # SpooNMAP
 
+[![CI](https://github.com/trustedsec/spoonmap/actions/workflows/ci.yml/badge.svg)](https://github.com/trustedsec/spoonmap/actions/workflows/ci.yml)
+
 ## Dependencies
 This script is a wrapper for masscan and nmap. nmap handles host discovery and (for smaller scans) port discovery, service banner grabbing, and NSE scripts. Masscan is used for large-scale port discovery where raw speed matters. Install both from your favourite package manager or from source.
 
@@ -443,3 +445,27 @@ On External scans, each externally-exposed sensitive service is additionally vul
 - **IKE/IPsec (U:500)** — [ike-version NSE](https://nmap.org/nsedoc/scripts/ike-version.html) · ike-scan --aggressive for hash capture · hashcat mode 5300 (IKEv1) / 5400 (IKEv2)
 - **IPMI (U:623)** — [US-CERT TA13-207A](https://www.cisa.gov/news-events/alerts/2013/07/26/risks-using-intelligent-platform-management-interface-ipmi) · [hashcat mode 7300](https://hashcat.net/wiki/doku.php?id=hashcat)
 - **VNC (5900/5901)** — [CVE-2006-2369](https://nvd.nist.gov/vuln/detail/CVE-2006-2369) · [vnc-info NSE](https://nmap.org/nsedoc/scripts/vnc-info.html) · [vnc-title NSE](https://nmap.org/nsedoc/scripts/vnc-title.html)
+
+## Development
+
+Run the test suite with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv run pytest tests/
+uv run pytest tests/test_spoonmap.py::TestGenerateFindings   # single class
+```
+
+Coverage is measured on every run and the suite fails below 95% (see
+`[tool.pytest.ini_options]` in `pyproject.toml`).
+
+`tests/test_nse_integration.py` binds real local ports and shells out to real
+nmap, so it skips itself where nmap is absent, where a port it needs is already
+in use, or (for the `-sU` cases) where the run is not root. A skip there is
+always an environment conflict, never an NSE result.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on every pull request and on pushes to `main`:
+the suite is exercised on Python 3.8–3.13 on Ubuntu plus Python 3.12 on macOS,
+with nmap installed on the Ubuntu jobs so the NSE integration tests actually
+run. It also checks that `uv.lock` is in sync with `pyproject.toml`.

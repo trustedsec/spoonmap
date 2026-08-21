@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to the same PR supersedes the previous run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        # pyproject declares requires-python >=3.8; every claimed version is tested.
+        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+        include:
+          # The tool is developed on macOS, which has its own termios/stty paths.
+          - os: macos-latest
+            python-version: '3.12'
+    steps:
+      - uses: actions/checkout@v4
+
+      # tests/test_nse_integration.py shells out to real nmap against local stub
+      # servers. Without nmap the whole module skips itself, so installing it is
+      # what makes the NSE assertions actually run.
+      - name: Install nmap
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends nmap
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Check uv.lock is up to date
+        run: uv lock --check
+
+      # Coverage reporting and the 95% floor come from [tool.pytest.ini_options]
+      # in pyproject.toml, so a coverage regression fails this step too.
+      - name: Run tests
+        run: uv run --frozen pytest tests/ -v
