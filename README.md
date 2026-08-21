@@ -39,10 +39,18 @@ Service Categories (comma-separated numbers, default: All)
 	(9) Specialized  [1090, 3300, 4786, 6970, 2375, 4243, 9100, 8530, 8531]
 	(10) Containers & Debuggers  [2377, 10250, 8001, 9229, 2345, 5005, 61616, 8009, 6000]
 	(11) Local LLM  [11434, 1234, 7860, 5000, 5001, 1337, 3000, 8000, 8080]
-	(12) Full Port Scan  [1-65535]
+	(12) Full Port Scan  [1-65535, TCP only — no UDP]
 	(c) Custom Port Scan  [enter your own comma-separated ports]
 
 (The Full Port Scan number increments automatically with the number of categories.)
+
+**Full Port Scan is TCP only.** It sweeps TCP 1-65535 and runs no UDP discovery at
+all, so every `U:` port listed in the categories above — SNMP (U:161), IKE (U:500),
+IPMI (U:623), IPP (U:631), OpenVPN (U:1194), NetBIOS (U:137), SQL Browser (U:1434) —
+is skipped, along with the NSE scripts and findings that depend on them. It is
+*wider* than All on TCP and *narrower* on UDP. For both, run All and Full as two
+passes, or use the Custom option with the UDP ports appended
+(e.g. `1-65535,U:161,U:500,U:623`).
 
 Which categories would you like to scan (e.g. 1,3 — default: All)?
 
@@ -87,7 +95,7 @@ You can also create a `config.json` file (based on `config.json.sample`) to skip
 ```
 
 To scan all categories, set `"scan_categories": "All"`.
-To scan all 65535 ports, set `"scan_categories": "Full"`.
+To scan all 65535 TCP ports, set `"scan_categories": "Full"` — note this is **TCP only** and performs no UDP discovery.
 For a fully custom port list, omit `scan_categories` and use `"dest_ports": ["80","443","U:53"]` instead.
 UDP ports are specified with a `U:` prefix (e.g. `"U:53"`).
 
@@ -139,7 +147,7 @@ git update-index --no-skip-worktree ranges.txt
 
 | Key | Values | Notes |
 |-----|--------|-------|
-| `scan_categories` | `"All"`, `"Full"`, or array of category names | `"Full"` scans all 65535 ports; e.g. `["Web","Database"]`; omit to use `dest_ports` |
+| `scan_categories` | `"All"`, `"Full"`, or array of category names | `"Full"` scans all 65535 **TCP** ports and no UDP; e.g. `["Web","Database"]`; omit to use `dest_ports` |
 | `dest_ports` | Array of port strings | Overrides `scan_categories`; use `U:` prefix for UDP |
 | `banner_scan` | `"True"` / `"False"` | Runs nmap -sV against discovered hosts |
 | `script_scan` | `"True"` / `"False"` | Runs NSE security scripts (implies `banner_scan`) |

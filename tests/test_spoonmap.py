@@ -2610,10 +2610,24 @@ class TestConfigFullScanCategory:
         assert scan_type == 'Full'
         assert dest_ports == ['1-65535']
 
+    def test_full_yields_no_udp_ports(self):
+        """Full is TCP-only: no U: entry reaches dest_ports, so no UDP discovery runs.
+
+        _nmap_udp_discovery() is driven by [p for p in dest_ports if
+        p.startswith('U:')], so an empty UDP slice here is what the docs promise.
+        """
+        _, dest_ports = self._resolve('Full')
+        assert [p for p in dest_ports if p.startswith('U:')] == []
+
     def test_all_is_unaffected(self):
         scan_type, dest_ports = self._resolve('All')
         assert scan_type == 'All'
         assert '1-65535' not in dest_ports
+
+    def test_all_does_cover_udp(self):
+        """The counterpart to Full's TCP-only behaviour — All keeps the U: ports."""
+        _, dest_ports = self._resolve('All')
+        assert 'U:623' in dest_ports
 
 
 # ── config source port derivation ────────────────────────────────────────────
@@ -2826,6 +2840,16 @@ class TestConfigDocs:
     def test_scan_categories_choices_track_service_categories(self):
         choices = dict(_CONFIG_DOCS['scan_categories'])['__scan_categories_choices__']
         assert choices == 'All, Full, ' + ', '.join(SERVICE_CATEGORIES)
+
+    def test_full_note_states_tcp_only_and_no_udp(self):
+        """Full is TCP 1-65535 with no UDP discovery; the note must say so.
+
+        The choices string lists Full alongside the categories, several of which
+        are UDP-only — without this the name reads as a superset of All.
+        """
+        note = dict(_CONFIG_DOCS['scan_categories'])['__scan_categories_full_note__']
+        assert 'TCP 1-65535 ONLY' in note
+        assert 'no UDP discovery' in note
 
     def test_host_discovery_note_does_not_claim_a_source_port_probe(self):
         """source_port is unconditionally '' — the note described a removed feature."""
