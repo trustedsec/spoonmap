@@ -5466,12 +5466,12 @@ def _load_config(config_parser, dir_path, resume=False):
 def _operator_dir():
     """Directory operator data (config.json, exclusions, output) resolves against.
 
-    Deliberately the CWD, not _DIR (the module's own location): an installed
-    `spoonmap` (via `uv tool install`) has a module directory inside uv's
-    managed tool venv, which is not a place an operator can put a config or
-    would want scan results written, and which `uv tool upgrade` rebuilds from
-    scratch. Pulled out of main() — which is pragma-no-cover — so this
-    derivation itself stays under test.
+    Deliberately the CWD, not _DIR (the module's own location): an operator's
+    config and scan results belong in the directory they ran the engagement
+    from, not wherever the module happens to be installed — those are
+    frequently different directories, regardless of install mechanism. Pulled
+    out of main() — which is pragma-no-cover — so this derivation itself
+    stays under test.
     """
     return os.getcwd()
 

@@ -11184,8 +11184,8 @@ class TestOperatorDirResolution:
         assert _operator_dir() == str(second)
 
     def test_operator_dir_is_not_module_relative(self, tmp_path, monkeypatch):
-        # Regression guard for PR #42: an installed spoonmap's module lives
-        # inside uv's managed tool venv, which must never be where operator
-        # data resolves.
+        # Regression guard for PR #42: wherever the module is installed must
+        # never be where operator data resolves, independent of install
+        # mechanism.
         monkeypatch.chdir(tmp_path)
         assert _operator_dir() != spoonmap._DIR
