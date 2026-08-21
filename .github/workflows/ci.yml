@@ -139,3 +139,119 @@ jobs:
         run: >
           uvx --from "bandit[toml]==1.9.4" bandit
           -r spoonmap.py -c pyproject.toml -b .bandit-baseline.json
+
+  # The built artifacts are a claimed interface ([project.scripts] installs a
+  # spoonmap entry point) that nothing else here exercises. This job builds
+  # them and asserts on the actual archive contents rather than trusting that
+  # [tool.hatch.build.targets.*] in pyproject.toml says what it means — that
+  # trust is exactly what let the wheel ship spoonmap.py alone, pointing at an
+  # nse/ directory that was never packaged, and let the sdist sweep in 54
+  # entries of local session scratch.
+  build:
+    name: build artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          python-version: '3.12'
+          enable-cache: true
+
+      - name: Build sdist and wheel
+        run: uv build
+
+      - name: Assert sdist excludes local scratch
+        run: |
+          python3 - <<'PYEOF'
+          import glob
+          import sys
+          import tarfile
+
+          path = glob.glob('dist/*.tar.gz')[0]
+          # config.json.sample is expected and must not trip this, so match
+          # the config.json basename exactly rather than as a substring.
+          banned_substrings = (
+              '.remember', '.superpowers', '.claude', 'PR_ai_ports', 'ranges.txt',
+          )
+          with tarfile.open(path) as tar:
+              names = tar.getnames()
+          offenders = [
+              n for n in names
+              if any(s in n for s in banned_substrings)
+              or n.split('/')[-1] == 'config.json'
+          ]
+          if offenders:
+              sys.exit(
+                  'sdist packaged local scratch it must not ship: '
+                  + ', '.join(offenders)
+              )
+          print(f'sdist clean: {len(names)} entries, none banned')
+          PYEOF
+
+      - name: Assert wheel contains every bundled NSE script
+        run: |
+          python3 - <<'PYEOF'
+          import glob
+          import os
+          import sys
+          import zipfile
+
+          # Derived from the nse/ directory listing, not hardcoded, so adding
+          # a script does not require editing this workflow.
+          expected = sorted(
+              f'spoonmap_nse/{name}'
+              for name in os.listdir('nse')
+              if name.endswith('.nse')
+          )
+          path = glob.glob('dist/*.whl')[0]
+          with zipfile.ZipFile(path) as z:
+              names = set(z.namelist())
+          missing = [n for n in expected if n not in names]
+          if missing:
+              sys.exit(f'wheel is missing bundled NSE scripts: {missing}')
+          print(f'wheel contains all {len(expected)} bundled NSE scripts')
+          PYEOF
+
+      - name: Install wheel into a clean venv and verify NSE paths resolve
+        run: |
+          wheel=$(ls dist/*.whl)
+          venv_dir=$(mktemp -d)
+          uv venv "$venv_dir/venv"
+          uv pip install --python "$venv_dir/venv/bin/python" "$wheel"
+          # cd out of the checkout first: spoonmap.py sitting in the cwd would
+          # shadow the installed site-packages copy, defeating the point of
+          # this check.
+          cd "$venv_dir"
+          "$venv_dir/venv/bin/python" - <<'PYEOF'
+          import os
+          import sys
+
+          import spoonmap
+          from spoonmap import EXTERNAL_PORT_SCRIPTS, INTERNAL_PORT_SCRIPTS
+
+
+          def nse_paths(port_scripts):
+              paths = []
+              for flags in port_scripts.values():
+                  for token in flags.split(','):
+                      if token.endswith('.nse'):
+                          paths.append(token)
+              return paths
+
+
+          paths = nse_paths(INTERNAL_PORT_SCRIPTS) + nse_paths(EXTERNAL_PORT_SCRIPTS)
+          if not paths:
+              sys.exit('expected at least one bundled .nse path to check')
+          missing = [p for p in paths if not os.path.isfile(p)]
+          if missing:
+              sys.exit(
+                  'installed wheel resolves NSE paths that do not exist on disk: '
+                  + str(missing)
+              )
+          print(f'installed wheel: {len(paths)} NSE paths all resolve on disk')
+          PYEOF
