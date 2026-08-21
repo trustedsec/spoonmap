@@ -15,3 +15,11 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # spoonmap.py itself is dependency-free stdlib — every locked dependency
+    # today lives in pyproject.toml's `[dependency-groups] dev` (pytest,
+    # ruff, bandit). Scoping to development dependencies keeps that true:
+    # the moment a runtime dependency is added, it's `production` and this
+    # allow-list stops silently covering it until someone reviews and widens
+    # the scope on purpose.
+    allow:
+      - dependency-type: "development"
