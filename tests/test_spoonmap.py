@@ -55,6 +55,12 @@ from spoonmap import (
     _CONFIG_GENERATED_KEY,
     _host_discovery,
     _atomic_write,
+    _cli_target_from_argv,
+    _parse_range_line,
+    _parse_target_arg,
+    _parse_target_ranges,
+    _resolve_cli_target,
+    _write_cli_target_file,
     _combine_live_hosts,
     _load_config,
     _read_config_file,
@@ -10662,3 +10668,165 @@ class TestInternalHostDiscovery:
             with pytest.raises(KeyboardInterrupt):
                 _internal_host_discovery(
                     str(targets), str(disc), '1000', None, HOST_DISCOVERY_NMAP_THRESHOLD)
+
+
+# ── --target CLI flag ─────────────────────────────────────────────────────────
+
+class TestParseRangeLine:
+    """The shared per-line parser behind both target files and --target."""
+
+    @pytest.mark.parametrize('line,expected', [
+        ('10.0.0.5', (167772165, 167772165)),
+        ('10.0.0.0/30', (167772160, 167772163)),
+        ('10.0.0.1-10.0.0.3', (167772161, 167772163)),
+        ('10.0.0.0 255.255.255.252', (167772160, 167772163)),
+    ])
+    def test_accepted_forms(self, line, expected):
+        bounds, error = _parse_range_line(line)
+        assert error is None
+        assert bounds == expected
+
+    def test_ipv6_reported_separately(self):
+        """IPv6 parses but is not IPv4, so it gets its own error code."""
+        bounds, error = _parse_range_line('2001:db8::/32')
+        assert bounds is None
+        assert error == 'ipv6'
+
+    @pytest.mark.parametrize('line', [
+        'nonsense',
+        '10.0.0.9-10.0.0.1',       # reversed range
+        '10.0.0.0 999.999.999.999',
+        '10.0.0.300',
+    ])
+    def test_rejected_forms(self, line):
+        bounds, error = _parse_range_line(line)
+        assert bounds is None
+        assert error == 'invalid'
+
+    def test_file_parser_still_skips_bad_lines_silently(self, tmp_path):
+        """Extracting the helper must not change _parse_target_ranges behaviour:
+        a junk line is skipped without aborting the surrounding parse."""
+        f = tmp_path / 'ranges.txt'
+        f.write_text('10.0.0.0/30\nnonsense\n10.0.1.1\n')
+        assert _parse_target_ranges(str(f)) == [
+            (167772160, 167772163), (167772417, 167772417)]
+
+    def test_file_parser_warns_on_ipv6_with_line_number(self, tmp_path, capsys):
+        f = tmp_path / 'ranges.txt'
+        f.write_text('10.0.0.1\n2001:db8::1\n')
+        result = _parse_target_ranges(str(f))
+        out = capsys.readouterr().out
+        assert result == [(167772161, 167772161)]
+        assert 'line 2' in out
+        assert 'IPv4 only' in out
+
+
+class TestParseTargetArg:
+    """--target value validation."""
+
+    def test_single_ip(self):
+        assert _parse_target_arg('10.0.0.5') == ['10.0.0.5']
+
+    def test_comma_separated_with_whitespace(self):
+        assert _parse_target_arg(' 10.0.0.0/24 , 10.0.1.5 ') == [
+            '10.0.0.0/24', '10.0.1.5']
+
+    def test_range_and_netmask_forms(self):
+        assert _parse_target_arg('10.0.0.1-10.0.0.9') == ['10.0.0.1-10.0.0.9']
+        assert _parse_target_arg('10.0.0.0 255.255.0.0') == ['10.0.0.0 255.255.0.0']
+
+    def test_empty_value_rejected(self):
+        with pytest.raises(ValueError, match='no address'):
+            _parse_target_arg('')
+
+    def test_only_commas_rejected(self):
+        with pytest.raises(ValueError, match='no address'):
+            _parse_target_arg(' , , ')
+
+    def test_ipv6_rejected_by_name(self):
+        with pytest.raises(ValueError, match='not IPv4'):
+            _parse_target_arg('2001:db8::1')
+
+    def test_garbage_rejected_naming_the_token(self):
+        """The message must name the offending token, not just fail."""
+        with pytest.raises(ValueError, match='nope'):
+            _parse_target_arg('10.0.0.1,nope')
+
+
+class TestCliTargetFromArgv:
+    """--target extraction from argv."""
+
+    def test_absent_returns_none(self):
+        assert _cli_target_from_argv(['spoonmap.py']) is None
+
+    def test_value_returned(self):
+        assert _cli_target_from_argv(
+            ['spoonmap.py', '--target', '10.0.0.5']) == '10.0.0.5'
+
+    def test_value_missing_at_end_rejected(self):
+        with pytest.raises(ValueError, match='requires an address'):
+            _cli_target_from_argv(['spoonmap.py', '--target'])
+
+    def test_next_flag_not_consumed_as_value(self):
+        """--target --resume must not treat --resume as an address."""
+        with pytest.raises(ValueError, match='requires an address'):
+            _cli_target_from_argv(['spoonmap.py', '--target', '--resume'])
+
+    def test_coexists_with_other_flags(self):
+        assert _cli_target_from_argv(
+            ['spoonmap.py', '--resume', '--target', '10.0.0.5']) == '10.0.0.5'
+
+
+class TestResolveCliTarget:
+    """main()'s entry point: returns tokens or exits non-zero."""
+
+    def test_absent_returns_none(self):
+        assert _resolve_cli_target(['spoonmap.py']) is None
+
+    def test_valid_returns_tokens(self):
+        assert _resolve_cli_target(
+            ['spoonmap.py', '--target', '10.0.0.0/24']) == ['10.0.0.0/24']
+
+    def test_invalid_exits_nonzero(self, capsys):
+        """A bad address must abort the run, not scan an empty target set."""
+        with pytest.raises(SystemExit) as exc:
+            _resolve_cli_target(['spoonmap.py', '--target', 'nope'])
+        assert exc.value.code == 1
+        assert 'ERROR' in capsys.readouterr().out
+
+    def test_missing_value_exits_nonzero(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _resolve_cli_target(['spoonmap.py', '--target'])
+        assert exc.value.code == 1
+        assert 'requires an address' in capsys.readouterr().out
+
+
+class TestWriteCliTargetFile:
+    """--target writes its own scope file and never touches ranges.txt."""
+
+    def test_writes_one_token_per_line(self, tmp_path):
+        path = _write_cli_target_file(['10.0.0.5', '10.0.1.0/24'], str(tmp_path))
+        assert Path(path).read_text() == '10.0.0.5\n10.0.1.0/24\n'
+
+    def test_lands_in_output_path(self, tmp_path):
+        path = _write_cli_target_file(['10.0.0.5'], str(tmp_path))
+        assert path == str(tmp_path / 'cli_targets.txt')
+
+    def test_does_not_touch_ranges_txt(self, tmp_path):
+        """ranges.txt is the operator's scope input; a convenience flag must
+        never overwrite it (the 2021 PR #12 approach did)."""
+        ranges = tmp_path / 'ranges.txt'
+        ranges.write_text('192.168.50.0/24\n')
+        _write_cli_target_file(['10.0.0.5'], str(tmp_path))
+        assert ranges.read_text() == '192.168.50.0/24\n'
+
+    def test_output_is_parseable_by_the_file_parser(self, tmp_path):
+        """Round-trip: what --target writes must be what the scan can read."""
+        path = _write_cli_target_file(
+            ['10.0.0.0/30', '10.0.1.1-10.0.1.3'], str(tmp_path))
+        assert _parse_target_ranges(path) == [
+            (167772160, 167772163), (167772417, 167772419)]
+
+    def test_atomic_leaves_no_temp_file(self, tmp_path):
+        _write_cli_target_file(['10.0.0.5'], str(tmp_path))
+        assert [p.name for p in tmp_path.iterdir()] == ['cli_targets.txt']

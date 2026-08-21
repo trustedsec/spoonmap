@@ -194,45 +194,132 @@ def _parse_target_ranges(filepath):
                 line = line.split('#')[0].strip()
                 if not line:
                     continue
-                # Standard CIDR or bare IP
-                try:
-                    net = ipaddress.ip_network(line, strict=False)
-                except ValueError:
-                    net = None
-                if net is not None:
-                    if net.version != 4:
-                        print(_COLOR_ERROR
-                              + f'Warning: {filepath} line {lineno}: '
-                              + f'ignoring non-IPv4 target "{line}" '
-                              + '— SpooNMAP scans IPv4 only.'
-                              + _COLOR_RESET)
-                        continue
-                    ranges.append((int(net.network_address),
-                                   int(net.broadcast_address)))
+                bounds, error = _parse_range_line(line)
+                if error == 'ipv6':
+                    print(_COLOR_ERROR
+                          + f'Warning: {filepath} line {lineno}: '
+                          + f'ignoring non-IPv4 target "{line}" '
+                          + '— SpooNMAP scans IPv4 only.'
+                          + _COLOR_RESET)
                     continue
-                # Range notation: A.B.C.D-E.F.G.H
-                if '-' in line:
-                    parts = line.split('-', 1)
-                    try:
-                        start = int(ipaddress.IPv4Address(parts[0].strip()))
-                        end   = int(ipaddress.IPv4Address(parts[1].strip()))
-                        if start <= end:
-                            ranges.append((start, end))
-                        continue
-                    except ValueError:
-                        pass
-                # Netmask notation: A.B.C.D M.M.M.M
-                parts = line.split()
-                if len(parts) == 2:
-                    try:
-                        net = ipaddress.ip_network(f'{parts[0]}/{parts[1]}', strict=False)
-                        ranges.append((int(net.network_address),
-                                       int(net.broadcast_address)))
-                    except ValueError:
-                        pass
+                # An unparseable line is skipped silently, as it always has been:
+                # masscan accepts forms this parser does not model, and this
+                # function also runs on the exclusions file.
+                if bounds is not None:
+                    ranges.append(bounds)
     except OSError:
         pass
     return ranges
+
+
+def _parse_range_line(line):
+    """Parse one masscan-style target line into inclusive IPv4 ``(start, end)``.
+
+    Returns a ``(bounds, error)`` pair: *bounds* is the tuple or None, and
+    *error* is None, ``'ipv6'`` (parsed, but not IPv4), or ``'invalid'``.
+
+    Split out of _parse_target_ranges() so that --target validates a value
+    against exactly the syntax a target *file* accepts.  Two parsers would
+    drift, and the divergence would show up as a CLI target the tool accepts
+    at the command line and then silently fails to scan.
+    """
+    # Standard CIDR or bare IP
+    try:
+        net = ipaddress.ip_network(line, strict=False)
+    except ValueError:
+        net = None
+    if net is not None:
+        if net.version != 4:
+            return None, 'ipv6'
+        return (int(net.network_address), int(net.broadcast_address)), None
+    # Range notation: A.B.C.D-E.F.G.H
+    if '-' in line:
+        parts = line.split('-', 1)
+        try:
+            start = int(ipaddress.IPv4Address(parts[0].strip()))
+            end   = int(ipaddress.IPv4Address(parts[1].strip()))
+            if start <= end:
+                return (start, end), None
+            return None, 'invalid'
+        except ValueError:
+            pass
+    # Netmask notation: A.B.C.D M.M.M.M
+    parts = line.split()
+    if len(parts) == 2:
+        try:
+            net = ipaddress.ip_network(f'{parts[0]}/{parts[1]}', strict=False)
+            return (int(net.network_address), int(net.broadcast_address)), None
+        except ValueError:
+            pass
+    return None, 'invalid'
+
+
+def _parse_target_arg(value):
+    """Validate a ``--target`` value into a list of target lines.
+
+    Accepts a comma-separated list of anything a target file line may hold (bare
+    IP, CIDR, ``A-B`` range, ``addr netmask``).  Raises ValueError naming the
+    offending token, so a typo is rejected before the scan starts rather than
+    producing a clean run over an empty target set — a false negative with a
+    report attached is this tool's worst outcome.
+    """
+    tokens = [tok.strip() for tok in value.split(',')]
+    tokens = [tok for tok in tokens if tok]
+    if not tokens:
+        raise ValueError('--target was given no address')
+    for tok in tokens:
+        bounds, error = _parse_range_line(tok)
+        if error == 'ipv6':
+            raise ValueError(f'--target "{tok}" is not IPv4 '
+                             '— SpooNMAP scans IPv4 only')
+        if bounds is None:
+            raise ValueError(f'--target "{tok}" is not a valid '
+                             'IP, CIDR, range, or address/netmask')
+    return tokens
+
+
+def _cli_target_from_argv(argv):
+    """Return the ``--target`` value from *argv*, or None if not supplied.
+
+    Raises ValueError when the flag is present but its value is missing, so
+    ``--target --resume`` cannot silently consume the next flag as an address.
+    """
+    if '--target' not in argv:
+        return None
+    idx = argv.index('--target')
+    if idx + 1 >= len(argv) or argv[idx + 1].startswith('-'):
+        raise ValueError('--target requires an address, e.g. --target 10.0.0.5')
+    return argv[idx + 1]
+
+
+def _resolve_cli_target(argv):
+    """Return validated ``--target`` tokens from *argv*, or None if absent.
+
+    Exits non-zero on a malformed value.  Lives outside main() so the reject
+    path is testable: main() is an interactive entry point excluded from
+    coverage, and "bad --target aborts the run" is exactly the behaviour that
+    must not regress into a clean scan over an empty target set.
+    """
+    try:
+        value = _cli_target_from_argv(argv)
+        return _parse_target_arg(value) if value else None
+    except ValueError as exc:
+        print(_COLOR_ERROR + f'ERROR: {exc}' + _COLOR_RESET)
+        sys.exit(1)
+
+
+def _write_cli_target_file(tokens, output_path):
+    """Write ``--target`` addresses to a scope file and return its path.
+
+    Deliberately does *not* touch ranges.txt.  That file is the operator's
+    engagement scope input and is tracked in-repo as an empty template;
+    overwriting it from a convenience flag would destroy scope data and leave no
+    record of what was actually authorised.  Written through _atomic_write() so
+    a partial write can never be read as a complete target list.
+    """
+    path = os.path.join(output_path, 'cli_targets.txt')
+    _atomic_write(path, ''.join(f'{tok}\n' for tok in tokens))
+    return path
 
 
 def _merge_ranges(ranges):
@@ -5257,6 +5344,9 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         if '--cleanup' in sys.argv:
             _cleanup_cmd(dir_path)  # prints result and exits
         resume = '--resume' in sys.argv
+        # Validate --target up front: a bad address must abort before any
+        # prompting or scanning, not after.
+        cli_target_tokens = _resolve_cli_target(sys.argv)
         config_loaded = False
         config_generated = False
         if os.path.exists(f'{dir_path}/config.json'):
@@ -5480,6 +5570,14 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                     f'(default: {output_path}): '
                     ) or output_path
             os.makedirs(output_path, exist_ok=True)
+
+        # --target overrides both config.json and the prompt, and must be applied
+        # after output_path is known so the generated scope file lands with the
+        # rest of the run's output.
+        if cli_target_tokens:
+            target_file = _write_cli_target_file(cli_target_tokens, output_path)
+            print(_COLOR_INFO + f'Using --target: {", ".join(cli_target_tokens)}'
+                  + _COLOR_RESET)
 
         if not target_file:
             target_file = _prior_default(prior, 'target_file', output_path+"/ranges.txt")
