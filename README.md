@@ -109,6 +109,20 @@ If a previous scan's output is detected in `output_path`, the tool offers three 
 
 Re-answering the prompts rewrites `config.json`, **merging** rather than overwriting: any keys you added to the file by hand are preserved.
 
+### Scanning a target without a file
+
+To scan a single address (or a short list) without editing a target file, use `--target`:
+
+```
+./spoonmap.py --target 10.0.0.5
+./spoonmap.py --target 10.0.0.0/24
+./spoonmap.py --target 10.0.0.5,10.0.1.0/24,10.0.2.1-10.0.2.9
+```
+
+The value accepts anything a target file line accepts — bare IP, CIDR, `A-B` range, or `address netmask` — comma-separated. It is validated before the scan starts: a malformed or IPv6 address aborts with a non-zero exit naming the offending entry, rather than running cleanly over an empty target set.
+
+`--target` takes precedence over both `config.json`'s `target_file` and the interactive prompt, so it also works in otherwise fully non-interactive runs. The addresses are written to `cli_targets.txt` in `output_path`; **`ranges.txt` is never modified**, so your engagement scope file stays intact and there is a record on disk of what each run actually targeted.
+
 To resume an interrupted scan without any prompts, use the `--resume` flag:
 
 ```
