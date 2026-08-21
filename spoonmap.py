@@ -5357,7 +5357,7 @@ def _config_target_scan(value):
             return valid
     print(_COLOR_ERROR + f'ERROR: config.json: target_scan = {value!r} is not '
                          "'Internal' or 'External'." + _COLOR_RESET)
-    print('See config.json.sample for the expected keys, or delete '
+    print(f'See {_DIR}/config.json.sample for the expected keys, or delete '
           'config.json to be prompted instead.')
     sys.exit(1)
 
@@ -5380,7 +5380,7 @@ def _load_config(config_parser, dir_path, resume=False):
         print(_COLOR_ERROR + 'ERROR: config.json is missing required '
                              f'{"key" if len(missing) == 1 else "keys"}: '
                              + ', '.join(missing) + _COLOR_RESET)
-        print('See config.json.sample for the expected keys, or delete '
+        print(f'See {_DIR}/config.json.sample for the expected keys, or delete '
               'config.json to be prompted instead.')
         sys.exit(1)
 
@@ -5463,12 +5463,24 @@ def _load_config(config_parser, dir_path, resume=False):
     }
 
 
+def _operator_dir():
+    """Directory operator data (config.json, exclusions, output) resolves against.
+
+    Deliberately the CWD, not _DIR (the module's own location): an installed
+    `spoonmap` (via `uv tool install`) has a module directory inside uv's
+    managed tool venv, which is not a place an operator can put a config or
+    would want scan results written, and which `uv tool upgrade` rebuilds from
+    scratch. Pulled out of main() — which is pragma-no-cover — so this
+    derivation itself stays under test.
+    """
+    return os.getcwd()
+
+
 # The Main Guts
 def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
     # already-independently-tested functions behind input()-driven prompts,
     # so there's little signal in mocking every prompt/subprocess in one
     # giant test versus exercising each called function directly.
-    global dir_path
     global output_path
 
     # Save initial terminal state
@@ -5496,7 +5508,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
 
 
         # Get options from configuration file if it exists
-        dir_path = os.path.dirname(os.path.realpath(__file__))
+        dir_path = _operator_dir()
 
         if '--cleanup' in sys.argv:
             _cleanup_cmd(dir_path)  # prints result and exits
