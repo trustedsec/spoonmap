@@ -5468,11 +5468,11 @@ def _operator_dir():
 
     Deliberately the CWD, not _DIR (the module's own location): an installed
     `spoonmap`'s module directory lives inside uv's managed tool environment,
-    which `uv tool upgrade` rebuilds from scratch — anything stored there,
-    config or scan results, is destroyed on upgrade. That is the failure mode
-    that makes the CWD the only defensible choice, not merely a stylistic
-    preference. Pulled out of main() — which is pragma-no-cover — so this
-    derivation itself stays under test.
+    which is rebuilt whenever `uv tool upgrade` actually installs a new
+    version — anything stored there, config or scan results, is lost at that
+    point. That is the failure mode that makes the CWD the only defensible
+    choice, not merely a stylistic preference. Pulled out of main() — which
+    is pragma-no-cover — so this derivation itself stays under test.
     """
     return os.getcwd()
 
