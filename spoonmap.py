@@ -1943,7 +1943,7 @@ def _build_nmap_cmd(dest_port, input_file, output_file, source_port,
             dest_port[2:] if 'U:' in dest_port else dest_port,
             '--open', '--randomize-hosts',
         ]
-        if source_port and dest_port not in _SMB_PORTS:
+        if source_port and dest_port not in _MULTI_SCRIPT_PORTS:
             cmd += ['--source-port', source_port]
         cmd += ['-iL', input_file, '-oX', output_file]
         scripts = _get_scripts_for_port(dest_port, target_scan)
@@ -1974,8 +1974,9 @@ def _build_nmap_cmd(dest_port, input_file, output_file, source_port,
             '-Pn', '-p', dest_port,
             '--open', '--randomize-hosts',
         ]
-        # Skip --source-port for SMB when scripts run to avoid 4-tuple collision
-        if source_port and not (script_scan and dest_port in _SMB_PORTS):
+        # Skip --source-port on multi-script ports when scripts run, to avoid
+        # 4-tuple collision between concurrent NSE connections
+        if source_port and not (script_scan and dest_port in _MULTI_SCRIPT_PORTS):
             cmd += ['--source-port', source_port]
 
     cmd += ['-iL', input_file, '-oX', output_file]
@@ -2458,8 +2459,8 @@ EXTERNAL_PORT_SCRIPTS = {
     'U:500': 'ike-version',
     'U:1194': f'{_DIR}/nse/openvpn-detect.nse',
     '1194':  f'{_DIR}/nse/openvpn-detect.nse',
-    '5900':  'vnc-info,realvnc-auth-bypass',
-    '5901':  'vnc-info,realvnc-auth-bypass',
+    '5900':  'vnc-info,realvnc-auth-bypass,vnc-title',
+    '5901':  'vnc-info,realvnc-auth-bypass,vnc-title',
     '631':   f'{_DIR}/nse/cups-browsed-rce.nse',
     'U:631': f'{_DIR}/nse/cups-browsed-rce.nse',
     '8530':  f'{_DIR}/nse/wsus-detect.nse',
@@ -2512,8 +2513,8 @@ INTERNAL_PORT_SCRIPTS = {
     'U:500': 'ike-version',
     'U:1194': f'{_DIR}/nse/openvpn-detect.nse',
     '1194':  f'{_DIR}/nse/openvpn-detect.nse',
-    '5900':  'vnc-info,realvnc-auth-bypass',
-    '5901':  'vnc-info,realvnc-auth-bypass',
+    '5900':  'vnc-info,realvnc-auth-bypass,vnc-title',
+    '5901':  'vnc-info,realvnc-auth-bypass,vnc-title',
     '631':   f'{_DIR}/nse/cups-browsed-rce.nse',
     'U:631': f'{_DIR}/nse/cups-browsed-rce.nse',
     '8530':  f'{_DIR}/nse/wsus-detect.nse',
@@ -2528,9 +2529,16 @@ INTERNAL_PORT_SCRIPTS = {
     '8000':  f'{_DIR}/nse/openai-api-detect.nse',
 }
 
-# Ports that use multiple concurrent NSE scripts; omit --source-port to prevent
-# TCP 4-tuple collision when nsock opens parallel connections to the same target.
 _SMB_PORTS = frozenset({'139', '445'})
+
+# Ports whose NSE scripts run concurrently against the same service; omit
+# --source-port for these to prevent TCP 4-tuple collision when nsock opens
+# parallel connections to the same target — with a fixed source port every
+# script connects from the same (src, dst) tuple and all but one fail silently.
+# VNC has three portrule scripts (vnc-info, realvnc-auth-bypass, vnc-title),
+# each opening its own RFB connection; for vnc-title a lost connection reads as
+# "no desktop name" rather than as an error.
+_MULTI_SCRIPT_PORTS = _SMB_PORTS | frozenset({'5900', '5901'})
 
 # Windows SMB ports are always co-resident; merge their live hosts after scanning
 # so a missed SYN-ACK on one port does not suppress nmap SMB script checks.
@@ -3505,6 +3513,23 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                             'The VNC server accepts connections with no password (security type "None"). '
                             'Any client can view and control the desktop without credentials.')
 
+                # ── vnc-title (desktop name via no-auth or bypassed login) ────
+                # vnc-title only produces a name once it is actually logged in —
+                # via security type None or the realvnc-auth-bypass flaw, since
+                # vnc-brute is not run — so any name is corroboration of the
+                # CRITICAL/HIGH above plus the identity of the exposed desktop.
+                if 'vnc-title' in scripts:
+                    # Success is a multi-line table (name/geometry/color_depth);
+                    # every failure path returns stdnse.format_output(false, ...),
+                    # which renders as "ERROR: ...".  Collapse the whitespace so
+                    # the detail stays on one line in findings.txt.
+                    out = ' '.join(scripts['vnc-title'].split())
+                    if out and not out.upper().startswith('ERROR'):
+                        add('LOW', ip, port_str,
+                            'VNC Desktop Name Disclosed',
+                            f'{out[:200]} — read without supplying credentials, '
+                            'so this desktop session is reachable unauthenticated.')
+
                 # ── realvnc-auth-bypass (CVE-2006-2369) ──────────────────────
                 if 'realvnc-auth-bypass' in scripts:
                     out = scripts['realvnc-auth-bypass']
@@ -4240,6 +4265,14 @@ def _write_artifact(path, content):
         return False
 
 
+# Findings whose detail string differs per host, so findings.txt must print it
+# alongside each host instead of collapsing the group to one description.
+_PER_HOST_DETAIL_TITLES = frozenset({
+    'Service Exposed Externally',
+    'VNC Desktop Name Disclosed',
+})
+
+
 def _write_findings_txt(output_path, target_scan, findings):
     today = datetime.date.today()
     lines = [
@@ -4277,9 +4310,10 @@ def _write_findings_txt(output_path, target_scan, findings):
             repro = _FINDING_REPRO.get(title, {})
             lines.append(f'  [{title}]  port {port_str}')
             lines.append(f'  Affected hosts ({len(hosts)}):')
-            if title == 'Service Exposed Externally':
-                # Detail (exposure label + embedded per-host vuln check) varies per
-                # host, so render it inline rather than collapsing to one line.
+            if title in _PER_HOST_DETAIL_TITLES:
+                # Detail varies per host (exposure label + embedded vuln check;
+                # the VNC desktop name), so render it inline rather than
+                # collapsing the group to one shared description.
                 for h, d in sorted(grp['host_details']):
                     lines.append(f'{h}  —  {d}')
             else:

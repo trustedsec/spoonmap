@@ -7472,7 +7472,7 @@ class TestWsusDetection:
 
 
 class TestVNCFindings:
-    """VNC findings from vnc-info and realvnc-auth-bypass scripts."""
+    """VNC findings from vnc-info, realvnc-auth-bypass and vnc-title scripts."""
 
     def test_vnc_no_auth_critical(self, nmap_dir):
         """vnc-info output with security type None -> CRITICAL finding."""
@@ -7531,6 +7531,84 @@ class TestVNCFindings:
         assert 'VNC No Authentication Required' in content
         assert 'CRITICAL' in content
         assert '10.0.2.5' in content
+
+    def test_vnc_title_output_low_finding(self, nmap_dir):
+        """vnc-title returning a desktop name -> LOW finding carrying the name."""
+        xml = _nmap_xml(
+            '10.0.2.6', 'tcp', '5900',
+            scripts={'vnc-title': '\n  name: root\'s X desktop (kiosk01:0)'
+                                  '\n  geometry: 1024 x 768\n  color_depth: 24'})
+        (nmap_dir / 'nse_results' / 'port5900.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        content = (nmap_dir / 'findings.txt').read_text()
+        assert 'VNC Desktop Name Disclosed' in content
+        assert 'LOW' in content
+        assert '10.0.2.6' in content
+        assert 'kiosk01:0' in content
+        # Multi-line NSE table must be collapsed to one line in findings.txt
+        assert 'color_depth: 24' in content
+        for line in content.splitlines():
+            if 'kiosk01:0' in line:
+                assert 'geometry: 1024 x 768' in line
+
+    def test_vnc_title_on_port_5901(self, nmap_dir):
+        """vnc-title finding also fires on 5901 and on Internal scans."""
+        xml = _nmap_xml(
+            '10.0.2.7', 'tcp', '5901',
+            scripts={'vnc-title': '\n  name: build-agent\n  geometry: 800 x 600'})
+        (nmap_dir / 'nse_results' / 'port5901.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        content = (nmap_dir / 'findings.txt').read_text()
+        assert 'VNC Desktop Name Disclosed' in content
+        assert '10.0.2.7' in content
+
+    def test_vnc_title_blank_output_no_finding(self, nmap_dir):
+        """Whitespace-only vnc-title output -> no finding."""
+        xml = _nmap_xml('10.0.2.8', 'tcp', '5900', scripts={'vnc-title': '   \n  '})
+        (nmap_dir / 'nse_results' / 'port5900.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        findings_file = nmap_dir / 'findings.txt'
+        if findings_file.exists():
+            assert 'VNC Desktop Name Disclosed' not in findings_file.read_text()
+
+    def test_vnc_title_error_output_no_finding(self, nmap_dir):
+        """vnc-title ERROR output (login failed) -> no finding."""
+        xml = _nmap_xml(
+            '10.0.2.9', 'tcp', '5900',
+            scripts={'vnc-title': "ERROR: Couldn't log in: Authentication failed"})
+        (nmap_dir / 'nse_results' / 'port5900.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        findings_file = nmap_dir / 'findings.txt'
+        if findings_file.exists():
+            assert 'VNC Desktop Name Disclosed' not in findings_file.read_text()
+
+
+class TestVNCTitleScriptWiring:
+    """vnc-title is mapped to 5900/5901 and does not collide on --source-port."""
+
+    @pytest.mark.parametrize('port', ['5900', '5901'])
+    @pytest.mark.parametrize('scan', ['External', 'Internal'])
+    def test_vnc_title_mapped_both_scans(self, port, scan):
+        scripts = _get_scripts_for_port(port, scan).split(',')
+        assert 'vnc-title' in scripts
+        assert 'vnc-info' in scripts
+        assert 'realvnc-auth-bypass' in scripts
+
+    @pytest.mark.parametrize('port', ['5900', '5901'])
+    def test_vnc_script_pass_omits_source_port(self, port):
+        """Three concurrent RFB scripts on one port must not share a 4-tuple."""
+        cmd = _build_nmap_cmd(port, '/in.txt', '/out.xml', '53',
+                              script_scan=True, target_scan='External',
+                              script_only=True)
+        assert '--source-port' not in cmd
+        assert 'vnc-title' in cmd[cmd.index('--script') + 1]
+
+    @pytest.mark.parametrize('port', ['5900', '5901'])
+    def test_vnc_banner_pass_keeps_source_port(self, port):
+        """Banner pass runs no scripts, so the source port is still usable."""
+        cmd = _build_nmap_cmd(port, '/in.txt', '/out.xml', '53',
+                              script_scan=False, target_scan='External')
+        assert '--source-port' in cmd
 
 
 class TestIKEFindings:
