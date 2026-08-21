@@ -16,38 +16,6 @@ cp config.json.sample config.json
 ./spoonmap.py
 ```
 
-### Operator path resolution
-
-Every operator-facing path — `config.json`, `exclusions.txt`, the default
-output location, relative `target_file`/`output_path`/`exclusions_file`
-values read out of `config.json`, and `--cleanup`'s search for a config to
-read `output_path` from — resolves against the current working directory the
-command was run from, via `_operator_dir()` (a thin wrapper around
-`os.getcwd()`, kept as its own module-level helper so it is testable outside
-`main()`'s `# pragma: no cover` region). An operator's config and scan output
-belong in the directory they ran the engagement from, not wherever the
-program happens to be installed — those are frequently different places, and
-this is true independent of how (or whether) the tool is installed.
-
-This is a behaviour change from resolving against `os.path.dirname(os.path.realpath(__file__))`:
-invoking by absolute path from another directory (`cd /tmp &&
-/opt/spoonmap/spoonmap.py`) previously read `/opt/spoonmap/config.json` and
-wrote output there; it now resolves against `/tmp`. The documented invocation
-— running `./spoonmap.py` or `uv run spoonmap.py` from inside the checkout —
-is unaffected, since CWD and checkout are the same directory there.
-
-This is a different anchor from `_DIR`/`_NSE_DIR` (`spoonmap.py:2459`), which
-stay `__file__`-relative on purpose: the bundled NSE scripts under `nse/` are
-program data that ships with SpooNMAP itself, not operator data, and must
-resolve identically regardless of the caller's CWD. `_operator_dir()` and
-`_DIR` are deliberately two separate anchors — do not collapse them into one.
-
-The wheel built by `pyproject.toml`'s hatch config is a supported consumption
-path (`uv tool install git+https://github.com/trustedsec/spoonmap`; see
-README.md for the end-user walkthrough), so a change here must keep
-`config.json.sample` and every bundled `nse/` script landing in the wheel —
-the `build` CI job asserts this.
-
 Run the test suite with:
 
 ```bash
@@ -151,6 +119,38 @@ only, so a fast follow-up merge to `main` can no longer cancel the previous
 commit's in-progress run and erase its green check.
 
 Pass `--cleanup [dir]` to remove prior scan output non-interactively (reads `output_path` from `config.json` if no directory is given).
+
+## Operator Path Resolution
+
+Every operator-facing path — `config.json`, `exclusions.txt`, the default
+output location, relative `target_file`/`output_path`/`exclusions_file`
+values read out of `config.json`, and `--cleanup`'s search for a config to
+read `output_path` from — resolves against the current working directory the
+command was run from, via `_operator_dir()` (a thin wrapper around
+`os.getcwd()`, kept as its own module-level helper so it is testable outside
+`main()`'s `# pragma: no cover` region). An operator's config and scan output
+belong in the directory they ran the engagement from, not wherever the
+program happens to be installed — those are frequently different places, and
+this is true independent of how (or whether) the tool is installed.
+
+This is a behaviour change from resolving against `os.path.dirname(os.path.realpath(__file__))`:
+invoking by absolute path from another directory (`cd /tmp &&
+/opt/spoonmap/spoonmap.py`) previously read `/opt/spoonmap/config.json` and
+wrote output there; it now resolves against `/tmp`. The documented invocation
+— running `./spoonmap.py` or `uv run spoonmap.py` from inside the checkout —
+is unaffected, since CWD and checkout are the same directory there.
+
+This is a different anchor from `_DIR`/`_NSE_DIR` (`spoonmap.py:2459`), which
+stay `__file__`-relative on purpose: the bundled NSE scripts under `nse/` are
+program data that ships with SpooNMAP itself, not operator data, and must
+resolve identically regardless of the caller's CWD. `_operator_dir()` and
+`_DIR` are deliberately two separate anchors — do not collapse them into one.
+
+The wheel built by `pyproject.toml`'s hatch config is a supported consumption
+path (`uv tool install git+https://github.com/trustedsec/spoonmap`; see
+README.md for the end-user walkthrough), so a change here must keep
+`config.json.sample` and every bundled `nse/` script landing in the wheel —
+the `build` CI job asserts this.
 
 ## Architecture
 

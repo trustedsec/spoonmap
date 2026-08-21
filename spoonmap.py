@@ -5365,7 +5365,7 @@ def _config_target_scan(value):
 def _load_config(config_parser, dir_path, resume=False):
     """Derive every scan setting from an already-parsed config.json dict.
 
-    *config_parser* is the JSON dict, *dir_path* the script directory that the
+    *config_parser* is the JSON dict, *dir_path* the operator directory that the
     three relative path settings resolve against, and *resume* whatever the
     --resume CLI flag already produced: the config's own 'resume' key is ORed
     into it so the flag can never be turned back off by the file.  Returns the
@@ -5434,7 +5434,7 @@ def _load_config(config_parser, dir_path, resume=False):
     resume = resume or _config_bool('resume', config_parser.get('resume'), False)
     config_generated = bool(config_parser.get(_CONFIG_GENERATED_KEY))
 
-    # Resolve relative paths in config relative to the script directory
+    # Resolve relative paths in config relative to the operator directory
     if target_file and not os.path.isabs(target_file):
         target_file = os.path.join(dir_path, target_file)
     if output_path and not os.path.isabs(output_path):
@@ -5466,12 +5466,13 @@ def _load_config(config_parser, dir_path, resume=False):
 def _operator_dir():
     """Directory operator data (config.json, exclusions, output) resolves against.
 
-    Deliberately the CWD, not _DIR (the module's own location): an operator's
-    config and scan results belong in the directory they ran the engagement
-    from, not wherever the module happens to be installed — those are
-    frequently different directories, regardless of install mechanism. Pulled
-    out of main() — which is pragma-no-cover — so this derivation itself
-    stays under test.
+    Deliberately the CWD, not _DIR (the module's own location): an installed
+    `spoonmap`'s module directory lives inside uv's managed tool environment,
+    which `uv tool upgrade` rebuilds from scratch — anything stored there,
+    config or scan results, is destroyed on upgrade. That is the failure mode
+    that makes the CWD the only defensible choice, not merely a stylistic
+    preference. Pulled out of main() — which is pragma-no-cover — so this
+    derivation itself stays under test.
     """
     return os.getcwd()
 

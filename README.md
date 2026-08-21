@@ -19,12 +19,11 @@ uv tool install git+https://github.com/trustedsec/spoonmap
 
 This puts a `spoonmap` executable on your `PATH`, so you can invoke it as
 `spoonmap` from any directory instead of cloning the repo and running
-`./spoonmap.py`. **There is no PyPI package** — the command above installs
-directly from the git repository, not from `pypi.org`. `uv tool install
-spoonmap` (naming the package instead of the git URL) will not work: the name
-`spoonmap` is unclaimed on PyPI and this project has never published to it.
-If you see that failure, it means you dropped the `git+...` URL, not that
-something is broken.
+`./spoonmap.py`. **There is no PyPI package** — this project has never
+published to `pypi.org`, and the command above installs directly from the
+git repository instead. Use the full `git+https://...` form above, not a
+bare `uv tool install spoonmap`; whatever that name resolves to on PyPI, now
+or in the future, is not this project.
 
 To update to the latest commit:
 
@@ -49,6 +48,11 @@ directory left for a config or output path to fall back to by habit.
 
 ## Usage
 Simply executing the script will prompt you for all required options.
+
+`config.json`, target/exclusion files, and scan output all resolve against
+the directory you run the command from — see "Where Files Live" below if
+your output isn't where you expect it, especially if you're used to invoking
+SpooNMAP by path from outside its own directory.
 
 If you use [uv](https://docs.astral.sh/uv/), you can run without a separate virtual environment:
 
@@ -214,12 +218,14 @@ writes output under `/tmp/`. If you have a habit of invoking SpooNMAP from
 outside its own directory, check where your `config.json` and prior output
 actually are before your next run.
 
-**What does *not* follow this rule:** the bundled NSE scripts under `nse/`
-(`.nse` files invoked during `script_scan`) are program data, not operator
-data — they ship with SpooNMAP itself and always resolve from the directory
-containing `spoonmap.py`, regardless of your CWD. This is the one exception,
-and it exists so the script scan works identically no matter where you
-happen to run the tool from.
+**What does *not* follow this rule:** the bundled NSE scripts (`.nse` files
+invoked during `script_scan`) are program data, not operator data — they ship
+with SpooNMAP itself and always resolve from the directory containing the
+`spoonmap` module, regardless of your CWD. That directory holds a folder
+named `nse/` in a checkout and `spoonmap_nse/` in a `uv tool install`; which
+one you have on disk depends on how you got SpooNMAP, not on anything you
+configure. This is the one exception, and it exists so the script scan works
+identically no matter where you happen to run the tool from.
 
 ## Target File (ranges.txt)
 

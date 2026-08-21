@@ -11167,8 +11167,12 @@ class TestOperatorDirResolution:
     _DIR/_NSE_DIR, which stay module-relative for bundled program data."""
 
     def test_operator_dir_is_the_cwd(self, tmp_path, monkeypatch):
+        # Compare realpaths on both sides: os.getcwd() resolves symlinks in
+        # the path (e.g. macOS's /tmp -> /private/tmp), so comparing directly
+        # against str(tmp_path) would depend on pytest happening to hand out
+        # an already-resolved tmp_path rather than on the helper's behaviour.
         monkeypatch.chdir(tmp_path)
-        assert _operator_dir() == str(tmp_path)
+        assert _operator_dir() == os.path.realpath(str(tmp_path))
 
     def test_operator_dir_follows_cwd_changes(self, tmp_path, monkeypatch):
         # A real behavioural assertion, not a restatement of os.getcwd():
@@ -11179,9 +11183,9 @@ class TestOperatorDirResolution:
         first.mkdir()
         second.mkdir()
         monkeypatch.chdir(first)
-        assert _operator_dir() == str(first)
+        assert _operator_dir() == os.path.realpath(str(first))
         monkeypatch.chdir(second)
-        assert _operator_dir() == str(second)
+        assert _operator_dir() == os.path.realpath(str(second))
 
     def test_operator_dir_is_not_module_relative(self, tmp_path, monkeypatch):
         # Regression guard for PR #42: wherever the module is installed must
