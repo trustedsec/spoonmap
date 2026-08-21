@@ -38,6 +38,19 @@ for 3.8/3.9; `requires-python` stays `>=3.8` because `spoonmap.py` itself is
 dependency-free stdlib. The 95% coverage floor is enforced by pytest's `addopts`,
 so every job inherits it without restating it.
 
+Two more jobs guard style and security: `lint` runs `ruff check spoonmap.py
+tests/` against a narrow `E4`/`E7`/`E9`/`F` ruleset with ruff exact-pinned in the
+`dev` group (a linter that grows an opinion should not fail an unrelated PR), and
+`bandit` runs SAST against the committed `.bandit-baseline.json`. `ruff format` is
+deliberately **not** adopted — reformatting the module and the 11k-line test file
+would bury every future diff, and `E501` alone flags 288 existing lines. The
+bandit baseline holds 32 reviewed findings (list-form `subprocess` calls,
+`xml.etree` parsing of masscan/nmap output we invoked ourselves), so only a *new*
+finding fails; regenerate it deliberately and justify additions in the commit
+message rather than adding inline `# nosec` suppressions. Actions are pinned to
+commit SHAs with the tag in a trailing comment, and every checkout sets
+`persist-credentials: false`.
+
 Pass `--cleanup [dir]` to remove prior scan output non-interactively (reads `output_path` from `config.json` if no directory is given).
 
 ## Architecture

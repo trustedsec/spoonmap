@@ -29,7 +29,11 @@ jobs:
           - os: macos-latest
             python-version: '3.12'
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to a commit SHA, not a tag: a tag is mutable, so
+      # `@v4` is an unaudited third party with write access to this build.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       # tests/test_nse_integration.py shells out to real nmap against local stub
       # servers. Without nmap the whole module skips itself, so installing it is
@@ -41,7 +45,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends nmap
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
@@ -68,7 +72,11 @@ jobs:
       matrix:
         python-version: ['3.8', '3.9']
     steps:
-      - uses: actions/checkout@v4
+      # Actions are pinned to a commit SHA, not a tag: a tag is mutable, so
+      # `@v4` is an unaudited third party with write access to this build.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install nmap
         run: |
@@ -76,7 +84,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends nmap
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           enable-cache: true
 
@@ -85,3 +93,49 @@ jobs:
           uv run --isolated --no-project --python ${{ matrix.python-version }}
           --with pytest --with pytest-cov
           pytest tests/ -v
+
+  # Separate job, not a step on `test`: a lint failure and a test failure are
+  # different questions, and neither should hide the other behind a red X.
+  # Ruleset and pinned ruff version live in pyproject.toml.
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          python-version: '3.12'
+          enable-cache: true
+
+      - name: Ruff
+        run: uv run --frozen ruff check spoonmap.py tests/
+
+  # SAST against a committed baseline: spoonmap shells out to masscan/nmap and
+  # parses their XML, so a bare run reports 32 reviewed findings (subprocess
+  # list-form calls, xml.etree on tool output we invoked ourselves) every time.
+  # Baselining them means only a NEW finding fails the build. Regenerate with
+  #   uvx --from 'bandit[toml]==1.9.4' bandit -r spoonmap.py -c pyproject.toml \
+  #       -f json -o .bandit-baseline.json
+  # and say in the commit message why each added finding is acceptable.
+  bandit:
+    name: bandit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          python-version: '3.12'
+          enable-cache: true
+
+      - name: Bandit
+        run: >
+          uvx --from "bandit[toml]==1.9.4" bandit
+          -r spoonmap.py -c pyproject.toml -b .bandit-baseline.json

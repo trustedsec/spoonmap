@@ -505,6 +505,31 @@ run:
   with `pyproject.toml`.
 - **`test-legacy`** — Python 3.8 and 3.9, resolving pytest fresh outside the
   project (`uv run --isolated --no-project`).
+- **`lint`** — `ruff check spoonmap.py tests/`. Run it locally with
+  `uv run ruff check spoonmap.py tests/`.
+- **`bandit`** — SAST against the committed `.bandit-baseline.json`, so only a
+  *new* finding fails the build.
+
+Actions are pinned to commit SHAs (with the tag in a trailing comment) rather
+than mutable tags, and every checkout uses `persist-credentials: false`.
+
+The ruff ruleset is deliberately narrow — `E4`, `E7`, `E9`, `F` — and the ruff
+version is exact-pinned in the `dev` group so a ruff release cannot fail CI on
+its own. `ruff format` is **not** used: reformatting a 4.6k-line module and an
+11k-line test file would bury every future diff, and `E501` alone would flag
+288 existing lines.
+
+`bandit` reports 32 reviewed findings on `spoonmap.py` — list-form `subprocess`
+calls and `xml.etree` parsing of output from tools we invoked ourselves — which
+is why they are baselined instead of suppressed inline. To re-baseline after an
+intentional change:
+
+```bash
+uvx --from 'bandit[toml]==1.9.4' bandit -r spoonmap.py -c pyproject.toml \
+    -f json -o .bandit-baseline.json
+```
+
+Say in the commit message why each newly added finding is acceptable.
 
 The split exists because `pytest` only ships the fix for CVE-2025-71176 in
 9.0.3+, which requires Python 3.10+. `uv.lock` therefore resolves for 3.10+

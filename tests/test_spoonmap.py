@@ -21,18 +21,14 @@ from spoonmap import (
     DISCOVERY_MASSCAN_PORTS_INTERNAL,
     DISCOVERY_TCP_PORTS_INTERNAL,
     EXTERNAL_PORT_SCRIPTS,
-    EXTERNAL_PROBE_PORT_PRIORITY,
     EXTERNAL_SENSITIVE_PORTS,
     HONEYPOT_MIN_PORTS_SCANNED,
-    HONEYPOT_MIN_UNMATCHED_PORTS,
     HONEYPOT_OPEN_PORT_FRACTION,
     HOST_DISCOVERY_NMAP_THRESHOLD,
     INTERNAL_DISCOVERY_MAX_RATE,
     INTERNAL_DISCOVERY_STATE_CEILING,
     SLOW_PORTS,
-    SQL_SERVER_EOL,
     INTERNAL_PORT_SCRIPTS,
-    PROBE_PORT_PRIORITY,
     _build_discovery_target_file,
     _build_interactive_config,
     _build_nmap_cmd,
@@ -101,7 +97,6 @@ from spoonmap import (
     _scan_extra_sql_ports,
     _validate_snmp_any_community,
     _SMB_COUPLED_PORTS,
-    _SMB_PORTS,
     SERVICE_CATEGORIES,
     _calc_scan_wait,
     _cleanup_cmd,
@@ -4930,7 +4925,8 @@ class TestMassScanResume:
         targets_file.parent.mkdir(parents=True, exist_ok=True)
         targets_file.write_text('10.0.0.1\n')
         # Make batch XML newer than targets file
-        import os, time as _time
+        import os
+        import time as _time
         os.utime(str(targets_file), (0, 0))
         os.utime(str(batch_xml), (_time.time(), _time.time()))
 
@@ -4982,7 +4978,8 @@ class TestMassScanResume:
         targets_file = tmp_path / 'discovery' / 'resolved_targets.txt'
         targets_file.parent.mkdir(parents=True, exist_ok=True)
         targets_file.write_text('10.0.0.1\n')
-        import os, time as _time
+        import os
+        import time as _time
         os.utime(str(targets_file), (0, 0))
         os.utime(str(batch_xml), (_time.time(), _time.time()))
 
@@ -5005,7 +5002,8 @@ class TestMassScanResume:
         targets_file = tmp_path / 'discovery' / 'resolved_targets.txt'
         targets_file.parent.mkdir(parents=True, exist_ok=True)
         targets_file.write_text('10.0.0.1\n')
-        import os, time as _time
+        import os
+        import time as _time
         os.utime(str(targets_file), (0, 0))
         os.utime(str(batch0_xml), (_time.time(), _time.time()))
 
@@ -5037,7 +5035,8 @@ class TestMassScanResume:
         targets_file.parent.mkdir(parents=True, exist_ok=True)
         targets_file.write_text('10.0.0.1\n')
 
-        import os, time as _time
+        import os
+        import time as _time
         # Make batch XML *older* than targets (simulates ranges.txt change)
         os.utime(str(batch_xml), (0, 0))
         os.utime(str(targets_file), (_time.time(), _time.time()))
@@ -6319,7 +6318,8 @@ class TestNmapWorker:
         interrupt_event = threading.Event()
 
         if popen_side_effect is None:
-            popen_side_effect = lambda *a, **k: self._make_finished_proc()
+            def popen_side_effect(*a, **k):
+                return self._make_finished_proc()
 
         with patch('spoonmap._build_nmap_cmd', return_value=['nmap', 'fake']) as mock_build, \
              patch('spoonmap._get_scripts_for_port', return_value=scripts_for_port), \
@@ -8673,12 +8673,13 @@ class TestSMBCoupling:
         }
         with patch('spoonmap._run_masscan_batch',
                    side_effect=self._make_batch_side_effect(responses)):
-            result = mass_scan('All', ['139', '445'], '88', '1000',
-                               '/fake/targets.txt', '', batch_size=5)
+            mass_scan('All', ['139', '445'], '88', '1000',
+                      '/fake/targets.txt', '', batch_size=5)
 
         port445_file = tmp_path / 'discovery' / 'live_hosts' / 'port445.txt'
         if port445_file.exists():
-            written = {l.strip() for l in port445_file.read_text().splitlines() if l.strip()}
+            written = {line.strip() for line in port445_file.read_text().splitlines()
+                       if line.strip()}
             assert written == {'10.0.0.1', '10.0.0.2', '10.0.0.3'}
 
     def test_smb_coupled_ports_constant(self):
@@ -9477,7 +9478,7 @@ class TestMassScanUdp:
         """dest_ports with U:500 → masscan never called with U:500."""
         spoonmap.output_path = str(tmp_path)
         with patch('spoonmap._run_masscan_batch', return_value={}) as mock_m, \
-             patch('spoonmap._nmap_udp_discovery', return_value=set()) as mock_u:
+             patch('spoonmap._nmap_udp_discovery', return_value=set()):
             mass_scan('All', ['443', 'U:500'], '53', '10000',
                       '/fake/targets.txt', '', batch_size=1)
         for call in mock_m.call_args_list:
@@ -9487,7 +9488,7 @@ class TestMassScanUdp:
     def test_udp_ports_trigger_nmap_udp_discovery(self, tmp_path):
         """dest_ports with U:500 → _nmap_udp_discovery called with 'U:500'."""
         spoonmap.output_path = str(tmp_path)
-        with patch('spoonmap._run_masscan_batch', return_value={}) as mock_m, \
+        with patch('spoonmap._run_masscan_batch', return_value={}), \
              patch('spoonmap._nmap_udp_discovery', return_value=set()) as mock_u:
             mass_scan('All', ['443', 'U:500'], '53', '10000',
                       '/fake/targets.txt', '', batch_size=1)
