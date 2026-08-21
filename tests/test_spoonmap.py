@@ -1,10 +1,10 @@
 """Tests for spoonmap.py"""
+import ast
 import datetime
 import inspect
 import io
 import json
 import os
-import re
 import readline
 import subprocess
 import textwrap
@@ -11124,10 +11124,30 @@ class TestNseDirResolution:
         _scan_extra_sql_ports(). A revert of any one of those back to a
         `_DIR`-relative `nse/` literal (bypassing _resolve_nse_dir(), and thus
         breaking once installed from the wheel) would be invisible to that
-        check. Assert on the module's own source text instead, so every call
-        site is covered at once regardless of which one regresses."""
-        source = inspect.getsource(spoonmap)
-        offenders = re.findall(r"_DIR\}/nse/[\w.\-]+\.nse", source)
+        check. Assert on the module's own parsed AST rather than its raw
+        source text: a `_DIR}/nse/...` f-string call site parses as an
+        ast.JoinedStr whose first part is a FormattedValue naming `_DIR`,
+        immediately followed by a Constant string starting with '/nse/' —
+        a shape only real code can produce. A comment or docstring that
+        merely quotes that same text (as prose, not syntax) has no such
+        JoinedStr node at all, so it can't trip this the way a plain
+        substring search over inspect.getsource() could."""
+        tree = ast.parse(inspect.getsource(spoonmap))
+        offenders = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.JoinedStr):
+                continue
+            parts = node.values
+            for i, part in enumerate(parts):
+                if not (isinstance(part, ast.FormattedValue)
+                        and isinstance(part.value, ast.Name)
+                        and part.value.id == '_DIR'):
+                    continue
+                following = parts[i + 1] if i + 1 < len(parts) else None
+                if (isinstance(following, ast.Constant)
+                        and isinstance(following.value, str)
+                        and following.value.startswith('/nse/')):
+                    offenders.append(f'{{_DIR}}{following.value}')
         assert not offenders, (
             'found _DIR-relative nse/ path(s); bundled scripts must be '
             'referenced via _NSE_DIR so they resolve in an installed wheel: '

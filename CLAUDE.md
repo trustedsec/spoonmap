@@ -56,10 +56,22 @@ hence the explicit re-injection rather than relying on `sudo`'s own (`uv`-less)
 `secure_path`. Coverage is disabled for this job specifically — the 95% floor
 in `pyproject.toml` applies to the whole suite and a single-module run can't
 meet it — without touching the floor itself; the rest of the suite is already
-covered, with coverage, by `test` and `test-legacy`.
+covered, with coverage, by `test` and `test-legacy`. The job's load-bearing
+step is not the pytest run itself but a `--junitxml` parse afterward: a pytest
+skip is not a failure, so "N passed, M skipped" would exit 0 even if sudo, the
+`PATH` re-injection, or `uv` resolution silently broke and the root-gated
+class never ran at all — that is exactly the failure this job exists to catch,
+and a plain pass/fail summary can't distinguish it from `tests/conftest.py`'s
+unrelated, legitimate port-conflict skip. The parse asserts *positively*: that
+`TestOpenvpnDetectNseUdp` produced at least one result in the junit report and
+that none of its results were skipped, for any reason. Because it doesn't key
+on the skip *text*, it survives that reason string being reworded, the class
+being renamed, or the whole module skipping itself (e.g. `nmap` missing) —
+all of which would defeat a check that only searched for one specific skip
+message.
 
-Three more jobs guard style, security, and the workflow file itself. `lint`
-runs `ruff check spoonmap.py tests/` against a narrow `E4`/`E7`/`E9`/`F`
+Three more jobs guard style, security, and the workflow directory itself.
+`lint` runs `ruff check spoonmap.py tests/` against a narrow `E4`/`E7`/`E9`/`F`
 ruleset with ruff exact-pinned in the `dev` group (a linter that grows an
 opinion should not fail an unrelated PR). `bandit` runs SAST against the
 committed `.bandit-baseline.json` via `uv run --frozen bandit`; `bandit[toml]`
@@ -73,13 +85,26 @@ ourselves), so only a *new* finding fails; regenerate it deliberately and
 justify additions in the commit message rather than adding inline `# nosec`
 suppressions. `workflow-lint` runs `actionlint` (YAML/expression errors) and
 `zizmor` (Actions-specific security auditing — unpinned actions, script
-injection, credential persistence) against `ci.yml` itself, since the workflow
-is hand-edited often and carries several hand-maintained SHA pins.
+injection, credential persistence) against the whole `.github/workflows/`
+directory, not just `ci.yml`, so a future workflow file is covered without an
+edit here (`.github/dependabot.yml` is deliberately excluded from both — it
+isn't a workflow file and neither tool parses it). This job installs `uv` via
+`setup-uv`, same as every other job, since it invokes both tools through
+`uvx` and `uv` is not preinstalled on the runner — its absence here once meant
+both `uvx` steps failed at "command not found" on every real run while
+passing in local verification, where `uv` was already on the developer's PATH.
 
 A `build` job (added for wheel/sdist packaging; see the job itself and
-`pyproject.toml`'s `[tool.hatch.build.targets.*]`) builds both artifacts with
-`uv build` and asserts on their actual contents rather than trusting the config
-says what it means.
+`pyproject.toml`'s `[tool.hatch.build.targets.*]`) builds both artifacts and
+asserts on their actual contents rather than trusting the config says what it
+means, including that the wheel's `spoonmap_nse/` and the sdist's `nse/` each
+match the local `nse/` directory by exact set, not mere inclusion — `nse/` is
+directory-wide in both `include` (sdist) and `force-include` (wheel), so
+without set equality an operator's own script left in that directory
+mid-engagement would ship to every install silently. The sdist assertion also
+checks a positive floor — every entry `pyproject.toml`'s own `include` list
+names must actually be present — since a gutted `include` list previously
+still passed as "clean" against the banned-substrings check alone.
 
 Every job declares `timeout-minutes`, generous but bounded, instead of relying
 on the 6-hour default: this suite exercises `work_queue.join()`,

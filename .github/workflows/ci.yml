@@ -240,45 +240,54 @@ jobs:
           tests/test_nse_integration.py -v -rs --no-cov
           --junitxml=nse-root-results.xml
 
-      # A skip here can mean two different things, and only one of them is
-      # acceptable: tests/conftest.py deliberately skips a class when the
-      # port it needs is already in use, on the (correct) theory that a hard
-      # failure there would be flaky-test noise from an environment conflict,
-      # not an NSE regression — that behavior stays exactly as it is. But
-      # TestOpenvpnDetectNseUdp *also* skips (tests/test_nse_integration.py,
-      # `requires root for -sU raw socket scan`) whenever os.geteuid() != 0,
-      # and that skip is normal pytest behavior, not an error — so "N passed,
-      # M skipped" exits 0 even if sudo silently failed and every root-gated
-      # test never ran at all, which is exactly the failure mode this job
-      # exists to catch. Distinguishing the two requires reading *why* a test
-      # skipped, which -rs prints but nothing enforces, hence this parse of
-      # the skip messages actually recorded in the junit report.
-      - name: Verify no test was skipped for the root-gate reason
+      # A *negative* check here ("no skip mentioned the root-gate reason")
+      # passes vacuously in at least three ways: the reason string in
+      # tests/test_nse_integration.py gets reworded, TestOpenvpnDetectNseUdp
+      # is renamed or deleted, or the whole module skips itself via the
+      # `nmap not installed` pytestmark — none of those produce a matching
+      # skip message, so a negative check would print success having
+      # verified nothing. This is a *positive* assertion instead: at least
+      # one testcase belonging to TestOpenvpnDetectNseUdp exists in the junit
+      # report, and none of that class's testcases were skipped, for any
+      # reason. It does not care what a skip message says, so rewording the
+      # reason string can't defeat it either.
+      #
+      # tests/conftest.py's port-conflict skip is still tolerated exactly as
+      # before — but only for *other* classes (e.g. the CUPS class on port
+      # 631). This job exists specifically to prove TestOpenvpnDetectNseUdp
+      # runs as root, so for that one class, a skip of any kind — including
+      # its own port conflict — means the thing this job exists to verify
+      # was not verified, and must fail.
+      - name: Verify TestOpenvpnDetectNseUdp actually ran (not skipped, for any reason)
         run: |
           python3 - <<'PYEOF'
           import sys
           import xml.etree.ElementTree as ET
 
-          ROOT_SKIP_REASON = 'requires root for -sU raw socket scan'
+          TARGET_CLASS = 'TestOpenvpnDetectNseUdp'
 
           tree = ET.parse('nse-root-results.xml')
-          offenders = []
-          for testcase in tree.getroot().iter('testcase'):
-              skipped = testcase.find('skipped')
-              if skipped is None:
-                  continue
-              if ROOT_SKIP_REASON in skipped.attrib.get('message', ''):
-                  offenders.append(testcase.attrib.get('name', '<unknown>'))
-          if offenders:
+          matches = [
+              tc for tc in tree.getroot().iter('testcase')
+              if TARGET_CLASS in tc.attrib.get('classname', '')
+          ]
+          if not matches:
               sys.exit(
-                  'test(s) skipped for the root-gate reason, meaning this job '
-                  'did not actually run as root (sudo/PATH/uv resolution '
-                  'broke silently): ' + ', '.join(offenders)
+                  f'no testcase found for {TARGET_CLASS} — it was renamed, '
+                  'deleted, or never collected at all (e.g. the whole module '
+                  'skipped itself because nmap was not found), so the -sU '
+                  'path this job exists to exercise was not verified'
               )
-          print(
-              'no test was skipped for the root-gate reason: the -sU path '
-              'actually ran as root (a port-conflict skip, if any, is fine)'
-          )
+          skipped = [tc for tc in matches if tc.find('skipped') is not None]
+          if skipped:
+              names = sorted(tc.attrib.get('name', '<unknown>') for tc in skipped)
+              sys.exit(
+                  f'{TARGET_CLASS} test(s) were skipped, meaning the -sU path '
+                  'did not actually run as root in this job (sudo, PATH '
+                  're-injection, or uv resolution may have broken silently): '
+                  + ', '.join(names)
+              )
+          print(f'{TARGET_CLASS}: {len(matches)} test(s) collected and ran as root')
           PYEOF
 
   # The workflow directory is hand-edited often and every `uses:` step in it
@@ -316,6 +325,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+
+      # `uv`/`uvx` is not preinstalled on ubuntu-latest, unlike every other
+      # job here — this one was missing this step and its two `uvx` steps
+      # were failing at "command not found" on every run, invisibly, because
+      # local verification always had `uv` on PATH already. enable-cache is
+      # on: unlike nse-root, nothing here runs under sudo, so there is no
+      # root-owned-cache/runner-owned-prune conflict, and caching speeds up
+      # repeated `uvx` tool installs across runs.
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          python-version: '3.12'
+          enable-cache: true
 
       # No path argument: actionlint auto-discovers the nearest
       # .github/workflows/ directory from the current repo root and checks
@@ -387,30 +409,137 @@ jobs:
           print(f'sdist clean: {len(names)} entries, none banned')
           PYEOF
 
-      - name: Assert wheel contains every bundled NSE script
+      # A blocklist alone let a gutted [tool.hatch.build.targets.sdist]
+      # include list still pass as "clean" (4 entries, none banned) — clean
+      # is not the same as complete. This adds the missing floor: every entry
+      # below must actually have landed in the sdist. Deliberately hardcoded
+      # here rather than read back out of pyproject.toml's own include list:
+      # the exact failure this guards against is that include list itself
+      # being gutted (accidentally or otherwise), so the floor cannot be
+      # derived from the same config it exists to check — that would just
+      # compare the edited list to itself and always agree.
+      #
+      # It also closes the other half of the local-scratch leak the blocklist
+      # above can't see: "nse/" and "tests/" are directory-wide includes, so
+      # anything sitting in nse/ ships regardless of what it's named — a
+      # custom NSE script an operator drops in mid-engagement included. This
+      # asserts the sdist's nse/ contents match nse/ as *git tracks it*
+      # exactly (set equality, not mere inclusion) — deliberately `git
+      # ls-files`, not `os.listdir`, because the packaging step reads from
+      # this same working tree: comparing against the working tree's own
+      # listing would just compare the leaked file to itself and always
+      # "match", proving nothing. `git ls-files` is what the operator
+      # actually committed, which is what's supposed to ship.
+      - name: Assert sdist has every required entry and nse/ matches exactly
         run: |
           python3 - <<'PYEOF'
           import glob
-          import os
+          import subprocess
+          import sys
+          import tarfile
+
+          # Mirrors [tool.hatch.build.targets.sdist].include in pyproject.toml
+          # today, but is intentionally a separate, hand-maintained list — see
+          # the step comment for why it must not be read from that same file.
+          required = (
+              'spoonmap.py', 'nse/', 'tests/', 'README.md', 'CLAUDE.md',
+              'config.json.sample', 'exclusions.txt', 'pyproject.toml',
+              'uv.lock', '.bandit-baseline.json', '.github/workflows/',
+          )
+
+          path = glob.glob('dist/*.tar.gz')[0]
+          with tarfile.open(path) as tar:
+              names = tar.getnames()
+          # hatchling prefixes every entry with 'spoonmap-<version>/'; strip
+          # that one leading path component so entries compare directly
+          # against `required` above.
+          stripped = ['/'.join(n.split('/')[1:]) for n in names]
+
+          missing_entries = [
+              pattern for pattern in required
+              if (pattern.endswith('/') and not any(
+                      s.startswith(pattern) for s in stripped))
+              or (not pattern.endswith('/') and pattern not in stripped)
+          ]
+          if missing_entries:
+              sys.exit(f'sdist is missing required entries: {missing_entries}')
+
+          tracked = subprocess.run(
+              ['git', 'ls-files', 'nse/'],
+              capture_output=True, text=True, check=True,
+          ).stdout.splitlines()
+          tracked_nse = {t[len('nse/'):] for t in tracked}
+          sdist_nse = {
+              s[len('nse/'):] for s in stripped
+              if s.startswith('nse/') and not s.endswith('/')
+          }
+          nse_missing = sorted(tracked_nse - sdist_nse)
+          nse_extra = sorted(sdist_nse - tracked_nse)
+          if nse_missing or nse_extra:
+              sys.exit(
+                  'sdist nse/ does not match git-tracked nse/ exactly '
+                  f'— missing: {nse_missing}, extra: {nse_extra}'
+              )
+          print(
+              f'sdist has all {len(required)} required entries; '
+              f'nse/ matches git-tracked files exactly ({len(tracked_nse)} files)'
+          )
+          PYEOF
+
+      # Set equality against nse/, not mere inclusion: `force-include` copies
+      # the whole nse/ tree into the wheel, so an extra file sitting there —
+      # an operator's engagement-specific NSE script left behind, or scratch
+      # notes — would silently ship to every install if this only checked
+      # that the expected scripts were present. Compared against `git
+      # ls-files`, not `os.listdir`, for the same reason as the sdist check
+      # above: the wheel is built from this same working tree, so comparing
+      # against the working tree's own listing can't detect an untracked file
+      # that both "sides" already agree on.
+      - name: Assert wheel spoonmap_nse/ matches nse/ exactly, and ships config.json.sample
+        run: |
+          python3 - <<'PYEOF'
+          import glob
+          import subprocess
           import sys
           import zipfile
 
-          # Derived from the nse/ directory listing, not hardcoded, so adding
-          # a script does not require editing this workflow.
-          expected = sorted(
-              f'spoonmap_nse/{name}'
-              for name in os.listdir('nse')
-              if name.endswith('.nse')
-          )
-          if not expected:
-              sys.exit('expected at least one bundled .nse script to check')
+          tracked = subprocess.run(
+              ['git', 'ls-files', 'nse/'],
+              capture_output=True, text=True, check=True,
+          ).stdout.splitlines()
+          tracked_nse = {t[len('nse/'):] for t in tracked}
+          if not tracked_nse:
+              sys.exit('expected at least one bundled NSE script to check')
+
           path = glob.glob('dist/*.whl')[0]
           with zipfile.ZipFile(path) as z:
               names = set(z.namelist())
-          missing = [n for n in expected if n not in names]
-          if missing:
-              sys.exit(f'wheel is missing bundled NSE scripts: {missing}')
-          print(f'wheel contains all {len(expected)} bundled NSE scripts')
+
+          packaged_nse = {
+              n[len('spoonmap_nse/'):] for n in names
+              if n.startswith('spoonmap_nse/') and not n.endswith('/')
+          }
+          missing = sorted(tracked_nse - packaged_nse)
+          extra = sorted(packaged_nse - tracked_nse)
+          if missing or extra:
+              sys.exit(
+                  'wheel spoonmap_nse/ does not match git-tracked nse/ exactly — '
+                  f'missing: {missing}, extra: {extra}'
+              )
+          print(
+              'wheel spoonmap_nse/ matches git-tracked nse/ exactly: '
+              f'{len(tracked_nse)} files'
+          )
+
+          # spoonmap.py's own config-error messages ("See config.json.sample
+          # for the expected keys") name this file by bare filename; a wheel
+          # that omitted it left that message pointing at nothing.
+          if 'config.json.sample' not in names:
+              sys.exit(
+                  "wheel is missing config.json.sample, which spoonmap.py's "
+                  'own config-error messages point operators at'
+              )
+          print('wheel contains config.json.sample')
           PYEOF
 
       - name: Install wheel into a clean venv and verify NSE paths resolve

@@ -519,15 +519,33 @@ with nmap installed on every job that needs it (Ubuntu via `apt`, macOS via
   place it runs. `sudo` resets `PATH`, dropping the `uv` `setup-uv` just
   installed, hence the explicit re-injection; coverage is disabled for this
   job specifically because the 95% floor applies to the whole suite and a
-  single-module run can't meet it — the floor itself is untouched.
-- **`workflow-lint`** — `actionlint` (YAML/expression errors in the workflow
-  file) and `zizmor` (Actions-specific security auditing: unpinned actions,
-  script injection, credential persistence). The workflow is hand-edited often
-  and carries several hand-maintained SHA pins, so it gets linted too.
+  single-module run can't meet it — the floor itself is untouched. A pytest
+  skip is not an error, so "N passed, M skipped" alone can't tell a genuine
+  environment conflict (`tests/conftest.py`'s port-in-use skip, still fine)
+  apart from sudo/PATH/uv silently failing and the root-gated class never
+  running at all. The job's real assertion is therefore a `--junitxml` parse:
+  it asserts `TestOpenvpnDetectNseUdp` produced at least one test result and
+  that none of them were skipped, for any reason — a positive check, not a
+  check against the skip *text*, so it can't be defeated by that text
+  changing, the class being renamed, or the whole module skipping itself.
+  Without that step this job is decorative: green whether or not it verified
+  anything.
+- **`workflow-lint`** — `actionlint` (YAML/expression errors) and `zizmor`
+  (Actions-specific security auditing: unpinned actions, script injection,
+  credential persistence), both pointed at the whole `.github/workflows/`
+  directory rather than naming `ci.yml`, so a future workflow file is covered
+  without an edit here. `.github/dependabot.yml` is deliberately excluded from
+  both — neither tool parses Dependabot config. This job installs `uv` via
+  `setup-uv` like every other job (it is not preinstalled on the runner),
+  since both tools are invoked with `uvx`.
 - **`build`** — builds the sdist and wheel with `uv build` and asserts on
-  their actual contents: that the sdist excludes local scratch files, that the
-  wheel contains every bundled `.nse` script, and that a clean venv with the
-  wheel installed resolves every NSE path on disk.
+  their actual contents: that the sdist excludes local scratch files and has
+  every entry `pyproject.toml` requires, that the wheel's `spoonmap_nse/`
+  matches the local `nse/` directory by exact set (not mere inclusion — an
+  extra file dropped into `nse/`, such as an operator's own script mid-
+  engagement, would otherwise ship silently), that the wheel also carries
+  `config.json.sample`, and that a clean venv with the wheel installed
+  resolves every NSE path on disk.
 
 Every job has `timeout-minutes` set: the suite exercises `work_queue.join()`,
 `threading.Event` polling and `KeyboardInterrupt` handling, and a past bug in
