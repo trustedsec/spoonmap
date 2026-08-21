@@ -1,5 +1,6 @@
 {
     "__scan_categories_choices__": "All, Full, Web, Database, Remote Management, Email, LDAP, Network Infrastructure, File Transfer, SMB, Specialized, Containers & Debuggers, Local LLM",
+    "__scan_categories_full_note__": "Full scans TCP 1-65535 ONLY and runs no UDP discovery, so the U: ports in the categories (U:161, U:500, U:623, ...) are skipped. Use All, or dest_ports with the UDP ports appended, for UDP coverage.",
     "scan_categories": ["Web", "Database"],
     "__dest_ports_note__": "Optional: overrides scan_categories with an explicit port list. Use U: prefix for UDP (e.g. U:53).",
     "dest_ports": [],

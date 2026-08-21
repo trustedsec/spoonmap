@@ -4721,6 +4721,10 @@ _CONFIG_DOCS = {
     'scan_categories': [
         ('__scan_categories_choices__',
          'All, Full, ' + ', '.join(SERVICE_CATEGORIES)),
+        ('__scan_categories_full_note__',
+         'Full scans TCP 1-65535 ONLY and runs no UDP discovery, so the U: '
+         'ports in the categories (U:161, U:500, U:623, ...) are skipped. Use '
+         'All, or dest_ports with the UDP ports appended, for UDP coverage.'),
     ],
     'dest_ports': [
         ('__dest_ports_note__',
@@ -5301,9 +5305,15 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                     ports = SERVICE_CATEGORIES[name]
                     print(f'\t({i}) {name}  [{", ".join(ports)}]')
                 full_n = len(category_names) + 1
-                print(f'\t({full_n}) Full Port Scan  [1-65535]')
+                print(f'\t({full_n}) Full Port Scan  [1-65535, TCP only — no UDP]')
                 print(f'\t(a) All Categories  [{", ".join(category_names)}]')
                 print(f'\t(c) Custom Port Scan  [enter your own comma-separated ports]')
+                print(_COLOR_INFO
+                      + '\nNote: Full Port Scan covers TCP 1-65535 only.  It runs NO UDP '
+                        'discovery, so the U: ports in the categories above (SNMP U:161, '
+                        'IKE U:500, IPMI U:623, ...) are not scanned.  Use (a) All, or (c) '
+                        'Custom with the UDP ports appended, if you need UDP coverage.'
+                      + _COLOR_RESET)
 
                 selection = input(
                     f'\nWhich categories would you like to scan (e.g. 1,3 / all / full / c — {selection_hint})? '
