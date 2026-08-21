@@ -20,6 +20,10 @@ dev = [
     # Exact-pinned: a ruff bump can add rules, and CI failing because the linter
     # grew an opinion is noise, not a signal. Bump deliberately.
     "ruff==0.16.4",
+    # Exact-pinned for the same reason ruff is: `uvx --from "bandit[toml]==X"`
+    # pinned bandit itself but let its transitive deps float. Locking it here
+    # means `uv run --frozen bandit` gets a fully reproducible dependency set.
+    "bandit[toml]==1.9.4",
 ]
 
 [tool.uv]
