@@ -57,7 +57,12 @@ jobs:
 
       - name: Install nmap (macOS)
         if: runner.os == 'macOS'
+        # HOMEBREW_NO_AUTO_UPDATE: without it, `brew install` first runs a
+        # full `brew update`, which can spend minutes refreshing tap metadata
+        # this job doesn't need — against the 10-minute timeout above.
         run: brew install nmap
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
 
       # A broken nmap install would otherwise just turn 26 assertions into
       # silent skips instead of failing the job.
@@ -199,7 +204,24 @@ jobs:
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           python-version: '3.12'
-          enable-cache: true
+          # setup-uv's post-run cache prune runs as the `runner` user, but
+          # `sudo -E` below leaves `uv` writing cache entries as root. A
+          # runner-owned prune hitting root-owned entries is an EPERM footgun
+          # this job doesn't need: it never rebuilds the cache from a fresh
+          # run in a way that benefits from it, since the only thing it runs
+          # is one test module.
+          enable-cache: false
+
+      # Deterministic proof that the mechanism this job exists to test —
+      # sudo, PATH re-injection, and uv resolving under it — actually works,
+      # run under the *exact same* invocation the real test run uses below.
+      # If sudo, the PATH re-injection, or uv resolution silently broke, this
+      # fails here instead of the test run quietly reporting skips as if
+      # nothing were wrong.
+      - name: Verify sudo/PATH/uv actually resolve as root
+        run: >
+          sudo -E env "PATH=$PATH" uv run --frozen python3 -c
+          "import os, sys; sys.exit(0 if os.geteuid() == 0 else 1)"
 
       # `sudo` resets PATH, dropping the `uv` that setup-uv just put on it —
       # `sudo -E env "PATH=$PATH" ...` re-injects the invoking user's PATH
@@ -209,19 +231,83 @@ jobs:
       # a reason unrelated to this job's purpose — `--no-cov` disables it
       # here without touching the floor itself. Only this one module is run:
       # the rest of the suite is already covered, with coverage, by `test`
-      # and `test-legacy`.
+      # and `test-legacy`. --junitxml records each test's skip message (if
+      # any) so the next step can tell a root-gate skip from a port-conflict
+      # skip, which a plain "N passed, M skipped" pytest summary cannot.
       - name: Run NSE integration tests as root
         run: >
           sudo -E env "PATH=$PATH" uv run --frozen pytest
           tests/test_nse_integration.py -v -rs --no-cov
+          --junitxml=nse-root-results.xml
 
-  # The workflow file is hand-edited often and carries four hand-maintained
-  # SHA pins, so it gets the same linting rigor as the Python it drives.
-  # actionlint catches YAML and expression errors (bad `if:`, unknown
+      # A skip here can mean two different things, and only one of them is
+      # acceptable: tests/conftest.py deliberately skips a class when the
+      # port it needs is already in use, on the (correct) theory that a hard
+      # failure there would be flaky-test noise from an environment conflict,
+      # not an NSE regression — that behavior stays exactly as it is. But
+      # TestOpenvpnDetectNseUdp *also* skips (tests/test_nse_integration.py,
+      # `requires root for -sU raw socket scan`) whenever os.geteuid() != 0,
+      # and that skip is normal pytest behavior, not an error — so "N passed,
+      # M skipped" exits 0 even if sudo silently failed and every root-gated
+      # test never ran at all, which is exactly the failure mode this job
+      # exists to catch. Distinguishing the two requires reading *why* a test
+      # skipped, which -rs prints but nothing enforces, hence this parse of
+      # the skip messages actually recorded in the junit report.
+      - name: Verify no test was skipped for the root-gate reason
+        run: |
+          python3 - <<'PYEOF'
+          import sys
+          import xml.etree.ElementTree as ET
+
+          ROOT_SKIP_REASON = 'requires root for -sU raw socket scan'
+
+          tree = ET.parse('nse-root-results.xml')
+          offenders = []
+          for testcase in tree.getroot().iter('testcase'):
+              skipped = testcase.find('skipped')
+              if skipped is None:
+                  continue
+              if ROOT_SKIP_REASON in skipped.attrib.get('message', ''):
+                  offenders.append(testcase.attrib.get('name', '<unknown>'))
+          if offenders:
+              sys.exit(
+                  'test(s) skipped for the root-gate reason, meaning this job '
+                  'did not actually run as root (sudo/PATH/uv resolution '
+                  'broke silently): ' + ', '.join(offenders)
+              )
+          print(
+              'no test was skipped for the root-gate reason: the -sU path '
+              'actually ran as root (a port-conflict skip, if any, is fine)'
+          )
+          PYEOF
+
+  # The workflow directory is hand-edited often and every `uses:` step in it
+  # carries a hand-maintained SHA pin (not a fixed count worth stating here —
+  # it only grows as jobs are added — but it's every `uses:` line in
+  # .github/workflows/), so it gets the same linting rigor as the Python it
+  # drives. actionlint catches YAML and expression errors (bad `if:`, unknown
   # contexts, malformed matrices); zizmor is Actions-specific security
   # auditing (unpinned actions, script injection via untrusted input,
   # credential persistence). One job for both, on the same reasoning as
   # combining `test`/`test-legacy` under one workflow instead of two.
+  #
+  # Both tools are pointed at the whole .github/workflows/ directory, not
+  # just this file, so a future workflow file is covered without anyone
+  # having to remember to add it here. .github/dependabot.yml is deliberately
+  # left out of both invocations: it isn't a workflow file and neither tool
+  # understands it (zizmor's `--collect dependabot` mode is a separate,
+  # unrelated check this repo isn't opting into) — its own YAML validity is
+  # covered by the plain `yaml.safe_load` parse this PR's own verification
+  # runs, not by this job.
+  #
+  # actionlint and zizmor are both installed via a bare `uvx --from`, the
+  # same pattern bandit's move into the locked `dev` group was meant to move
+  # away from — but the exception is deliberate here: neither tool is part of
+  # spoonmap's own dependency surface (nothing here imports them, and they
+  # never touch spoonmap.py), both are single, effectively dependency-free
+  # Rust/Go-style binaries wrapped for PyPI, and their blast radius is
+  # limited to linting this workflow file, not running against or shipping
+  # with the project's own source the way bandit does.
   workflow-lint:
     name: workflow lint (actionlint + zizmor)
     runs-on: ubuntu-latest
@@ -231,11 +317,14 @@ jobs:
         with:
           persist-credentials: false
 
+      # No path argument: actionlint auto-discovers the nearest
+      # .github/workflows/ directory from the current repo root and checks
+      # every file in it, so a new workflow file needs no edit here.
       - name: actionlint
-        run: uvx --from "actionlint-py==1.7.12.24" actionlint .github/workflows/ci.yml
+        run: uvx --from "actionlint-py==1.7.12.24" actionlint
 
       - name: zizmor
-        run: uvx zizmor==1.29.0 --persona=regular .github/workflows/ci.yml
+        run: uvx zizmor==1.29.0 --persona=regular .github/workflows/
 
   # The built artifacts are a claimed interface ([project.scripts] installs a
   # spoonmap entry point) that nothing else here exercises. This job builds
