@@ -3,6 +3,8 @@
 # Author: Spoonman (Larry.Spohn@TrustedSec.com)
 # QA and Personal Pythonian Consultant: Bandrel (Justin.Bollinger@TrustedSec.com)
 
+import bisect
+import collections
 import contextlib
 import datetime
 import glob as _glob
@@ -20,6 +22,7 @@ import tempfile
 import termios
 import threading
 import time
+import queue
 from queue import Queue
 import xml.etree.ElementTree as etree
 
@@ -28,6 +31,12 @@ _COLOR_PROGRESS = '\x1b[38;5;118m'   # neon lime green — completion status / r
 _COLOR_RESULT   = '\x1b[38;5;226m'   # electric yellow — output paths / final summary
 _COLOR_ERROR    = '\x1b[38;5;198m'   # hot pink        — errors and warnings
 _COLOR_RESET    = '\x1b[0m'
+
+# Written over a zero-length -oX file after a *successful* masscan run so that
+# "completed, found nothing" is distinguishable on disk from "killed before it
+# wrote anything".  Parses to a tree with zero <host> elements, so it reads as
+# an empty result set everywhere and as usable output to the resume gates.
+_EMPTY_RESULT_XML = '<?xml version="1.0"?>\n<nmaprun></nmaprun>\n'
 
 
 def _raise_fd_limit():
@@ -102,9 +111,19 @@ def _count_hosts_in_file(filepath):
     """Return total IP address count for all entries in a target/exclusions file.
 
     Each line may be a bare IP, a CIDR, or a hostname.
-    CIDRs are expanded to their full address count via ipaddress.
+    IPv4 CIDRs are expanded to their full address count via ipaddress.
     Hostnames count as 1. Blank lines and # comments are skipped.
     Returns None if the file cannot be opened.
+
+    Non-IPv4 entries count as 0, matching _parse_ranges(), which rejects them at
+    parse time because SpooNMAP scans IPv4 only.  ipaddress.ip_network() happily
+    parses IPv6, so counting it at face value meant one ``::/0`` line contributed
+    2**128 hosts.  This count drives the discovery port-list trim against
+    INTERNAL_DISCOVERY_STATE_CEILING and _calc_scan_wait(), so a single stray IPv6
+    line in ranges.txt cut an all-IPv4 scan's port list from 10 ports to 5 and
+    skewed the inter-scan wait — no crash and no lost output, but it silently
+    changed what got scanned.  _parse_ranges() already names the offending line,
+    so no second warning is printed here.
     """
     count = 0
     try:
@@ -114,12 +133,186 @@ def _count_hosts_in_file(filepath):
                 if not line or line.startswith('#'):
                     continue
                 try:
-                    count += ipaddress.ip_network(line, strict=False).num_addresses
+                    net = ipaddress.ip_network(line, strict=False)
                 except ValueError:
                     count += 1   # hostname — resolves to one IP
+                else:
+                    if net.version == 4:
+                        count += net.num_addresses
     except OSError:
         return None
     return count
+
+
+def _ip_sort_key(value):
+    """Total-order sort key for a list of IPv4 address strings that never raises.
+
+    The previous inline key, ``tuple(int(o) for o in x.split('.'))``, raises
+    ValueError for anything that is not four decimal octets — a hostname that
+    survived resolution, an IPv6 literal that leaked out of a parser, a
+    truncated line read back from a resume file.  Those sorts run *after* a
+    completed masscan sweep, so a single odd entry discarded the whole sweep
+    with an opaque traceback.  Sorting must not be able to lose scan results.
+
+    IPv4 addresses keep their existing numeric ordering; anything unparseable
+    sorts after them, ordered lexically among itself, and is still written out.
+    """
+    try:
+        return (0, int(ipaddress.IPv4Address(value)), '')
+    except ValueError:
+        return (1, 0, str(value))
+
+
+def _parse_target_ranges(filepath):
+    """Parse IPs/CIDRs/ranges from a masscan-style target or exclude file.
+
+    Returns a list of inclusive ``(start_int, end_int)`` IPv4 bounds.
+
+    Handles three formats masscan accepts but ipaddress rejects:
+      - Inline comments:    10.0.0.0/8 # note
+      - Range notation:     10.0.0.1-10.0.0.254
+      - Netmask notation:   10.0.0.0 255.255.0.0
+
+    SpooNMAP is IPv4-only, so an IPv6 entry is reported by file and line
+    number and skipped here.  ipaddress.ip_network() happily parses IPv6, so
+    without this check the bounds were stored and only blew up several hundred
+    lines later, in _build_discovery_target_file()'s summarize_address_range()
+    call, as an AddressValueError for a value >= 2**32 — and only when an
+    exclusions file happened to be configured, since the no-exclusions path
+    returns early.  Naming the offending line beats that traceback.
+
+    Module level rather than nested inside _build_discovery_target_file()
+    because mass_scan() needs the same parse to decide whether a cached
+    live_hosts entry is still inside the operator's current scope.  One parser
+    for "what does this target file actually cover", not two.
+    """
+    ranges = []
+    try:
+        with open(filepath) as fh:
+            for lineno, line in enumerate(fh, 1):
+                # Strip inline comments before parsing
+                line = line.split('#')[0].strip()
+                if not line:
+                    continue
+                # Standard CIDR or bare IP
+                try:
+                    net = ipaddress.ip_network(line, strict=False)
+                except ValueError:
+                    net = None
+                if net is not None:
+                    if net.version != 4:
+                        print(_COLOR_ERROR
+                              + f'Warning: {filepath} line {lineno}: '
+                              + f'ignoring non-IPv4 target "{line}" '
+                              + '— SpooNMAP scans IPv4 only.'
+                              + _COLOR_RESET)
+                        continue
+                    ranges.append((int(net.network_address),
+                                   int(net.broadcast_address)))
+                    continue
+                # Range notation: A.B.C.D-E.F.G.H
+                if '-' in line:
+                    parts = line.split('-', 1)
+                    try:
+                        start = int(ipaddress.IPv4Address(parts[0].strip()))
+                        end   = int(ipaddress.IPv4Address(parts[1].strip()))
+                        if start <= end:
+                            ranges.append((start, end))
+                        continue
+                    except ValueError:
+                        pass
+                # Netmask notation: A.B.C.D M.M.M.M
+                parts = line.split()
+                if len(parts) == 2:
+                    try:
+                        net = ipaddress.ip_network(f'{parts[0]}/{parts[1]}', strict=False)
+                        ranges.append((int(net.network_address),
+                                       int(net.broadcast_address)))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return ranges
+
+
+def _merge_ranges(ranges):
+    """Coalesce overlapping/adjacent ``(start, end)`` bounds, sorted by start."""
+    out = []
+    for s, e in sorted(ranges):
+        if out and s <= out[-1][1] + 1:
+            out[-1] = (out[-1][0], max(out[-1][1], e))
+        else:
+            out.append((s, e))
+    return out
+
+
+def _ip_in_ranges(value, merged_ranges):
+    """Return True if IPv4 string *value* falls inside *merged_ranges*.
+
+    *merged_ranges* must come from _merge_ranges(): disjoint and sorted, so a
+    bisect finds the only range that could contain the address.  Never raises —
+    anything that is not a plain IPv4 address (an unresolved hostname, an IPv6
+    literal, a truncated line read back from a resume file) reads as out of
+    range, so it is excluded rather than crashing the caller.  This gates what
+    gets *scanned*, so failing closed is the only safe direction.
+    """
+    try:
+        addr = int(ipaddress.IPv4Address(value))
+    except ValueError:
+        return False
+    idx = bisect.bisect_right(merged_ranges, (addr, float('inf'))) - 1
+    if idx < 0:
+        return False
+    start, end = merged_ranges[idx]
+    return start <= addr <= end
+
+
+# Retained results are disclosed, never deleted; deletion is exclusively
+# operator-initiated via the [d]elete prompt or --cleanup flag.
+def _report_out_of_scope_retained(port_ips, scope_ranges, target_file,
+                                  examples=3):
+    """Warn about retained hosts that fall outside the current target scope.
+
+    Cached ``live_hosts/portN.txt`` entries are unioned into this run's results
+    and are deliberately never deleted — losing a completed scan's output is this
+    tool's worst failure mode, so a narrowed ``ranges.txt`` does not prune them.
+    But ``all_live_hosts.txt`` and ``spoonmap_output.*`` feed engagement
+    deliverables, and a host outside the current scope sitting in those files is
+    a host the operator may report on or pivot to believing it was authorised for
+    this engagement.  Rules-of-engagement violations start exactly there, and it
+    used to be entirely silent.
+
+    So: disclose, never delete, and never filter what gets written.  This prints
+    and returns the offending set; it mutates nothing.  Anything that is not a
+    plain IPv4 address counts as out of scope, because it cannot be shown to be
+    inside it (see _ip_in_ranges).
+
+    An empty *scope_ranges* means there is no parseable authorisation to compare
+    against, so nothing is claimed either way.
+    """
+    if not scope_ranges:
+        return set()
+    stale = {ip
+             for ips in port_ips.values()
+             for ip in ips
+             if not _ip_in_ranges(ip, scope_ranges)}
+    if not stale:
+        return set()
+    shown = sorted(stale, key=_ip_sort_key)[:examples]
+    remainder = len(stale) - len(shown)
+    sample = ', '.join(shown) + (f' (+{remainder} more)' if remainder else '')
+    print(_COLOR_ERROR
+          + f'Warning: {len(stale)} retained host(s) are OUTSIDE the current '
+            f'target scope and were NOT scanned this run: {sample}. These are '
+            'cached results from an earlier run against a wider scope. '
+            'They are kept in live_hosts/ and all_live_hosts.txt on purpose — '
+            'completed scan results are never deleted — but they are not in '
+            f'{target_file}, and nothing was sent to them this run. Confirm they '
+            'are in scope for this engagement before reporting on or pivoting to '
+            'them. To clean them, re-run and select [d]elete at the prompt, '
+            'or use --cleanup.'
+          + _COLOR_RESET)
+    return stale
 
 
 def _build_discovery_target_file(target_file, exclusions_file, disc):
@@ -134,63 +327,6 @@ def _build_discovery_target_file(target_file, exclusions_file, disc):
     Returns (filtered_file_path, accurate_host_count).  If no exclusions apply,
     returns (target_file, raw_count) unchanged so callers omit --excludefile.
     """
-    def _parse_ranges(filepath):
-        """Parse IPs/CIDRs/ranges from a masscan-style target or exclude file.
-
-        Handles three formats masscan accepts but ipaddress rejects:
-          - Inline comments:    10.0.0.0/8 # note
-          - Range notation:     10.0.0.1-10.0.0.254
-          - Netmask notation:   10.0.0.0 255.255.0.0
-        """
-        ranges = []
-        try:
-            with open(filepath) as fh:
-                for line in fh:
-                    # Strip inline comments before parsing
-                    line = line.split('#')[0].strip()
-                    if not line:
-                        continue
-                    # Standard CIDR or bare IP
-                    try:
-                        net = ipaddress.ip_network(line, strict=False)
-                        ranges.append((int(net.network_address),
-                                       int(net.broadcast_address)))
-                        continue
-                    except ValueError:
-                        pass
-                    # Range notation: A.B.C.D-E.F.G.H
-                    if '-' in line:
-                        parts = line.split('-', 1)
-                        try:
-                            start = int(ipaddress.IPv4Address(parts[0].strip()))
-                            end   = int(ipaddress.IPv4Address(parts[1].strip()))
-                            if start <= end:
-                                ranges.append((start, end))
-                            continue
-                        except ValueError:
-                            pass
-                    # Netmask notation: A.B.C.D M.M.M.M
-                    parts = line.split()
-                    if len(parts) == 2:
-                        try:
-                            net = ipaddress.ip_network(f'{parts[0]}/{parts[1]}', strict=False)
-                            ranges.append((int(net.network_address),
-                                           int(net.broadcast_address)))
-                        except ValueError:
-                            pass
-        except OSError:
-            pass
-        return ranges
-
-    def _merge(ranges):
-        out = []
-        for s, e in sorted(ranges):
-            if out and s <= out[-1][1] + 1:
-                out[-1] = (out[-1][0], max(out[-1][1], e))
-            else:
-                out.append((s, e))
-        return out
-
     def _subtract(targets, excls):
         result = []
         ei = 0
@@ -211,7 +347,7 @@ def _build_discovery_target_file(target_file, exclusions_file, disc):
                 result.append((cur, te))
         return result
 
-    target_ranges = _parse_ranges(target_file)
+    target_ranges = _parse_target_ranges(target_file)
     if not target_ranges:
         return target_file, 0
 
@@ -220,11 +356,11 @@ def _build_discovery_target_file(target_file, exclusions_file, disc):
     if not exclusions_file or not os.path.exists(exclusions_file):
         return target_file, raw_count
 
-    excl_ranges = _parse_ranges(exclusions_file)
+    excl_ranges = _parse_target_ranges(exclusions_file)
     if not excl_ranges:
         return target_file, raw_count
 
-    remaining = _subtract(_merge(target_ranges), _merge(excl_ranges))
+    remaining = _subtract(_merge_ranges(target_ranges), _merge_ranges(excl_ranges))
     if not remaining:
         filtered_file = os.path.join(disc, 'discovery_targets_filtered.txt')
         open(filtered_file, 'w').close()
@@ -314,6 +450,88 @@ def _write_if_changed(path, content):
     return True
 
 
+def _atomic_write(path, content):
+    """Write *content* to *path* atomically (temp file in the same dir + os.replace).
+
+    The temp file is created in the same directory as *path* so os.replace()
+    never crosses a filesystem boundary and therefore stays atomic: readers
+    see either the old contents or the new ones, never a half-written file.
+    A failure part-way through leaves *path* untouched and removes the temp.
+    """
+    directory = os.path.dirname(path) or '.'
+    fd, tmp_path = tempfile.mkstemp(dir=directory,
+                                    prefix='.' + os.path.basename(path) + '.',
+                                    suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as fh:
+            fh.write(content)
+        os.replace(tmp_path, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
+
+
+def _safe_mtime(path):
+    """Return *path*'s mtime, or 0 if it cannot be read.
+
+    Closes the exists()/getmtime() race in the resume gates: a file removed by
+    another process between the two calls must read as stale (0) rather than
+    raising FileNotFoundError and aborting a scan mid-run.
+    """
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0
+
+
+def _safe_size(path):
+    """Return *path*'s size in bytes, or 0 if it is not a readable regular file.
+
+    The _safe_mtime() companion for size checks: the resume gates and
+    _parse_result_xml() both test existence and then stat, and a file removed in
+    between (a parallel --cleanup, an operator tidying up mid-run) must read as
+    unusable (0) rather than raising FileNotFoundError out of a scan. A
+    directory reads as 0 too, which keeps the isfile() checks these callers used
+    to make.
+    """
+    try:
+        if not os.path.isfile(path):
+            return 0
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _resume_cache_usable(output_file, baseline_mtime, description, is_xml=True):
+    """True when cached *output_file* may satisfy a resume gate.
+
+    Existence plus freshness is not enough.  A scan that was killed, or that
+    died before writing anything, leaves a zero-length or truncated output file
+    behind; a gate that only checks existence treats that emptiness as
+    "already done" forever, silently under-scanning with no warning.  So the
+    file must also hold usable content: XML outputs have to parse (via
+    _parse_result_xml, which rejects empty and unterminated files), while a
+    plain-text host list only has to be non-empty.
+
+    *baseline_mtime* keeps the separate, still-valid freshness concern: a target
+    list edited after the cache was written must force the work to be redone.
+    Pass 0 for gates with no target-file baseline.
+    """
+    if not os.path.exists(output_file):
+        return False
+    if _safe_mtime(output_file) < baseline_mtime:
+        return False
+    if is_xml:
+        usable = _parse_result_xml(output_file) is not None
+    else:
+        usable = _safe_size(output_file) > 0
+    if not usable:
+        print(_COLOR_INFO + f're-running {description}: cached result was empty '
+                            'or unreadable' + _COLOR_RESET)
+    return usable
+
+
 def preprocess_targets(target_file, output_path):
     """
     Preprocess the target file to separate hostnames from IPs.
@@ -391,15 +609,21 @@ def _get_scripts_for_port(dest_port, target_scan):
 
 
 def _parse_masscan_ping_xml(xml_file):
-    """Return set of IPs from a masscan --ping XML output file."""
+    """Return set of IPv4 addresses from a masscan --ping XML output file.
+
+    Filters on addrtype="ipv4" to match what the nmap parsers already do.  The
+    first <address> child is not necessarily the IPv4 one, and this tool is
+    IPv4-only: an IPv6 or MAC string admitted here flows straight into
+    live_ips/port_ips and on into the address sort keys and masscan -iL files.
+    """
     ips = set()
     if not os.path.exists(xml_file) or os.stat(xml_file).st_size == 0:
         return ips
     try:
         root = etree.parse(xml_file)
         for host in root.findall('host'):
-            addr_elem = host.find('address')
-            if addr_elem is not None:
+            addr_elem = host.find("address[@addrtype='ipv4']")
+            if addr_elem is not None and addr_elem.attrib.get('addr'):
                 ips.add(addr_elem.attrib['addr'])
     except etree.ParseError:
         pass
@@ -407,7 +631,13 @@ def _parse_masscan_ping_xml(xml_file):
 
 
 def _parse_nmap_sn_xml(xml_file):
-    """Return set of IPs from a nmap -sn XML output where status is 'up'."""
+    """Return set of IPv4 addresses from a nmap -sn XML output where status is 'up'.
+
+    Same addrtype="ipv4" filter as _parse_masscan_ping_xml: an -sn sweep of a
+    dual-stacked host can report a MAC or IPv6 <address> first, and this set is
+    unioned with the masscan discovery set before being sorted and written to a
+    target file that only IPv4 tooling reads.
+    """
     ips = set()
     if not os.path.exists(xml_file) or os.stat(xml_file).st_size == 0:
         return ips
@@ -416,8 +646,8 @@ def _parse_nmap_sn_xml(xml_file):
         for host in root.findall('host'):
             status = host.find('status')
             if status is not None and status.attrib.get('state') == 'up':
-                addr_elem = host.find('address')
-                if addr_elem is not None:
+                addr_elem = host.find("address[@addrtype='ipv4']")
+                if addr_elem is not None and addr_elem.attrib.get('addr'):
                     ips.add(addr_elem.attrib['addr'])
     except etree.ParseError:
         pass
@@ -439,8 +669,16 @@ def _stream_masscan_progress(proc):
     Masscan emits status using bare \\r (no \\n), so readline() would stall
     until the process exits.  Reading byte-by-byte and splitting on \\r lets
     us display each update as it arrives.  Clears the line when done.
+
+    Returns the last ~2 KB of captured stderr content for diagnostic reporting
+    (the last 20 lines). On multi-hour scans, masscan emits continuous progress
+    updates, so the full stderr would grow without bound. We keep only the tail
+    since the diagnostic purpose is to show why the process exited, which appears
+    in the final lines. 20 lines (~50-100 bytes each) is sufficient for exit
+    diagnostics and bounds memory usage during long scans.
     """
     buf = b''
+    stderr_lines = collections.deque(maxlen=20)  # Keep last 20 lines (~2 KB)
     while True:
         ch = proc.stderr.read(1)
         if not ch:
@@ -450,11 +688,18 @@ def _stream_masscan_progress(proc):
             if line:
                 sys.stdout.write(f'\r  {line:<78}')
                 sys.stdout.flush()
+                stderr_lines.append(line.encode('utf-8'))
             buf = b''
         elif ch != b'\n':
             buf += ch
+    # Append any remaining buffered content
+    if buf:
+        line = buf.decode('utf-8', errors='replace').strip()
+        if line:
+            stderr_lines.append(line.encode('utf-8'))
     sys.stdout.write('\r' + ' ' * 80 + '\r')
     sys.stdout.flush()
+    return b'\n'.join(stderr_lines)
 
 
 def _discover_external_masscan(target_file, disc, max_rate, exclusions_file, target_count):
@@ -473,6 +718,11 @@ def _discover_external_masscan(target_file, disc, max_rate, exclusions_file, tar
         masscan_cmd.extend(['--excludefile', exclusions_file])
     term_state = save_terminal_state()
     progress_thread = None
+    # Pre-initialised for the same reason progress_thread is: Ctrl-C during a
+    # scan is routine, and if SIGINT lands inside Popen() itself (the fork/exec
+    # window) the name is never bound, so a bare proc.kill() in the handler
+    # below replaced the KeyboardInterrupt with an UnboundLocalError.
+    proc = None
     try:
         proc = subprocess.Popen(masscan_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                 preexec_fn=_raise_fd_limit)
@@ -481,8 +731,9 @@ def _discover_external_masscan(target_file, disc, max_rate, exclusions_file, tar
         proc.wait()
         progress_thread.join()
     except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
+        if proc:
+            proc.kill()
+            proc.wait()
         if progress_thread:
             progress_thread.join()
         restore_terminal_state(term_state)
@@ -525,6 +776,11 @@ def _discover_internal_masscan(target_file, disc, max_rate, exclusions_file, tar
         masscan_cmd.extend(['--excludefile', exclusions_file])
     term_state = save_terminal_state()
     progress_thread = None
+    # Pre-initialised for the same reason progress_thread is: Ctrl-C during a
+    # scan is routine, and if SIGINT lands inside Popen() itself (the fork/exec
+    # window) the name is never bound, so a bare proc.kill() in the handler
+    # below replaced the KeyboardInterrupt with an UnboundLocalError.
+    proc = None
     try:
         proc = subprocess.Popen(masscan_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                 preexec_fn=_raise_fd_limit)
@@ -533,8 +789,9 @@ def _discover_internal_masscan(target_file, disc, max_rate, exclusions_file, tar
         proc.wait()
         progress_thread.join()
     except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
+        if proc:
+            proc.kill()
+            proc.wait()
         if progress_thread:
             progress_thread.join()
         restore_terminal_state(term_state)
@@ -620,10 +877,9 @@ def _host_discovery(target_file, output_path, max_rate, exclusions_file,
     # Resume: reuse cached discovery only if it is newer than the target file.
     # If the target set changed since the cache was written, re-discover so
     # newly added ranges are not silently skipped.
-    targets_mtime = os.path.getmtime(target_file) if os.path.exists(target_file) else 0
-    if (resume
-            and os.path.exists(discovery_file)
-            and os.path.getmtime(discovery_file) >= targets_mtime):
+    targets_mtime = _safe_mtime(target_file)
+    if resume and _resume_cache_usable(discovery_file, targets_mtime,
+                                       'host discovery', is_xml=False):
         with open(discovery_file) as fh:
             count = sum(1 for line in fh if line.strip())
         print(_COLOR_INFO + f'Resume: skipping host discovery ({count} hosts cached)' + _COLOR_RESET)
@@ -660,7 +916,7 @@ def _host_discovery(target_file, output_path, max_rate, exclusions_file,
         return None
 
     with open(discovery_file, 'w') as fh:
-        for ip in sorted(live_ips, key=lambda x: tuple(int(o) for o in x.split('.'))):
+        for ip in sorted(live_ips, key=_ip_sort_key):
             fh.write(ip + '\n')
 
     return discovery_file
@@ -683,12 +939,16 @@ def _nmap_host_discovery(target_file, disc, source_port, exclusions_file):
 
     print(_COLOR_INFO + 'Host discovery: running nmap -sn...' + _COLOR_RESET)
     term_state = save_terminal_state()
+    # SIGINT inside Popen() leaves proc unbound; a bare proc.kill() below then
+    # raised UnboundLocalError in place of the KeyboardInterrupt.
+    proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         proc.wait()
     except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
+        if proc:
+            proc.kill()
+            proc.wait()
         restore_terminal_state(term_state)
         raise
     except FileNotFoundError:
@@ -707,9 +967,15 @@ def _nmap_host_discovery(target_file, disc, source_port, exclusions_file):
             status = host.find('status')
             if status is None or status.attrib.get('state') != 'up':
                 continue
+            # An <address> with no addr= attribute (truncated -sn output) is not
+            # usable.  Subscripting it raised KeyError, which `except
+            # etree.ParseError` below does not catch, so one malformed element
+            # discarded the live hosts found by the whole sweep.
             addr = host.find('address[@addrtype="ipv4"]')
-            if addr is not None:
-                live_ips.add(addr.attrib['addr'])
+            ip = addr.attrib.get('addr') if addr is not None else None
+            if not ip:
+                continue
+            live_ips.add(ip)
     except etree.ParseError as e:
         print(_COLOR_ERROR + f'Error parsing nmap discovery XML: {e}' + _COLOR_RESET)
 
@@ -736,6 +1002,15 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
 
     term_state = save_terminal_state()
     progress_thread = None
+    # Pre-initialised for the same reason progress_thread is: if SIGINT lands
+    # inside Popen() itself the name is never bound, and the handler's
+    # masscan_process.pid read raised UnboundLocalError instead of letting the
+    # KeyboardInterrupt through.
+    masscan_process = None
+    stderr_holder = []
+
+    def run_progress_and_capture(proc):
+        stderr_holder.append(_stream_masscan_progress(proc))
 
     try:
         masscan_process = subprocess.Popen(
@@ -744,14 +1019,15 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
             stderr=subprocess.PIPE,
             preexec_fn=_raise_fd_limit,
         )
-        progress_thread = threading.Thread(target=_stream_masscan_progress, args=(masscan_process,), daemon=True)
+        progress_thread = threading.Thread(target=run_progress_and_capture, args=(masscan_process,), daemon=True)
         progress_thread.start()
         masscan_process.wait()
         progress_thread.join()
     except KeyboardInterrupt:
-        print(f'Killing PID {str(masscan_process.pid)}...')
-        masscan_process.kill()
-        masscan_process.wait()
+        if masscan_process:
+            print(f'Killing PID {str(masscan_process.pid)}...')
+            masscan_process.kill()
+            masscan_process.wait()
         if progress_thread:
             progress_thread.join()
         restore_terminal_state(term_state)
@@ -759,25 +1035,50 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
     except FileNotFoundError:
         print(_COLOR_ERROR + 'Error: masscan not found. Please install masscan.' + _COLOR_RESET)
         restore_terminal_state(term_state)
-        quit(1)
+        sys.exit(1)
     except Exception as e:
         print(_COLOR_ERROR + f'Error running masscan: {e}' + _COLOR_RESET)
         restore_terminal_state(term_state)
-        quit(1)
+        sys.exit(1)
     finally:
         restore_terminal_state(term_state)
 
-    if masscan_process.returncode == 1:
-        quit(1)
+    if masscan_process.returncode != 0:
+        stderr_content = stderr_holder[0] if stderr_holder else b''
+        stderr_str = stderr_content.decode('utf-8', errors='replace') if stderr_content else '(no error output)'
+        print(_COLOR_ERROR + f'masscan exited with code {masscan_process.returncode}' + _COLOR_RESET)
+        if stderr_str and stderr_str.strip():
+            print(_COLOR_ERROR + f'Error output: {stderr_str}' + _COLOR_RESET)
+        sys.exit(1)
 
-    if not os.path.exists(output_file) or os.stat(output_file).st_size == 0:
+    # masscan writes nothing at all to -oX when a batch finds no open ports, so
+    # "ran to completion, found nothing" and "was killed before writing" both
+    # look like a zero-length file on disk.  Only the success path gets here (a
+    # non-zero exit sys.exit()s above and an interrupt re-raises), so stamp a
+    # minimal valid document over the empty one: the resume gates can then tell
+    # the two apart and skip an honestly-empty batch instead of redoing it on
+    # every resume.  It parses to zero <host> elements, so every consumer of
+    # this directory behaves exactly as it did for the zero-length file.
+    if os.path.exists(output_file) and os.stat(output_file).st_size == 0:
+        _atomic_write(output_file, _EMPTY_RESULT_XML)
+        return {}
+    if not os.path.exists(output_file):
         return {}
 
     results = {}
     try:
         root = etree.parse(output_file)
         for host in root.findall('host'):
-            ip_address = host.findall('address')[0].attrib['addr']
+            # Select the IPv4 <address> explicitly rather than trusting the
+            # first child.  findall(...)[0] raised IndexError on an <host> with
+            # no <address> at all (killing the whole batch's results, not just
+            # that host), and on a dual-stacked host it could hand back an IPv6
+            # or MAC string that then propagated into live_hosts/portNN.txt and
+            # became a masscan -iL target this IPv4-only tool cannot scan.
+            addr_elem = host.find("address[@addrtype='ipv4']")
+            if addr_elem is None or not addr_elem.attrib.get('addr'):
+                continue
+            ip_address = addr_elem.attrib['addr']
             ports_elem = host.find('ports')
             if ports_elem is not None:
                 port_elem = ports_elem.find('port')
@@ -896,10 +1197,9 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
 
     # Resume: reuse cached UDP results only if newer than the target file, so a
     # changed target set forces a re-scan rather than reusing stale hosts.
-    targets_mtime = os.path.getmtime(target_file) if os.path.exists(target_file) else 0
-    if (resume
-            and os.path.exists(output_file)
-            and os.path.getmtime(output_file) >= targets_mtime):
+    targets_mtime = _safe_mtime(target_file)
+    if resume and _resume_cache_usable(output_file, targets_mtime,
+                                       f'UDP port {port_num} discovery'):
         live_file = f'{_disc(output_path)}/live_hosts/port{_port_fname(udp_port)}.txt'
         if os.path.exists(live_file):
             with open(live_file) as fh:
@@ -923,12 +1223,16 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
     print(_COLOR_INFO + f'UDP discovery: scanning port {port_num} with nmap...' + _COLOR_RESET)
 
     term_state = save_terminal_state()
+    # SIGINT inside Popen() leaves proc unbound; a bare proc.kill() below then
+    # raised UnboundLocalError in place of the KeyboardInterrupt.
+    proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         proc.wait()
     except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
+        if proc:
+            proc.kill()
+            proc.wait()
         restore_terminal_state(term_state)
         raise
     except FileNotFoundError:
@@ -944,10 +1248,14 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
     try:
         root = etree.parse(output_file)
         for host in root.findall('host'):
+            # Skip a <host> whose IPv4 <address> carries no addr= attribute:
+            # subscripting it raised KeyError, which the ParseError guard below
+            # does not catch, losing the whole UDP discovery pass over one
+            # unusable element.
             addr = host.find('address[@addrtype="ipv4"]')
-            if addr is None:
+            ip = addr.attrib.get('addr') if addr is not None else None
+            if not ip:
                 continue
-            ip = addr.attrib['addr']
             for port_elem in host.findall('.//port'):
                 state_elem = port_elem.find('state')
                 if state_elem is not None and state_elem.attrib.get('state') in ('open', 'open|filtered'):
@@ -955,6 +1263,37 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
     except etree.ParseError as e:
         print(_COLOR_ERROR + f'Error parsing nmap UDP XML: {e}' + _COLOR_RESET)
     return ips
+
+
+# Upper bound on how long a caller waits for a _start_stderr_reader() thread
+# after the child has been reaped.  Normally the join returns instantly; the
+# timeout only matters when a grandchild inherited the stderr fd and is holding
+# the pipe open, which would otherwise hang the worker for the rest of the scan.
+_STDERR_JOIN_TIMEOUT = 5
+
+
+def _start_stderr_reader(stderr_stream):
+    """Drain *stderr_stream* on a daemon thread; return ``(thread, lines)``.
+
+    Must run concurrently with the wait()/poll() that reaps the child: nmap
+    emits one stderr line per failed packet send, and if nobody drains the pipe
+    the child blocks in write() once the ~64 KB buffer fills — so wait() never
+    returns and poll() never stops returning None.  Callers join *thread* after
+    the child is reaped and then ``''.join(lines)`` for the full text.
+
+    One helper rather than a per-call-site closure: this exact deadlock has now
+    been introduced twice in this module (issues #25 and the nmap_worker
+    regression), so there is a single idiom to reuse.
+    """
+    lines = []
+
+    def _stderr_reader():
+        for line in stderr_stream:
+            lines.append(line)
+
+    thread = threading.Thread(target=_stderr_reader, daemon=True)
+    thread.start()
+    return thread, lines
 
 
 def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
@@ -970,14 +1309,14 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
     os.makedirs(f'{disc}/live_hosts', exist_ok=True)
 
     output_file = f'{disc}/masscan_results/portDirect.xml'
-    targets_mtime = os.path.getmtime(target_file) if os.path.exists(target_file) else 0
+    targets_mtime = _safe_mtime(target_file)
 
     status_summary = '\nSummary'
 
-    # Resume: if output already exists and is newer than the targets file, reload from live_hosts/
-    if (resume
-            and os.path.exists(output_file)
-            and os.path.getmtime(output_file) >= targets_mtime):
+    # Resume: if output already exists, is newer than the targets file, and holds
+    # usable results, reload from live_hosts/
+    if resume and _resume_cache_usable(output_file, targets_mtime,
+                                       'nmap port discovery'):
         print(_COLOR_INFO + 'Resume: skipping completed nmap port discovery' + _COLOR_RESET)
         live_hosts_dir = f'{disc}/live_hosts'
         if os.path.exists(live_hosts_dir):
@@ -1056,17 +1395,23 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
                 print(_COLOR_PROGRESS + f'  [nmap] {line}' + _COLOR_RESET, flush=True)
 
     term_state = save_terminal_state()
+    # SIGINT inside Popen() leaves proc unbound; a bare proc.kill() below then
+    # raised UnboundLocalError in place of the KeyboardInterrupt.
+    proc = None
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
         _t = threading.Thread(target=_progress_reader, args=(proc.stdout,), daemon=True)
         _t.start()
+        _et, stderr_lines = _start_stderr_reader(proc.stderr)
         proc.wait()
         _t.join()
-        stderr_output = proc.stderr.read()
+        _et.join()
+        stderr_output = ''.join(stderr_lines)
     except KeyboardInterrupt:
-        proc.kill()
-        proc.wait()
+        if proc:
+            proc.kill()
+            proc.wait()
         restore_terminal_state(term_state)
         raise
     except FileNotFoundError:
@@ -1091,10 +1436,13 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
     try:
         root = etree.parse(output_file)
         for host in root.findall('host'):
+            # Skip a <host> whose IPv4 <address> carries no addr= attribute.
+            # The KeyError from subscripting escaped the ParseError guard below
+            # and discarded the results for every other host in the sweep.
             addr = host.find('address[@addrtype="ipv4"]')
-            if addr is None:
+            ip = addr.attrib.get('addr') if addr is not None else None
+            if not ip:
                 continue
-            ip = addr.attrib['addr']
             for port_elem in host.findall('.//port'):
                 protocol = port_elem.attrib.get('protocol', 'tcp')
                 portid = port_elem.attrib.get('portid', '')
@@ -1141,14 +1489,17 @@ def _report_suspected_tarpits(suspected, disc):
     if not suspected:
         return
     tarpit_file = os.path.join(disc, 'suspected_tarpits.txt')
-    with open(tarpit_file, 'w') as fh:
-        for ip in sorted(suspected, key=lambda x: tuple(int(o) for o in x.split('.'))):
-            open_count, total = suspected[ip]
-            fh.write(f'{ip},{open_count},{total}\n')
-            print(_COLOR_ERROR
-                  + f'Warning: {ip} responded open on {open_count}/{total} scanned TCP ports '
-                  + '— likely a tarpit/decoy host, not a real service host.'
-                  + _COLOR_RESET)
+    lines = []
+    for ip in sorted(suspected, key=_ip_sort_key):
+        open_count, total = suspected[ip]
+        lines.append(f'{ip},{open_count},{total}\n')
+        print(_COLOR_ERROR
+              + f'Warning: {ip} responded open on {open_count}/{total} scanned TCP ports '
+              + '— likely a tarpit/decoy host, not a real service host.'
+              + _COLOR_RESET)
+    # Atomic: an interrupt or ENOSPC part-way through must not leave a partial
+    # last line for generate_findings() to read back.
+    _atomic_write(tarpit_file, ''.join(lines))
 
 
 def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file, batch_size=1, resume=False, discovery_file=None, target_scan='Internal'):
@@ -1187,15 +1538,20 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                     if (discovery_file and os.path.exists(discovery_file))
                     else target_file)
 
+    # The operator's current authorised scope, parsed once per call: used both to
+    # decide which cached hosts may be folded into the batch target and to
+    # disclose the ones that are retained but out of scope.  Empty when
+    # target_file is absent or holds nothing parseable, which disables both.
+    scope_ranges = _merge_ranges(_parse_target_ranges(target_file))
+
     # Full port scan: skip adaptive probe, run single masscan over 1-65535
     disc = _disc(output_path)
     if scan_type == 'Full':
         output_file = f'{disc}/masscan_results/portFull.xml'
         full_targets_file = f'{disc}/resolved_targets.txt'
-        full_targets_mtime = os.path.getmtime(full_targets_file) if os.path.exists(full_targets_file) else 0
-        if (resume
-                and os.path.exists(output_file)
-                and os.path.getmtime(output_file) >= full_targets_mtime):
+        full_targets_mtime = _safe_mtime(full_targets_file)
+        if resume and _resume_cache_usable(output_file, full_targets_mtime,
+                                          'Full port scan'):
             print(_COLOR_INFO + 'Resume: skipping completed Full port scan' + _COLOR_RESET)
             live_hosts_dir = f'{disc}/live_hosts'
             full_results = {}
@@ -1204,7 +1560,14 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                     if not (fname.startswith('port') and fname.endswith('.txt')
                             and not fname.endswith('_hostnames.txt')):
                         continue
-                    port_key = fname[4:-4]
+                    # Convert the filename stem back to a port key, as the two
+                    # structurally identical loops in _nmap_port_discovery() and
+                    # _filter_udp_live_hosts() already do.  The raw stem leaves a
+                    # UDP port as 'U_53', which fails the port_key.startswith('U:')
+                    # test in _flag_suspected_tarpits() — so a resumed Full scan
+                    # counted UDP ports toward the TCP open-port fraction and could
+                    # skew or spuriously trigger the honeypot/tarpit heuristic.
+                    port_key = _fname_port(fname[4:-4])
                     with open(os.path.join(live_hosts_dir, fname)) as fh:
                         ips = {line.strip() for line in fh if line.strip()}
                     if ips:
@@ -1214,6 +1577,9 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                         status_summary += status_update
                         print(_COLOR_PROGRESS + status_update + _COLOR_RESET)
             _report_suspected_tarpits(_flag_suspected_tarpits(full_results, 65535), disc)
+            # This path's results are read straight back off disk, so it is the
+            # most exposed to a live_hosts/ directory left over from a wider scope.
+            _report_out_of_scope_retained(full_results, scope_ranges, target_file)
             return status_summary
         print(_COLOR_INFO + 'Full port scan: running masscan 1-65535 (no probe)...' + _COLOR_RESET)
         full_results = _run_masscan_batch(['1-65535'], full_scan_rate, output_file,
@@ -1221,9 +1587,8 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                                           wait_secs=wait_secs)
         os.makedirs(f'{disc}/live_hosts', exist_ok=True)
         for port_key, ips in full_results.items():
-            with open(f'{disc}/live_hosts/port{_port_fname(port_key)}.txt', 'w') as f:
-                for ip in sorted(ips):
-                    f.write(f'{ip}\n')
+            _atomic_write(f'{disc}/live_hosts/port{_port_fname(port_key)}.txt',
+                          ''.join(f'{ip}\n' for ip in sorted(ips)))
             host_count = len(ips)
             status_update = f'\nHosts Found on Port {port_key}: {host_count}'
             status_summary += status_update
@@ -1296,11 +1661,24 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         os.makedirs(f'{disc}/live_hosts', exist_ok=True)
         for port_key in probe_ports_used:
             combined = fast_results.get(port_key, set()) | slow_results.get(port_key, set())
+            # Union with the cached per-port file instead of replacing it, exactly
+            # as the batch phase below does ("loading existing data for resume").
+            # The probe has no resume gate, so a resumed run always re-probes —
+            # and it probes probe_target, a narrower set than the batch target,
+            # at a rate whose packet loss varies run to run.  Writing only this
+            # probe's hits therefore deleted every host an earlier run had already
+            # confirmed on this port: out of live_hosts/portN.txt, and so out of
+            # all_live_hosts.txt and out of the nmap banner phase's input file.
+            # Losing a completed scan's output is this tool's worst failure mode,
+            # and it happened silently, with a smaller host count as the only tell.
+            live_host_file = f'{disc}/live_hosts/port{_port_fname(port_key)}.txt'
+            if os.path.exists(live_host_file):
+                with open(live_host_file, 'r') as file:
+                    combined.update(line.strip() for line in file if line.strip())
             if combined:
                 port_ips[port_key] = combined
-                with open(f'{disc}/live_hosts/port{_port_fname(port_key)}.txt', 'w') as f:
-                    for ip in sorted(combined):
-                        f.write(f'{ip}\n')
+                _atomic_write(f'{disc}/live_hosts/port{_port_fname(port_key)}.txt',
+                              ''.join(f'{ip}\n' for ip in sorted(combined)))
                 if port_key not in SLOW_PORTS:
                     # SLOW_PORTS are always re-queued for a solo batch scan;
                     # their summary is emitted once from that batch phase.
@@ -1338,16 +1716,71 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         if discovery_file and os.path.exists(discovery_file):
             with open(discovery_file) as fh:
                 _combined_ips.update(line.strip() for line in fh if line.strip())
+        # Fold in the cached hosts the probe loop just unioned into port_ips, so
+        # the -iL list the remaining batches scan covers every host we retain.
+        # Without this, retaining a cached host (see the probe write loop above)
+        # while leaving it out of the batch target meant it reached
+        # all_live_hosts.txt having been scanned for the probe ports only — output
+        # asserting coverage the scan never performed.  Reachable whenever this
+        # set is not already the whole live population: with host_discovery=False
+        # there is no discovery_file at all, so _combined_ips would otherwise be
+        # nothing but this run's probe hits.
+        #
+        # Filtered against target_file's ranges, never folded in blind.  Nothing
+        # prunes live_hosts/ when ranges.txt narrows — a --resume run deletes no
+        # prior output, and the mtime gate only forces phases to re-run — so a
+        # cached file can still hold hosts from a previous, wider engagement
+        # scope.  Handing those to masscan would scan outside the operator's
+        # current authorisation, which is far worse than under-scanning, so an
+        # out-of-scope cached host keeps its place in live_hosts/portN.txt but
+        # never becomes a target.  An unparseable target file yields no ranges
+        # and folds nothing, which is the pre-existing behaviour.
+        if scope_ranges:
+            _cached_in_scope = {
+                ip
+                for port_key in probe_ports_used
+                for ip in port_ips.get(port_key, ())
+                if ip not in _combined_ips and _ip_in_ranges(ip, scope_ranges)
+            }
+            if _cached_in_scope:
+                _combined_ips.update(_cached_in_scope)
+                print(_COLOR_INFO
+                      + f'Combined target: added {len(_cached_in_scope)} cached '
+                        'host(s) from previous runs (in current scope).'
+                      + _COLOR_RESET)
         if _combined_ips:
             combined_path = os.path.join(disc, 'live_hosts_combined.txt')
-            with open(combined_path, 'w') as fh:
-                for ip in sorted(_combined_ips,
-                                 key=lambda x: tuple(int(o) for o in x.split('.'))):
-                    fh.write(ip + '\n')
-            batch_target = combined_path
-            print(_COLOR_INFO
-                  + f'Combined target: {len(_combined_ips)} host(s) for remaining port batches.'
-                  + _COLOR_RESET)
+            # _atomic_write, not a plain open(): this file is the masscan -iL
+            # target for every remaining batch.  An ENOSPC part-way through a
+            # direct write raised OSError out of mass_scan() and out of main(),
+            # losing the whole run's aggregation, and a truncation that did not
+            # raise silently narrowed the batch target set — under-scanning with
+            # no error.  A failure now leaves the batches pointed at the full
+            # target file: slower, never quieter.
+            try:
+                _atomic_write(combined_path,
+                              ''.join(ip + '\n' for ip in
+                                      sorted(_combined_ips, key=_ip_sort_key)))
+            # `Exception`, not `OSError`: _atomic_write() cleans up and re-raises
+            # whatever it caught, so a non-OSError failure (a TypeError from a
+            # non-str entry that leaked into the set, a rename hook raising
+            # something else) still unwound mass_scan() and lost the whole run's
+            # aggregation — the very outcome the fallback was added to prevent.
+            # Deliberately not BaseException: a KeyboardInterrupt here means the
+            # operator wants the scan stopped, and swallowing it into "carry on
+            # with the full target file" would make Ctrl-C escalate the scan
+            # instead of ending it.
+            except Exception as e:
+                print(_COLOR_ERROR
+                      + f'Warning: could not write combined target list ({e}); '
+                        'falling back to the full target file for remaining batches.'
+                      + _COLOR_RESET)
+                batch_target = target_file
+            else:
+                batch_target = combined_path
+                print(_COLOR_INFO
+                      + f'Combined target: {len(_combined_ips)} host(s) for remaining port batches.'
+                      + _COLOR_RESET)
         else:
             batch_target = target_file
     else:
@@ -1365,15 +1798,15 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
     scan_start_time = time.time()
 
     targets_file = f'{disc}/resolved_targets.txt'
-    targets_mtime = os.path.getmtime(targets_file) if os.path.exists(targets_file) else 0
+    targets_mtime = _safe_mtime(targets_file)
 
     for batch_idx, batch in enumerate(batches):
         batch_label = ', '.join(batch)
         output_file = f'{disc}/masscan_results/batch_{batch_idx}.xml'
 
-        if (resume
-                and os.path.exists(output_file)
-                and os.path.getmtime(output_file) >= targets_mtime):
+        if resume and _resume_cache_usable(
+                output_file, targets_mtime,
+                f'batch {batch_idx + 1}/{total_batches} ({batch_label})'):
             print(_COLOR_INFO +
                   f'Resume: skipping completed batch {batch_idx + 1}/{total_batches} '
                   f'({batch_label})' + _COLOR_RESET)
@@ -1419,9 +1852,9 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             os.makedirs(f'{disc}/live_hosts', exist_ok=True)
             for dest_port in batch:
                 if port_ips.get(dest_port):
-                    with open(f'{disc}/live_hosts/port{_port_fname(dest_port)}.txt', 'w') as file:
-                        for ip in sorted(port_ips[dest_port]):
-                            file.write(f'{ip}\n')
+                    _atomic_write(
+                        f'{disc}/live_hosts/port{_port_fname(dest_port)}.txt',
+                        ''.join(f'{ip}\n' for ip in sorted(port_ips[dest_port])))
                     host_count = len(port_ips[dest_port])
                     status_update = f'\nHosts Found on Port {dest_port}: {host_count}'
                     status_summary += status_update
@@ -1440,9 +1873,8 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                 added = merged_smb - port_ips.get(smb_port, set())
                 if added:
                     port_ips[smb_port] = merged_smb
-                    with open(f'{disc}/live_hosts/port{_port_fname(smb_port)}.txt', 'w') as _f:
-                        for _ip in sorted(merged_smb):
-                            _f.write(_ip + '\n')
+                    _atomic_write(f'{disc}/live_hosts/port{_port_fname(smb_port)}.txt',
+                                  ''.join(_ip + '\n' for _ip in sorted(merged_smb)))
                     partner = '445' if smb_port == '139' else '139'
                     print(_COLOR_INFO
                           + f'SMB coupling: added {len(added)} host(s) to port {smb_port} '
@@ -1459,9 +1891,8 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         )
         if ips:
             port_ips[udp_port] = ips
-            with open(f'{disc}/live_hosts/port{_port_fname(udp_port)}.txt', 'w') as f:
-                for ip in sorted(ips):
-                    f.write(f'{ip}\n')
+            _atomic_write(f'{disc}/live_hosts/port{_port_fname(udp_port)}.txt',
+                          ''.join(f'{ip}\n' for ip in sorted(ips)))
             host_count = len(ips)
             status_update = f'\nHosts Found on Port {udp_port}: {host_count}'
             status_summary += status_update
@@ -1469,6 +1900,11 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         else:
             print(_COLOR_INFO
                   + f'No hosts found on UDP port {udp_port[2:]}' + _COLOR_RESET)
+
+    # Last, so it covers everything retained — probe ports, batch ports (which
+    # union with their cached files too) and UDP — and so the warning is the final
+    # thing on screen rather than buried above the per-port counts.
+    _report_out_of_scope_retained(port_ips, scope_ranges, target_file)
 
     return status_summary
 
@@ -1507,7 +1943,7 @@ def _build_nmap_cmd(dest_port, input_file, output_file, source_port,
             dest_port[2:] if 'U:' in dest_port else dest_port,
             '--open', '--randomize-hosts',
         ]
-        if source_port and dest_port not in _SMB_PORTS:
+        if source_port and dest_port not in _MULTI_SCRIPT_PORTS:
             cmd += ['--source-port', source_port]
         cmd += ['-iL', input_file, '-oX', output_file]
         scripts = _get_scripts_for_port(dest_port, target_scan)
@@ -1538,30 +1974,117 @@ def _build_nmap_cmd(dest_port, input_file, output_file, source_port,
             '-Pn', '-p', dest_port,
             '--open', '--randomize-hosts',
         ]
-        # Skip --source-port for SMB when scripts run to avoid 4-tuple collision
-        if source_port and not (script_scan and dest_port in _SMB_PORTS):
+        # Skip --source-port on multi-script ports when scripts run, to avoid
+        # 4-tuple collision between concurrent NSE connections
+        if source_port and not (script_scan and dest_port in _MULTI_SCRIPT_PORTS):
             cmd += ['--source-port', source_port]
 
     cmd += ['-iL', input_file, '-oX', output_file]
     return cmd
 
 
+def _quarantine_failed_output(output_file):
+    """Rename a failed pass's XML to ``<name>.xml.failed``; return the new path.
+
+    A non-zero nmap exit can still leave a perfectly *valid* XML behind holding
+    zero or partial hosts (whole-target resolution failure, missing privileges
+    for the requested scan type).  _resume_cache_usable() only rejects files
+    that fail to parse, so such a file satisfies the resume gate forever and the
+    port is treated as scanned when it never was — an "appears scanned but
+    wasn't", the worst failure mode this tool has.  Renaming makes the gate
+    reject it while leaving the data on disk for inspection.
+
+    The '.xml.failed' suffix is chosen so no consumer can pick it up: every
+    aggregation and post-processing pass requires an '.xml' extension (or an
+    exact filename), and the live_hosts filters only match 'port*.txt'.
+
+    Returns None when there was nothing to rename or the rename failed — a
+    missing output file already fails the gate, so either way the port is
+    re-scanned.
+    """
+    if not os.path.exists(output_file):
+        return None
+    failed_path = output_file + '.failed'
+    try:
+        os.replace(output_file, failed_path)
+    except OSError:
+        return None
+    return failed_path
+
+
 def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 interrupt_event, ip_to_hostname, script_scan=False,
                 target_scan='Internal', start_time=None):
     """Worker thread function to process NMAP scans from queue"""
+
+    def _report_nmap_failure(pass_label, dest_port, proc, stderr_output, output_file):
+        """Print a diagnostic for a non-zero nmap exit that was not an interrupt.
+
+        Callers must confirm interrupt_event is clear first: a deliberately
+        killed nmap also exits non-zero, and reporting that as a failure would
+        spam an error for every port on Ctrl-C.
+
+        *stderr_output* comes from the concurrent drain started at Popen() time,
+        never from a read() after the fact: reading only on the failure path
+        leaves the pipe unread while the worker polls, which deadlocks the whole
+        scan the moment nmap exceeds the pipe buffer (see _start_stderr_reader).
+
+        The partial output is quarantined before the message is printed so the
+        claim about resume is unconditionally true: this used to promise the port
+        would NOT be retried, which stopped being accurate once the resume gate
+        started accepting any *parseable* XML — a valid, hostless XML from a
+        failed run satisfied the gate and stranded that port permanently.
+        """
+        failed_path = _quarantine_failed_output(output_file)
+        with lock:
+            print(_COLOR_ERROR
+                  + f'Error: nmap {pass_label} for port {dest_port} exited with code '
+                    f'{proc.returncode} — results for this port are missing or '
+                    f'incomplete, so this port WILL be re-scanned on resume.'
+                  + _COLOR_RESET)
+            if failed_path:
+                print(_COLOR_ERROR
+                      + f'Partial output kept for inspection: '
+                        f'{os.path.basename(failed_path)}'
+                      + _COLOR_RESET)
+            if stderr_output.strip():
+                print(_COLOR_ERROR + stderr_output.strip() + _COLOR_RESET)
+
+    # Bound before the loop, not just after each successful get(): the outer
+    # `except Exception` handler below reads it, and once the get() handler stopped
+    # swallowing non-Empty errors, a failure *inside* get() on the very first
+    # iteration reached that handler with the name still unbound — turning a
+    # reportable queue error into an UnboundLocalError from within a finally.
+    task_done_called = False
+
     while not interrupt_event.is_set():
         try:
             # Get work item with timeout to check interrupt_event periodically
             try:
                 host_file = work_queue.get(timeout=0.5)
-            except:
-                # Queue is empty or timeout occurred
+            except queue.Empty:
+                # Nothing queued within the timeout — loop to re-check
+                # interrupt_event.  Narrowed from a bare `except:`, which caught
+                # BaseException: SystemExit and KeyboardInterrupt were swallowed
+                # into `continue`, and so was any genuine error from get(). Not a
+                # live bug (KeyboardInterrupt is not delivered to non-main
+                # threads and shutdown goes through interrupt_event), but a bare
+                # except here could only ever hide something worth seeing.
                 continue
 
             if host_file is None:  # Poison pill to stop worker
                 work_queue.task_done()
                 break
+
+            # task_done() must fire exactly once per successful get().  The inner
+            # `finally` below and the outer `except Exception` both called it, so
+            # an exception raised *inside* one of the inner handlers (a failing
+            # print, say) reached the outer handler after the finally had already
+            # run — a second call raises ValueError('task_done() called too many
+            # times') and, worse, over-decrements the queue's unfinished counter,
+            # so work_queue.join() returns as though every port had been scanned.
+            # That turns a visible hang into a silently incomplete scan.
+            task_done_called = False
 
             dest_port = _fname_port((host_file.split('.')[0])[4:])
             output_file = f'{output_path}/nmap_results/port{_port_fname(dest_port)}.xml'
@@ -1586,29 +2109,60 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 # no controlling terminal — terminal signals cannot propagate
                 # between nmap and spoonmap in either direction, making external
                 # `kill <nmap_pid>` safe without stopping the overall scan.
+                # stderr is captured rather than discarded so a non-zero exit
+                # (bad port spec, missing privileges, disk full) is reportable.
+                # It MUST be drained concurrently: a -sV pass against a few
+                # thousand hosts on a filtered port emits a stderr line per
+                # retransmission-cap hit, and once that fills the ~64 KB pipe
+                # buffer nmap blocks in write() — poll() then never returns
+                # non-None and work_queue.join() in nmap_scan() hangs forever.
                 nmap_process = subprocess.Popen(
                     nmap_cmd,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
                     start_new_session=True,
                 )
+                nmap_err_thread, nmap_err_lines = _start_stderr_reader(nmap_process.stderr)
 
                 # Poll process to allow interrupt checking; wake immediately on interrupt
                 while nmap_process.poll() is None and not interrupt_event.is_set():
                     interrupt_event.wait(0.1)
 
+                # Bounded joins.  The child is always reaped first, so the
+                # reader's loop has already ended and these return immediately
+                # in every normal case — but the fd can outlive the child if a
+                # grandchild inherited it (nmap's own helper processes), which
+                # would hold the pipe open and hang this worker forever.  The
+                # thread is a daemon and its accumulated lines are already usable
+                # either way, so waiting is only ever a courtesy.  Do NOT move
+                # the reader's start below the poll loop to "simplify" this: that
+                # reintroduces the pipe-buffer deadlock of issue #25.
                 if interrupt_event.is_set() and nmap_process.poll() is None:
                     nmap_process.kill()
                     nmap_process.wait()
+                    nmap_err_thread.join(timeout=_STDERR_JOIN_TIMEOUT)
                 else:
                     nmap_process.wait()
+                    nmap_err_thread.join(timeout=_STDERR_JOIN_TIMEOUT)
 
-                    with lock:
-                        completed_count[0] += 1
-                        _print_completion_status(
-                            'NMAP', completed_count[0], total_count,
-                            start_time if start_time is not None else time.time()
-                        )
+                    if interrupt_event.is_set():
+                        # Exited on its own during an interrupt — neither a
+                        # completion nor a failure worth reporting.
+                        pass
+                    elif nmap_process.returncode != 0:
+                        # Failed scan: leave completed_count alone so the
+                        # progress percentage does not claim work that produced
+                        # no (or truncated) XML.
+                        _report_nmap_failure('banner scan', dest_port, nmap_process,
+                                             ''.join(nmap_err_lines), output_file)
+                    else:
+                        with lock:
+                            completed_count[0] += 1
+                            _print_completion_status(
+                                'NMAP', completed_count[0], total_count,
+                                start_time if start_time is not None else time.time()
+                            )
 
                 # Script pass — separate invocation writing to nse_results/
                 if script_scan and not interrupt_event.is_set():
@@ -1625,14 +2179,25 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                         nse_process = subprocess.Popen(
                             nse_cmd,
                             stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE,
+                            text=True,
                             start_new_session=True,
                         )
+                        # Same concurrent drain as the banner pass: an NSE run
+                        # can be even chattier on stderr (per-script warnings).
+                        nse_err_thread, nse_err_lines = _start_stderr_reader(nse_process.stderr)
                         while nse_process.poll() is None and not interrupt_event.is_set():
                             interrupt_event.wait(0.1)
                         if interrupt_event.is_set() and nse_process.poll() is None:
                             nse_process.kill()
                         nse_process.wait()
+                        # Bounded for the same reason as the banner pass above.
+                        nse_err_thread.join(timeout=_STDERR_JOIN_TIMEOUT)
+                        # A killed process also exits non-zero, so only report
+                        # when no interrupt is in flight.
+                        if nse_process.returncode != 0 and not interrupt_event.is_set():
+                            _report_nmap_failure('NSE script pass', dest_port, nse_process,
+                                                 ''.join(nse_err_lines), nse_output)
 
             except FileNotFoundError:
                 with lock:
@@ -1641,12 +2206,20 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 with lock:
                     print(_COLOR_ERROR + f'Error running nmap for port {dest_port}: {e}' + _COLOR_RESET)
             finally:
+                # Flag set before the call so a raising task_done() cannot be
+                # retried by the outer handler either.
+                task_done_called = True
                 work_queue.task_done()
 
         except Exception as e:
-            with lock:
-                print(_COLOR_ERROR + f'Worker thread error: {e}' + _COLOR_RESET)
-            work_queue.task_done()
+            try:
+                with lock:
+                    print(_COLOR_ERROR + f'Worker thread error: {e}' + _COLOR_RESET)
+            finally:
+                # Only for failures before the inner try/finally was entered
+                # (queue item parsing, hostname target file creation).
+                if not task_done_called:
+                    work_queue.task_done()
 
 def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
               script_scan=False, target_scan='Internal'):
@@ -1672,21 +2245,35 @@ def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
         return
 
     try:
-        host_files = os.listdir(live_hosts_dir)
+        # Only portNN.txt files are per-port host lists; portNN_hostnames.txt is
+        # a derived input file and anything else is not ours.  The "nothing to
+        # scan" message below has to be decided from *this* list, not the raw
+        # listdir: a live_hosts/ holding only _hostnames.txt files (or unrelated
+        # files) is "no open ports found", not "already scanned".
+        port_files = [f for f in os.listdir(live_hosts_dir)
+                      if f.startswith('port') and f.endswith('.txt')
+                      and not f.endswith('_hostnames.txt')]
 
         # Filter out files that have already been scanned (both passes must be done)
         files_to_scan = []
-        for host_file in host_files:
+        for host_file in port_files:
             dest_port = _fname_port((host_file.split('.')[0])[4:])
-            banner_done = os.path.exists(f'{output_path}/nmap_results/port{_port_fname(dest_port)}.xml')
+            # An nmap killed part-way through leaves a zero-length or truncated
+            # portN.xml; require parseable content in both passes so that port is
+            # rescanned instead of being treated as scanned forever.
+            banner_done = _resume_cache_usable(
+                f'{output_path}/nmap_results/port{_port_fname(dest_port)}.xml',
+                0, f'port {dest_port} banner scan')
             scripts_exist = _get_scripts_for_port(dest_port, target_scan)
             script_done = (not script_scan or not scripts_exist or
-                           os.path.exists(f'{output_path}/nse_results/port{_port_fname(dest_port)}.xml'))
+                           _resume_cache_usable(
+                               f'{output_path}/nse_results/port{_port_fname(dest_port)}.xml',
+                               0, f'port {dest_port} NSE scan'))
             if not (banner_done and script_done):
                 files_to_scan.append(host_file)
 
         if not files_to_scan:
-            if not host_files:
+            if not port_files:
                 print(_COLOR_INFO + 'No open ports found in port discovery — skipping banner scan.' + _COLOR_RESET)
             else:
                 print(_COLOR_INFO + 'All ports have already been scanned.' + _COLOR_RESET)
@@ -1872,8 +2459,8 @@ EXTERNAL_PORT_SCRIPTS = {
     'U:500': 'ike-version',
     'U:1194': f'{_DIR}/nse/openvpn-detect.nse',
     '1194':  f'{_DIR}/nse/openvpn-detect.nse',
-    '5900':  'vnc-info,realvnc-auth-bypass',
-    '5901':  'vnc-info,realvnc-auth-bypass',
+    '5900':  'vnc-info,realvnc-auth-bypass,vnc-title',
+    '5901':  'vnc-info,realvnc-auth-bypass,vnc-title',
     '631':   f'{_DIR}/nse/cups-browsed-rce.nse',
     'U:631': f'{_DIR}/nse/cups-browsed-rce.nse',
     '8530':  f'{_DIR}/nse/wsus-detect.nse',
@@ -1926,8 +2513,8 @@ INTERNAL_PORT_SCRIPTS = {
     'U:500': 'ike-version',
     'U:1194': f'{_DIR}/nse/openvpn-detect.nse',
     '1194':  f'{_DIR}/nse/openvpn-detect.nse',
-    '5900':  'vnc-info,realvnc-auth-bypass',
-    '5901':  'vnc-info,realvnc-auth-bypass',
+    '5900':  'vnc-info,realvnc-auth-bypass,vnc-title',
+    '5901':  'vnc-info,realvnc-auth-bypass,vnc-title',
     '631':   f'{_DIR}/nse/cups-browsed-rce.nse',
     'U:631': f'{_DIR}/nse/cups-browsed-rce.nse',
     '8530':  f'{_DIR}/nse/wsus-detect.nse',
@@ -1942,9 +2529,16 @@ INTERNAL_PORT_SCRIPTS = {
     '8000':  f'{_DIR}/nse/openai-api-detect.nse',
 }
 
-# Ports that use multiple concurrent NSE scripts; omit --source-port to prevent
-# TCP 4-tuple collision when nsock opens parallel connections to the same target.
 _SMB_PORTS = frozenset({'139', '445'})
+
+# Ports whose NSE scripts run concurrently against the same service; omit
+# --source-port for these to prevent TCP 4-tuple collision when nsock opens
+# parallel connections to the same target — with a fixed source port every
+# script connects from the same (src, dst) tuple and all but one fail silently.
+# VNC has three portrule scripts (vnc-info, realvnc-auth-bypass, vnc-title),
+# each opening its own RFB connection; for vnc-title a lost connection reads as
+# "no desktop name" rather than as an error.
+_MULTI_SCRIPT_PORTS = _SMB_PORTS | frozenset({'5900', '5901'})
 
 # Windows SMB ports are always co-resident; merge their live hosts after scanning
 # so a missed SYN-ACK on one port does not suppress nmap SMB script checks.
@@ -2083,7 +2677,20 @@ def _scan_extra_sql_ports(output_path, source_port):
         try:
             root = etree.parse(fpath)
             for host in root.findall('host'):
-                ip = host.findall('address')[0].attrib['addr']
+                # findall('address')[0] raised IndexError on a <host> with no
+                # <address> child, and KeyError on one with no addr=.  Both were
+                # swallowed by the broad guard below, which abandons the rest of
+                # the file — so one unusable host element lost every other SQL
+                # named instance in it.  Require the IPv4 address and skip the
+                # host when there is none: the fallback to find('address') that
+                # used to sit here returned a MAC or an IPv6 literal on a
+                # dual-stacked host, and this ip becomes an nmap scan target
+                # below — a MAC address there is an unresolvable target, not a
+                # degraded one.
+                addr_elem = host.find("address[@addrtype='ipv4']")
+                ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
+                if not ip:
+                    continue
                 for script in host.iter('script'):
                     if script.attrib.get('id') != 'ms-sql-info':
                         continue
@@ -2155,7 +2762,15 @@ def _validate_snmp_any_community(nmap_dir, scan_type):
         except Exception:
             continue
         for host_elem in tree.findall('.//host'):
-            addr = host_elem.find('address')
+            # addrtype="ipv4" filter, as every other parser in this module does.
+            # An unfiltered find('address') returns the first <address> child
+            # whatever its type, and on a dual-stacked or ARP-resolved host that
+            # is routinely the MAC or the IPv6 literal.  This ip is not just a
+            # label — it is handed straight to nmap below as the scan target, so
+            # the "confirm it accepts any community" re-scan aimed at a MAC
+            # address, failed to resolve, and the host was quietly dropped from
+            # validated{} instead of being reported as accepting any community.
+            addr = host_elem.find("address[@addrtype='ipv4']")
             if addr is None:
                 continue
             ip = addr.attrib.get('addr', '')
@@ -2182,6 +2797,8 @@ def _validate_snmp_any_community(nmap_dir, scan_type):
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
                     if 'Valid credentials' in result.stdout:
                         validated[ip] = True
+                except (subprocess.TimeoutExpired, OSError):
+                    print(_COLOR_ERROR + f'SNMP validation probe timed out or failed for {ip}; validation skipped' + _COLOR_RESET)
                 finally:
                     Path(tmp_path).unlink(missing_ok=True)
     return validated
@@ -2353,10 +2970,14 @@ def _count_unmatched_service_ports(output_path):
         except etree.ParseError:
             continue
         for host in root.findall('host'):
+            # Skip a <host> whose IPv4 <address> has no addr= attribute.  The
+            # KeyError escaped the `except etree.ParseError` above (it wraps only
+            # the parse), aborting the honeypot heuristic for every remaining
+            # result file rather than for the one unusable element.
             addr_elem = host.find("address[@addrtype='ipv4']")
-            if addr_elem is None:
+            ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
+            if not ip:
                 continue
-            ip = addr_elem.attrib['addr']
             for port_elem in host.iter('port'):
                 state_elem = port_elem.find('state')
                 if state_elem is not None and state_elem.attrib.get('state') != 'open':
@@ -2380,9 +3001,14 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
         findings.append((sev, host, str(port), title, detail))
 
     def scripts_for_elem(elem):
-        """Return dict of {script_id: output} for a port or hostscript element."""
+        """Return dict of {script_id: output} for a port or hostscript element.
+
+        A <script> with no id= attribute (truncated/garbled NSE output) is
+        skipped rather than raising KeyError, which would abort the whole
+        findings phase over one unusable element.
+        """
         return {s.attrib['id']: s.attrib.get('output', '')
-                for s in elem.findall('script')}
+                for s in elem.findall('script') if s.attrib.get('id')}
 
     def add_sql_instance_finding(ip, port_str, ms_sql_output):
         """Emit the SQL Server discovery finding, with Azure exemption + on-prem EOL check.
@@ -2443,12 +3069,25 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
     tarpit_hosts = {}   # {ip: (open_count, total_scanned)}
     tarpit_file = f'{_disc(output_path)}/suspected_tarpits.txt'
     if os.path.exists(tarpit_file):
-        with open(tarpit_file) as fh:
-            for line in fh:
-                parts = line.strip().split(',')
-                if len(parts) == 3:
-                    ip, open_count, total = parts
-                    tarpit_hosts[ip] = (int(open_count), int(total))
+        # _report_suspected_tarpits() writes this file line by line, not
+        # atomically, so an interrupt or a full disk can leave a partial final
+        # line ('10.0.0.1,5,') that has three comma-separated parts but does
+        # not parse as two ints. A corrupt state file must degrade to "no
+        # tarpit data", never take down the findings phase — which is the last
+        # thing to run, so a crash here loses all three findings files and
+        # recurs on every later run until something rewrites the file.
+        try:
+            with open(tarpit_file) as fh:
+                for line in fh:
+                    parts = line.strip().split(',')
+                    if len(parts) == 3:
+                        ip, open_count, total = parts
+                        try:
+                            tarpit_hosts[ip] = (int(open_count), int(total))
+                        except ValueError:
+                            continue
+        except OSError:
+            tarpit_hosts = {}
 
     unmatched_counts = _count_unmatched_service_ports(output_path)  # {ip: count}
     unmatched_flagged = {ip for ip, count in unmatched_counts.items()
@@ -2484,10 +3123,17 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
         file_port_str = port_str_from_fname(fname)
 
         for host in root.findall('host'):
+            # A <host> from a truncated or garbled result file can carry no
+            # <address> child at all, or one with no addr= attribute. Neither
+            # is usable, and indexing/subscripting blindly here raised
+            # IndexError/KeyError outside the parse guard above, taking down
+            # findings generation for every other host in the run.
             addr_elem = host.find("address[@addrtype='ipv4']")
             if addr_elem is None:
-                addr_elem = host.findall('address')[0]
-            ip = addr_elem.attrib['addr']
+                addr_elem = host.find('address')
+            ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
+            if not ip:
+                continue
 
             for port_elem in host.iter('port'):
                 state_elem = port_elem.find('state')
@@ -2866,6 +3512,23 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                             'VNC No Authentication Required',
                             'The VNC server accepts connections with no password (security type "None"). '
                             'Any client can view and control the desktop without credentials.')
+
+                # ── vnc-title (desktop name via no-auth or bypassed login) ────
+                # vnc-title only produces a name once it is actually logged in —
+                # via security type None or the realvnc-auth-bypass flaw, since
+                # vnc-brute is not run — so any name is corroboration of the
+                # CRITICAL/HIGH above plus the identity of the exposed desktop.
+                if 'vnc-title' in scripts:
+                    # Success is a multi-line table (name/geometry/color_depth);
+                    # every failure path returns stdnse.format_output(false, ...),
+                    # which renders as "ERROR: ...".  Collapse the whitespace so
+                    # the detail stays on one line in findings.txt.
+                    out = ' '.join(scripts['vnc-title'].split())
+                    if out and not out.upper().startswith('ERROR'):
+                        add('LOW', ip, port_str,
+                            'VNC Desktop Name Disclosed',
+                            f'{out[:200]} — read without supplying credentials, '
+                            'so this desktop session is reachable unauthenticated.')
 
                 # ── realvnc-auth-bypass (CVE-2006-2369) ──────────────────────
                 if 'realvnc-auth-bypass' in scripts:
@@ -3585,6 +4248,31 @@ def _build_repro_cmd(title, port_str, host):
     return f'nmap {udp_flag}-p {pnum} {flags} {host}'
 
 
+def _write_artifact(path, content):
+    """Write *content* to *path*, downgrading a write failure to a warning.
+
+    Every output artifact goes through here so that one unwritable path (full
+    disk after a large -sV/NSE run, a dropped SMB/NFS mount, a read-only
+    remount, a root-owned file left by a prior sudo run) cannot unwind main()
+    and discard the *rest* of a completed scan's output.  Returns True if the
+    file was written.
+    """
+    try:
+        _atomic_write(path, content)
+        return True
+    except OSError as exc:
+        print(_COLOR_ERROR + f'ERROR: could not write {path}: {exc}' + _COLOR_RESET)
+        return False
+
+
+# Findings whose detail string differs per host, so findings.txt must print it
+# alongside each host instead of collapsing the group to one description.
+_PER_HOST_DETAIL_TITLES = frozenset({
+    'Service Exposed Externally',
+    'VNC Desktop Name Disclosed',
+})
+
+
 def _write_findings_txt(output_path, target_scan, findings):
     today = datetime.date.today()
     lines = [
@@ -3622,9 +4310,10 @@ def _write_findings_txt(output_path, target_scan, findings):
             repro = _FINDING_REPRO.get(title, {})
             lines.append(f'  [{title}]  port {port_str}')
             lines.append(f'  Affected hosts ({len(hosts)}):')
-            if title == 'Service Exposed Externally':
-                # Detail (exposure label + embedded per-host vuln check) varies per
-                # host, so render it inline rather than collapsing to one line.
+            if title in _PER_HOST_DETAIL_TITLES:
+                # Detail varies per host (exposure label + embedded vuln check;
+                # the VNC desktop name), so render it inline rather than
+                # collapsing the group to one shared description.
                 for h, d in sorted(grp['host_details']):
                     lines.append(f'{h}  —  {d}')
             else:
@@ -3656,8 +4345,7 @@ def _write_findings_txt(output_path, target_scan, findings):
             lines.append('')
 
     lines.append(f'Total findings: {len(groups)}')
-    with open(f'{output_path}/findings.txt', 'w') as fh:
-        fh.write('\n'.join(lines) + '\n')
+    _write_artifact(f'{output_path}/findings.txt', '\n'.join(lines) + '\n')
 
 
 def _write_findings_md(output_path, target_scan, findings):
@@ -3686,8 +4374,7 @@ def _write_findings_md(output_path, target_scan, findings):
                 lines.append(f'| `{host}` | {port} | {detail_safe} |')
             lines.append('')
     lines.append(f'**Total findings:** {len(findings)}')
-    with open(f'{output_path}/findings.md', 'w') as fh:
-        fh.write('\n'.join(lines) + '\n')
+    _write_artifact(f'{output_path}/findings.md', '\n'.join(lines) + '\n')
 
 
 def _write_findings_json(output_path, findings):
@@ -3696,8 +4383,7 @@ def _write_findings_json(output_path, findings):
         {'severity': sev, 'host': host, 'port': port, 'title': title, 'detail': detail}
         for sev, host, port, title, detail in findings
     ]
-    with open(f'{output_path}/findings.json', 'w') as fh:
-        json.dump(records, fh, indent=2)
+    _write_artifact(f'{output_path}/findings.json', json.dumps(records, indent=2))
 
 
 def _host_elem_to_dict(host_elem, ip_to_hostname=None):
@@ -3720,13 +4406,18 @@ def _host_elem_to_dict(host_elem, ip_to_hostname=None):
                 'service':  svc_elem.attrib.get('name', '')    if svc_elem   is not None else '',
                 'product':  svc_elem.attrib.get('product', '') if svc_elem   is not None else '',
                 'version':  svc_elem.attrib.get('version', '') if svc_elem   is not None else '',
+                # Skip any <script> lacking an id= attribute; this function
+                # feeds the whole-run results aggregation, so a KeyError here
+                # would lose spoonmap_output.xml/.json entirely.
                 'scripts':  {s.attrib['id']: s.attrib.get('output', '')
-                             for s in port_elem.findall('script')},
+                             for s in port_elem.findall('script')
+                             if s.attrib.get('id')},
             })
     hostscript_elem = host_elem.find('hostscript')
     if hostscript_elem is not None:
         result['hostscripts'] = {s.attrib['id']: s.attrib.get('output', '')
-                                 for s in hostscript_elem.findall('script')}
+                                 for s in hostscript_elem.findall('script')
+                                 if s.attrib.get('id')}
     return result
 
 
@@ -3756,6 +4447,146 @@ def _merge_host_xml(base, other):
                 seen_scripts.add(script.get('id'))
 
 
+def _parse_result_xml(path):
+    """Parse one masscan/nmap result file, returning None if it holds no results.
+
+    A zero-length or unterminated file is what a killed nmap or masscan leaves
+    behind. (An honestly-empty masscan batch is *not* zero length: masscan writes
+    nothing to -oX when it finds nothing, so _run_masscan_batch() stamps
+    _EMPTY_RESULT_XML over the empty file on its success path to keep the two
+    cases distinguishable — see the resume gates in _resume_cache_usable().)
+    Callers aggregating a whole results directory must skip both instead of
+    aborting.
+    """
+    if not path.endswith('.xml') or _safe_size(path) == 0:
+        return None
+    try:
+        return etree.parse(path)
+    except etree.ParseError as e:
+        print(_COLOR_ERROR + f'Warning: skipping unreadable result file '
+              f'{os.path.basename(path)}: {e}' + _COLOR_RESET)
+        return None
+
+
+def _aggregate_result_dir(result_dir, ip_to_hostname):
+    """Merge every result file in *result_dir* into (hosts_json, xml_hosts).
+
+    Returns the JSON-shaped host list and an {ip: merged <host> Element} map,
+    deduplicating hosts seen in more than one file.
+    """
+    hosts_json = []
+    ip_index   = {}  # {ip: index into hosts_json}
+    xml_hosts  = {}  # {ip: merged <host> Element}
+    for xml_file in sorted(os.listdir(result_dir)):
+        root = _parse_result_xml(os.path.join(result_dir, xml_file))
+        if root is None:
+            continue
+        for host in root.findall('host'):
+            hd = _host_elem_to_dict(host, ip_to_hostname)
+            ip = hd['ip']
+            if ip in xml_hosts:
+                _merge_host_xml(xml_hosts[ip], host)
+                existing = hosts_json[ip_index[ip]]
+                existing['ports'].extend(hd['ports'])
+                existing['hostscripts'].update(hd['hostscripts'])
+            else:
+                xml_hosts[ip] = host
+                ip_index[ip] = len(hosts_json)
+                hosts_json.append(hd)
+    return hosts_json, xml_hosts
+
+
+def _combine_live_hosts(disc, output_path):
+    """Write output_path/all_live_hosts.txt from disc/live_hosts/portNN.txt.
+
+    Only port*.txt files are read.  create_hostname_target_file() also writes
+    port{N}_hostnames.txt into this same directory and those hold *hostnames*,
+    not IPs, so reading the directory unfiltered put hostnames into a file
+    documented as a list of live IPs and listed every resolved host twice.
+
+    Each per-port file holds one IP per line; lines are stripped before being
+    added to the set and blanks are dropped, then the union is written back out
+    newline-terminated and in IP order.  Deduplicating the *raw* lines instead
+    meant '10.0.0.1' and '10.0.0.1\\n' were different set members, so a file whose
+    last line had no trailing newline — every internal writer newline-terminates
+    via _atomic_write(), but an operator-supplied or externally generated port
+    file need not — listed that IP twice in a file documented as a deduplicated
+    list.  Sorting also makes the output stable rather than set-iteration order.
+    """
+    all_ips = set()
+    live_dir = f'{disc}/live_hosts'
+    try:
+        host_files = sorted(os.listdir(live_dir))
+    except OSError as exc:
+        print(_COLOR_ERROR + f'ERROR: could not list {live_dir}: {exc}' + _COLOR_RESET)
+        return
+    for host_file in host_files:
+        if not (host_file.startswith('port') and host_file.endswith('.txt')
+                and not host_file.endswith('_hostnames.txt')):
+            continue
+        host_path = f'{live_dir}/{host_file}'
+        try:
+            with open(host_path) as input_file:
+                for line in input_file:
+                    line = line.strip()
+                    if line:
+                        all_ips.add(line)
+        except OSError as exc:
+            # A directory or an unreadable file in here must not cost us the
+            # IPs from every other port's file.
+            print(_COLOR_ERROR + f'Warning: could not read {host_path}: {exc}' + _COLOR_RESET)
+    _write_artifact(f'{output_path}/all_live_hosts.txt',
+                    ''.join(f'{ip}\n' for ip in sorted(all_ips, key=_ip_sort_key)))
+
+
+def _write_combined_results(output_path, hosts_json, xml_hosts):
+    """Write spoonmap_output.xml and spoonmap_output.json.
+
+    *xml_hosts* / *hosts_json* come from _aggregate_result_dir(); the XML is
+    the merged <host> elements wrapped in a minimal <nmaprun> document so the
+    result loads in tools that expect nmap output.
+
+    The two writes are guarded independently: these are the two most expensive
+    artifacts to regenerate, so an unwritable .xml must not also cost the .json.
+    """
+    xml_result = '<?xml version="1.0"?>\n<!-- SpooNMAP -->\n<nmaprun>\n'
+    for host_elem in xml_hosts.values():
+        xml_result += etree.tostring(host_elem, encoding="unicode", method="xml")
+    xml_result += '</nmaprun>'
+    wrote_xml = _write_artifact(f'{output_path}/spoonmap_output.xml', xml_result)
+    wrote_json = _write_artifact(f'{output_path}/spoonmap_output.json',
+                                json.dumps(hosts_json, indent=2))
+    if wrote_xml or wrote_json:
+        print(_COLOR_RESULT + f'\nResults written to {output_path}/spoonmap_output.xml / .json' + _COLOR_RESET)
+
+
+def _read_config_file(path):
+    """Parse *path* as a JSON object, or print a clear diagnostic and exit.
+
+    config.json is written non-atomically elsewhere, so an interrupted write can
+    leave it empty or truncated.  An unguarded json.load() then turns *both*
+    normal startup and --cleanup -- the documented recovery command -- into the
+    same raw traceback, which is the worst possible time to lose the error
+    message.  json.JSONDecodeError subclasses ValueError; OSError covers an
+    unreadable or root-owned file.
+    """
+    try:
+        with open(path) as fh:
+            config_parser = json.load(fh)
+    except ValueError as exc:
+        print(_COLOR_ERROR + f'ERROR: could not parse {path}: {exc}' + _COLOR_RESET)
+        print(f'Fix the JSON syntax in {path}, or delete it to be prompted instead.')
+        sys.exit(1)
+    except OSError as exc:
+        print(_COLOR_ERROR + f'ERROR: could not read {path}: {exc}' + _COLOR_RESET)
+        sys.exit(1)
+    if not isinstance(config_parser, dict):
+        print(_COLOR_ERROR + f'ERROR: {path} must contain a JSON object, '
+                             f'got {type(config_parser).__name__}.' + _COLOR_RESET)
+        sys.exit(1)
+    return config_parser
+
+
 def _cleanup_cmd(dir_path):
     """Handle --cleanup: remove prior scan output from output_path and exit."""
     idx = sys.argv.index('--cleanup')
@@ -3765,8 +4596,7 @@ def _cleanup_cmd(dir_path):
     else:
         cfg_file = os.path.join(dir_path, 'config.json')
         if os.path.exists(cfg_file):
-            with open(cfg_file) as fh:
-                cfg = json.load(fh)
+            cfg = _read_config_file(cfg_file)
             cleanup_path = cfg.get('output_path', '')
             if cleanup_path and not os.path.isabs(cleanup_path):
                 cleanup_path = os.path.join(dir_path, cleanup_path)
@@ -3857,10 +4687,14 @@ def _filter_udp_live_hosts(output_path):
             tree = etree.parse(nmap_xml)
             root_elem = tree.getroot()
             for host in root_elem.findall('host'):
+                # Skip a <host> whose IPv4 <address> has no addr= attribute: the
+                # KeyError escaped the ParseError guard below, and the resulting
+                # empty `confirmed` set would then rewrite live_hosts and strip
+                # every genuinely confirmed host from the nmap XML.
                 addr = host.find('address[@addrtype="ipv4"]')
-                if addr is None:
+                ip = addr.attrib.get('addr') if addr is not None else None
+                if not ip:
                     continue
-                ip = addr.attrib['addr']
                 for port_elem in host.findall('.//port'):
                     state_elem = port_elem.find('state')
                     if state_elem is not None and state_elem.attrib.get('state') == 'open':
@@ -3880,19 +4714,21 @@ def _filter_udp_live_hosts(output_path):
         confirmed_counts[port_key] = len(confirmed)
 
         # Rewrite live_hosts file
-        with open(live_file, 'w') as fh:
-            for ip in sorted(confirmed):
-                fh.write(ip + '\n')
+        _atomic_write(live_file, ''.join(ip + '\n' for ip in sorted(confirmed)))
 
         # Rewrite nmap XML — remove open|filtered host entries so spoonmap_output.* is clean.
         # Write prologue first so Metasploit's importer sees <?xml?> + <!DOCTYPE nmaprun>.
+        # Atomic: this rewrites a file nmap already finished, so a failure mid-write
+        # would otherwise leave truncated XML that breaks aggregation permanently.
         for host in root_elem.findall('host'):
+            # .attrib.get() rather than a bare subscript: this walk sits outside
+            # the parse guard above, so a KeyError here propagated out of
+            # _filter_udp_live_hosts() after live_hosts had already been rewritten,
+            # leaving the run's UDP state half-updated.
             addr = host.find('address[@addrtype="ipv4"]')
-            if addr is None or addr.attrib['addr'] not in confirmed:
+            if addr is None or addr.attrib.get('addr') not in confirmed:
                 root_elem.remove(host)
-        with open(nmap_xml, 'w') as fh:
-            fh.write(prologue)
-            tree.write(fh, encoding='unicode')
+        _atomic_write(nmap_xml, prologue + etree.tostring(root_elem, encoding='unicode'))
 
     return confirmed_counts
 
@@ -3919,14 +4755,27 @@ _CONFIG_DOCS = {
     'scan_categories': [
         ('__scan_categories_choices__',
          'All, Full, ' + ', '.join(SERVICE_CATEGORIES)),
+        ('__scan_categories_full_note__',
+         'Full scans TCP 1-65535 ONLY and runs no UDP discovery, so the U: '
+         'ports in the categories (U:161, U:500, U:623, ...) are skipped. Use '
+         'All, or dest_ports with the UDP ports appended, for UDP coverage.'),
     ],
     'dest_ports': [
         ('__dest_ports_note__',
          'Optional: overrides scan_categories with an explicit port list. '
          'Use U: prefix for UDP (e.g. U:53).'),
     ],
+    'masscan_batch_size': [
+        ('__numeric_fields_note__',
+         'masscan_batch_size, max_rate, nmap_threads and nmap_threshold accept a '
+         'JSON number or a quoted number. A non-numeric or null value falls back to '
+         'the default, and a value below the minimum of 1 is raised to 1; both print '
+         'a warning rather than failing mid-scan.'),
+    ],
     'banner_scan': [
-        ('__banner_scan_choices__', 'True, False'),
+        ('__banner_scan_choices__',
+         'true, false (JSON booleans; legacy quoted "True"/"False" '
+         'still accepted)'),
         ('__banner_scan_udp_warning__',
          'WARNING: When scanning UDP ports (U:* prefixed) with banner_scan=False, '
          'hosts will not undergo NSE confirmation. All open|filtered UDP hosts '
@@ -3934,10 +4783,14 @@ _CONFIG_DOCS = {
          'significantly. Enable banner_scan or script_scan when using UDP ports.'),
     ],
     'script_scan': [
-        ('__script_scan_choices__', 'True, False'),
+        ('__script_scan_choices__',
+         'true, false (JSON booleans; legacy quoted "True"/"False" '
+         'still accepted)'),
     ],
     'host_discovery': [
-        ('__host_discovery_choices__', 'True, False'),
+        ('__host_discovery_choices__',
+         'true, false (JSON booleans; legacy quoted "True"/"False" '
+         'still accepted)'),
         ('__host_discovery_note__',
          'When False, no host discovery sweep runs and every target is port-scanned '
          'directly. No source-port override is used in any phase. Independent of this '
@@ -3948,10 +4801,14 @@ _CONFIG_DOCS = {
          '(~60K concurrent entries max).'),
     ],
     'resume': [
-        ('__resume_choices__', 'True, False'),
+        ('__resume_choices__',
+         'true, false (JSON booleans; legacy quoted "True"/"False" '
+         'still accepted)'),
     ],
     'target_scan': [
-        ('__target_scan_choices__', 'External, Internal'),
+        ('__target_scan_choices__',
+         'External, Internal (case-insensitive; any other value stops the run '
+         'rather than scanning with the Internal-only checks silently skipped)'),
     ],
     'max_rate': [
         ('__max_rate_external_recommendation__',
@@ -3989,9 +4846,16 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
     The result round-trips through main()'s config loader: reloading it
     reproduces the same scan without prompting.  A custom port list is stored
     under ``dest_ports``; an All/Full/category selection under
-    ``scan_categories``.  ``resume`` is written as ``"False"`` so a plain
-    re-run still surfaces the delete/append prompt — resuming is opt-in via the
+    ``scan_categories``.  ``resume`` is written as ``false`` so a plain re-run
+    still surfaces the delete/append prompt — resuming is opt-in via the
     ``--resume`` flag.
+
+    Booleans are written as JSON booleans, matching config.json.sample.  They
+    used to be the quoted ``"True"``/``"False"`` strings the sample once used,
+    which meant a generated config disagreed with the documented spelling and
+    with the ``true, false`` its own ``__*_choices__`` notes advertised.  Both
+    spellings still load (see _config_bool), so this is about the two files
+    telling an operator the same thing.
 
     Keys are emitted in ``_CONFIG_FIELD_ORDER`` with their ``_CONFIG_DOCS``
     entries interleaved, so the written file documents its editable fields the
@@ -4000,10 +4864,10 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
     ``scan_categories`` one.
     """
     values = {
-        'banner_scan': 'True' if banner_scan else 'False',
-        'script_scan': 'True' if script_scan else 'False',
-        'host_discovery': 'True' if host_discovery else 'False',
-        'resume': 'False',
+        'banner_scan': bool(banner_scan),
+        'script_scan': bool(script_scan),
+        'host_discovery': bool(host_discovery),
+        'resume': False,
         'target_scan': target_scan,
         'max_rate': str(max_rate),
         'nmap_threads': int(nmap_threads),
@@ -4156,6 +5020,205 @@ def _handle_previous_results(output_path, resume, prompt_fn=input):
     return False, 'a'
 
 
+# config.json keys that have no sane default: without them there is nothing to
+# scan, nowhere to write, and no way to guess what the operator meant.
+_CONFIG_REQUIRED_KEYS = ('banner_scan', 'target_scan', 'max_rate',
+                         'target_file', 'output_path')
+
+_CONFIG_TARGET_SCANS = ('Internal', 'External')
+
+_CONFIG_TRUE_STRINGS = ('true', 'yes', 'on', '1')
+_CONFIG_FALSE_STRINGS = ('false', 'no', 'off', '0', '')
+
+
+def _config_bool(key, value, default):
+    """Coerce a config.json boolean-ish *value*, accepting both spellings.
+
+    config.json.sample used to quote its booleans ("resume": "False") while
+    leaving integers bare, which invited JSON-native true/false.  The old code
+    compared == 'True', so a real JSON `true` evaluated to False: setting
+    "script_scan": true silently got you no script scan and no warning.  The
+    sample and the generated config now both use JSON booleans, but every
+    hand-edited config.json out there still carries the quoted strings, so both
+    forms are accepted here indefinitely.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in _CONFIG_TRUE_STRINGS:
+        return True
+    if text in _CONFIG_FALSE_STRINGS:
+        return False
+    print(_COLOR_ERROR + f'Warning: config.json: {key} = {value!r} is not a '
+                         f'boolean; using {default}.' + _COLOR_RESET)
+    return default
+
+
+def _config_int(key, value, default, minimum=1):
+    """Coerce a config.json integer *value*, warning instead of crashing.
+
+    A bare int() raised ValueError on a non-numeric string and TypeError on a
+    JSON null, aborting the run before any scanning happened.
+
+    *minimum* mirrors _prompt_int()'s contract, which the interactive path has
+    always enforced while the config path enforced nothing.  A too-small value
+    is clamped rather than rejected, because the failures it produced all
+    surfaced *after* discovery had already run: nmap_threads=0 starts zero
+    workers and hangs forever in work_queue.join(), masscan_batch_size=0 raises
+    "range() arg 3 must not be zero" out of main() mid-scan, and max_rate=0
+    silently runs masscan at --max-rate 0.
+
+    *minimum* is applied to *default* as well.  Clamping only the parsed value
+    meant a caller could hand in a default below its own stated minimum and have
+    it returned intact on any non-numeric input — the exact failure this function
+    exists to prevent, reachable through the fallback path instead of the parse
+    path.  All four current call sites pass defaults >= 1, so this is a latent
+    trap for the next one rather than a live bug.
+    """
+    minimum_default = max(default, minimum)
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        print(_COLOR_ERROR + f'Warning: config.json: {key} = {value!r} is not a '
+                             f'number; using {minimum_default}.' + _COLOR_RESET)
+        return minimum_default
+    if parsed < minimum:
+        print(_COLOR_ERROR + f'Warning: config.json: {key} = {value!r} is below the '
+                             f'minimum of {minimum}; using {minimum}.' + _COLOR_RESET)
+        return minimum
+    return parsed
+
+
+def _config_target_scan(value):
+    """Normalise config.json's *target_scan* to exactly 'Internal' or 'External'.
+
+    Roughly 25 sites compare target_scan against those two literals, so an
+    unrecognised spelling is not an inert typo: discovery falls into the
+    Internal-ish ``else`` branch, the scan runs and looks completely normal, but
+    every ``target_scan == 'Internal'`` gated check is skipped — SMB security
+    mode, MS17-010, LDAP signing and channel binding, ms-sql-info, the extra SQL
+    port sweep. The operator gets a clean report with ~20 internal checks
+    silently absent, from one lowercase letter. That is the worst failure mode
+    in this tool's threat model, so an unusable value exits rather than warns.
+
+    Case and surrounding whitespace are normalised rather than rejected:
+    "internal" is unambiguous, and accepting it removes the trap outright
+    instead of merely reporting it once the operator hits it.
+    """
+    text = str(value).strip().lower()
+    for valid in _CONFIG_TARGET_SCANS:
+        if text == valid.lower():
+            return valid
+    print(_COLOR_ERROR + f'ERROR: config.json: target_scan = {value!r} is not '
+                         "'Internal' or 'External'." + _COLOR_RESET)
+    print('See config.json.sample for the expected keys, or delete '
+          'config.json to be prompted instead.')
+    sys.exit(1)
+
+
+def _load_config(config_parser, dir_path, resume=False):
+    """Derive every scan setting from an already-parsed config.json dict.
+
+    *config_parser* is the JSON dict, *dir_path* the script directory that the
+    three relative path settings resolve against, and *resume* whatever the
+    --resume CLI flag already produced: the config's own 'resume' key is ORed
+    into it so the flag can never be turned back off by the file.  Returns the
+    derived settings as a dict; the caller assigns 'output_path' to the module
+    global of the same name.
+
+    Missing required keys are reported all at once and then exit: reporting them
+    one crash at a time made fixing a hand-written config a guessing game.
+    """
+    missing = [k for k in _CONFIG_REQUIRED_KEYS if k not in config_parser]
+    if missing:
+        print(_COLOR_ERROR + 'ERROR: config.json is missing required '
+                             f'{"key" if len(missing) == 1 else "keys"}: '
+                             + ', '.join(missing) + _COLOR_RESET)
+        print('See config.json.sample for the expected keys, or delete '
+              'config.json to be prompted instead.')
+        sys.exit(1)
+
+    scan_categories = config_parser.get('scan_categories', 'All')
+    if scan_categories == 'All' or scan_categories == ['All']:
+        scan_type = 'All'
+        all_ports = [p for cat in SERVICE_CATEGORIES.values() for p in cat]
+    elif scan_categories in ('Full', ['Full']):
+        scan_type = 'Full'
+        all_ports = ['1-65535']
+    elif isinstance(scan_categories, list):
+        valid = [c for c in scan_categories if c in SERVICE_CATEGORIES]
+        scan_type = ', '.join(valid)
+        all_ports = [p for name in valid for p in SERVICE_CATEGORIES[name]]
+    else:
+        scan_type = ''
+        all_ports = []
+    # UDP ports sorted to end of batch
+    dest_ports = [p for p in all_ports if not p.startswith('U:')] + \
+                 [p for p in all_ports if p.startswith('U:')]
+    # Allow dest_ports override for fully custom use
+    if config_parser.get('dest_ports'):
+        dest_ports = config_parser['dest_ports']
+        scan_type = 'Custom'
+    banner_scan = _config_bool('banner_scan', config_parser['banner_scan'], False)
+    target_scan = _config_target_scan(config_parser['target_scan'])
+    source_port = ''
+    # Coerced to str here because _discover_external_masscan() passes max_rate
+    # straight to Popen(), which rejects an int with a bare TypeError.  It goes
+    # through _config_int() first because it was the one required numeric that
+    # only got str(): a JSON null became the string 'None' and blew up as a raw
+    # ValueError traceback out of int(max_rate) in _discover_internal_masscan(),
+    # and 0 is truthy as '0' so it skipped the re-prompt and scanned at
+    # --max-rate 0.  The fallbacks mirror the interactive prompt's defaults.
+    max_rate = str(_config_int('max_rate', config_parser['max_rate'],
+                               20000 if target_scan == 'External' else 2000))
+    target_file = config_parser['target_file']
+    output_path = config_parser['output_path']
+    # Absent or empty means "no exclusions" — normalize to None so it is
+    # neither re-prompted nor passed as an empty --excludefile.
+    exclusions_file = config_parser.get('exclusions_file') or None
+    nmap_threads = _config_int('nmap_threads', config_parser.get('nmap_threads', 5), 5)
+    masscan_batch_size = _config_int(
+        'masscan_batch_size', config_parser.get('masscan_batch_size', 5), 5)
+    nmap_threshold = _config_int(
+        'nmap_threshold', config_parser.get('nmap_threshold', 5_000_000), 5_000_000)
+    script_scan = _config_bool('script_scan', config_parser.get('script_scan'), False)
+    host_discovery = _config_bool(
+        'host_discovery', config_parser.get('host_discovery'), True)
+    # ORed, never overwritten: --resume can't be turned back off by the file.
+    resume = resume or _config_bool('resume', config_parser.get('resume'), False)
+    config_generated = bool(config_parser.get(_CONFIG_GENERATED_KEY))
+
+    # Resolve relative paths in config relative to the script directory
+    if target_file and not os.path.isabs(target_file):
+        target_file = os.path.join(dir_path, target_file)
+    if output_path and not os.path.isabs(output_path):
+        output_path = os.path.join(dir_path, output_path)
+    if exclusions_file and not os.path.isabs(exclusions_file):
+        exclusions_file = os.path.join(dir_path, exclusions_file)
+
+    return {
+        'scan_categories': scan_categories,
+        'scan_type': scan_type,
+        'dest_ports': dest_ports,
+        'banner_scan': banner_scan,
+        'target_scan': target_scan,
+        'source_port': source_port,
+        'max_rate': max_rate,
+        'target_file': target_file,
+        'output_path': output_path,
+        'exclusions_file': exclusions_file,
+        'nmap_threads': nmap_threads,
+        'masscan_batch_size': masscan_batch_size,
+        'nmap_threshold': nmap_threshold,
+        'script_scan': script_scan,
+        'host_discovery': host_discovery,
+        'resume': resume,
+        'config_generated': config_generated,
+    }
+
+
 # The Main Guts
 def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
     # already-independently-tested functions behind input()-driven prompts,
@@ -4198,57 +5261,26 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         config_generated = False
         if os.path.exists(f'{dir_path}/config.json'):
             config_loaded = True
-            with open(f'{dir_path}/config.json') as config:
-                config_parser = json.load(config)
+            config_parser = _read_config_file(f'{dir_path}/config.json')
 
-            scan_categories = config_parser.get('scan_categories', 'All')
-            if scan_categories == 'All' or scan_categories == ['All']:
-                scan_type = 'All'
-                all_ports = [p for cat in SERVICE_CATEGORIES.values() for p in cat]
-            elif scan_categories in ('Full', ['Full']):
-                scan_type = 'Full'
-                all_ports = ['1-65535']
-            elif isinstance(scan_categories, list):
-                valid = [c for c in scan_categories if c in SERVICE_CATEGORIES]
-                scan_type = ', '.join(valid)
-                all_ports = [p for name in valid for p in SERVICE_CATEGORIES[name]]
-            else:
-                all_ports = []
-            # UDP ports sorted to end of batch
-            dest_ports = [p for p in all_ports if not p.startswith('U:')] + \
-                         [p for p in all_ports if p.startswith('U:')]
-            # Allow dest_ports override for fully custom use
-            if config_parser.get('dest_ports'):
-                dest_ports = config_parser['dest_ports']
-                scan_type = 'Custom'
-            banner_scan = config_parser['banner_scan']
-            if banner_scan == 'True':
-                banner_scan = True
-            else:
-                banner_scan = False
-            target_scan = config_parser['target_scan']
-            source_port = ''
-            max_rate = config_parser['max_rate']
-            target_file = config_parser['target_file']
-            output_path = config_parser['output_path']
-            # Absent or empty means "no exclusions" — normalize to None so it is
-            # neither re-prompted nor passed as an empty --excludefile.
-            exclusions_file = config_parser.get('exclusions_file') or None
-            nmap_threads = int(config_parser.get('nmap_threads', 5))
-            masscan_batch_size = int(config_parser.get('masscan_batch_size', 5))
-            nmap_threshold = int(config_parser.get('nmap_threshold', 5_000_000))
-            script_scan = config_parser.get('script_scan', 'False') == 'True'
-            host_discovery = config_parser.get('host_discovery', 'True') == 'True'
-            resume = resume or config_parser.get('resume', 'False').strip().lower() == 'true'
-            config_generated = bool(config_parser.get(_CONFIG_GENERATED_KEY))
-
-            # Resolve relative paths in config relative to the script directory
-            if target_file and not os.path.isabs(target_file):
-                target_file = os.path.join(dir_path, target_file)
-            if output_path and not os.path.isabs(output_path):
-                output_path = os.path.join(dir_path, output_path)
-            if exclusions_file and not os.path.isabs(exclusions_file):
-                exclusions_file = os.path.join(dir_path, exclusions_file)
+            cfg = _load_config(config_parser, dir_path, resume)
+            scan_categories    = cfg['scan_categories']
+            scan_type          = cfg['scan_type']
+            dest_ports         = cfg['dest_ports']
+            banner_scan        = cfg['banner_scan']
+            target_scan        = cfg['target_scan']
+            source_port        = cfg['source_port']
+            max_rate           = cfg['max_rate']
+            target_file        = cfg['target_file']
+            output_path        = cfg['output_path']
+            exclusions_file    = cfg['exclusions_file']
+            nmap_threads       = cfg['nmap_threads']
+            masscan_batch_size = cfg['masscan_batch_size']
+            nmap_threshold     = cfg['nmap_threshold']
+            script_scan        = cfg['script_scan']
+            host_discovery     = cfg['host_discovery']
+            resume             = cfg['resume']
+            config_generated   = cfg['config_generated']
 
         # A config this tool wrote is a saved answer sheet, not a hand-authored
         # one, so ask about pre-existing output *before* the prompts: [d]elete and
@@ -4307,9 +5339,15 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                     ports = SERVICE_CATEGORIES[name]
                     print(f'\t({i}) {name}  [{", ".join(ports)}]')
                 full_n = len(category_names) + 1
-                print(f'\t({full_n}) Full Port Scan  [1-65535]')
+                print(f'\t({full_n}) Full Port Scan  [1-65535, TCP only — no UDP]')
                 print(f'\t(a) All Categories  [{", ".join(category_names)}]')
                 print(f'\t(c) Custom Port Scan  [enter your own comma-separated ports]')
+                print(_COLOR_INFO
+                      + '\nNote: Full Port Scan covers TCP 1-65535 only.  It runs NO UDP '
+                        'discovery, so the U: ports in the categories above (SNMP U:161, '
+                        'IKE U:500, IPMI U:623, ...) are not scanned.  Use (a) All, or (c) '
+                        'Custom with the UDP ports appended, if you need UDP coverage.'
+                      + _COLOR_RESET)
 
                 selection = input(
                     f'\nWhich categories would you like to scan (e.g. 1,3 / all / full / c — {selection_hint})? '
@@ -4652,48 +5690,19 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
 
         # Combine all live hosts into one file
         disc = _disc(output_path)
-        all_ips = set()
         if os.path.exists(f'{disc}/live_hosts'):
-            host_files = os.listdir(f'{disc}/live_hosts')
-            for host_file in host_files:
-                with open(f'{disc}/live_hosts/{host_file}') as input_file:
-                    for line in input_file:
-                        all_ips.add(line)
-            with open(f'{output_path}/all_live_hosts.txt', 'w') as output_file:
-                for ip in all_ips:
-                    output_file.write(ip)
-
-            # Combine all XML results into one file
+            # Combine all XML results into one file.  These two are the
+            # expensive artifacts, so they are written *before* the trivially
+            # regenerable all_live_hosts.txt -- the old order let a failure on
+            # the cheapest artifact abort before either of them was reached.
             if banner_scan or script_scan:
                 result_dir = f'{output_path}/nmap_results/'
             else:
                 result_dir = f'{disc}/masscan_results/'
-            hosts_json = []
-            ip_index   = {}  # {ip: index into hosts_json}
-            xml_hosts  = {}  # {ip: merged <host> Element}
-            for xml_file in sorted(os.listdir(result_dir)):
-                root = etree.parse(result_dir + xml_file)
-                for host in root.findall('host'):
-                    hd = _host_elem_to_dict(host, ip_to_hostname)
-                    ip = hd['ip']
-                    if ip in xml_hosts:
-                        _merge_host_xml(xml_hosts[ip], host)
-                        existing = hosts_json[ip_index[ip]]
-                        existing['ports'].extend(hd['ports'])
-                        existing['hostscripts'].update(hd['hostscripts'])
-                    else:
-                        xml_hosts[ip] = host
-                        ip_index[ip] = len(hosts_json)
-                        hosts_json.append(hd)
-            xml_result = '<?xml version="1.0"?>\n<!-- SpooNMAP -->\n<nmaprun>\n'
-            for host_elem in xml_hosts.values():
-                xml_result += etree.tostring(host_elem, encoding="unicode", method="xml")
-            xml_result += '</nmaprun>'
-            with open(f'{output_path}/spoonmap_output.xml', 'w+') as spoonmap_output:
-                spoonmap_output.write(xml_result)
-            with open(f'{output_path}/spoonmap_output.json', 'w') as f:
-                json.dump(hosts_json, f, indent=2)
-            print(_COLOR_RESULT + f'\nResults written to {output_path}/spoonmap_output.xml / .json' + _COLOR_RESET)
+            hosts_json, xml_hosts = _aggregate_result_dir(result_dir, ip_to_hostname)
+            _write_combined_results(output_path, hosts_json, xml_hosts)
+
+            _combine_live_hosts(disc, output_path)
 
             if script_scan:
                 generate_findings(output_path, target_scan, snmp_any_validated=snmp_any_validated)

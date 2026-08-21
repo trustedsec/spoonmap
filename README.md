@@ -39,10 +39,18 @@ Service Categories (comma-separated numbers, default: All)
 	(9) Specialized  [1090, 3300, 4786, 6970, 2375, 4243, 9100, 8530, 8531]
 	(10) Containers & Debuggers  [2377, 10250, 8001, 9229, 2345, 5005, 61616, 8009, 6000]
 	(11) Local LLM  [11434, 1234, 7860, 5000, 5001, 1337, 3000, 8000, 8080]
-	(12) Full Port Scan  [1-65535]
+	(12) Full Port Scan  [1-65535, TCP only — no UDP]
 	(c) Custom Port Scan  [enter your own comma-separated ports]
 
 (The Full Port Scan number increments automatically with the number of categories.)
+
+**Full Port Scan is TCP only.** It sweeps TCP 1-65535 and runs no UDP discovery at
+all, so every `U:` port listed in the categories above — SNMP (U:161), IKE (U:500),
+IPMI (U:623), IPP (U:631), OpenVPN (U:1194), NetBIOS (U:137), SQL Browser (U:1434) —
+is skipped, along with the NSE scripts and findings that depend on them. It is
+*wider* than All on TCP and *narrower* on UDP. For both, run All and Full as two
+passes, or use the Custom option with the UDP ports appended
+(e.g. `1-65535,U:161,U:500,U:623`).
 
 Which categories would you like to scan (e.g. 1,3 — default: All)?
 
@@ -87,7 +95,7 @@ You can also create a `config.json` file (based on `config.json.sample`) to skip
 ```
 
 To scan all categories, set `"scan_categories": "All"`.
-To scan all 65535 ports, set `"scan_categories": "Full"`.
+To scan all 65535 TCP ports, set `"scan_categories": "Full"` — note this is **TCP only** and performs no UDP discovery.
 For a fully custom port list, omit `scan_categories` and use `"dest_ports": ["80","443","U:53"]` instead.
 UDP ports are specified with a `U:` prefix (e.g. `"U:53"`).
 
@@ -139,7 +147,7 @@ git update-index --no-skip-worktree ranges.txt
 
 | Key | Values | Notes |
 |-----|--------|-------|
-| `scan_categories` | `"All"`, `"Full"`, or array of category names | `"Full"` scans all 65535 ports; e.g. `["Web","Database"]`; omit to use `dest_ports` |
+| `scan_categories` | `"All"`, `"Full"`, or array of category names | `"Full"` scans all 65535 **TCP** ports and no UDP; e.g. `["Web","Database"]`; omit to use `dest_ports` |
 | `dest_ports` | Array of port strings | Overrides `scan_categories`; use `U:` prefix for UDP |
 | `banner_scan` | `"True"` / `"False"` | Runs nmap -sV against discovered hosts |
 | `script_scan` | `"True"` / `"False"` | Runs NSE security scripts (implies `banner_scan`) |
@@ -311,9 +319,9 @@ Inter-scan wait: 29s (target ~256 hosts)
 
 When `script_scan` is enabled, nmap runs targeted NSE scripts against relevant ports. Scripts are chosen based on scan type (External vs Internal):
 
-**External scans** run: `ftp-anon`, `ssh-auth-methods`, `ssh2-enum-algos`, `*-ntlm-info`, `ssl-cert`, `ms-sql-ntlm-info`, `rdp-ntlm-info`, `docker-version`, `snmp-brute`, `snmp-sysdescr`, `ajp-headers`, `x11-access`, `dameware-detect` (custom, 6129), `cucm-detect` (custom, 6970), `ipmi-version`, `ipmi-cipher-zero`, `ipmi-hashdump` (custom, U:623), `ike-version` (U:500), `openvpn-detect` (custom, U:1194/1194), `vnc-info`, `realvnc-auth-bypass` (5900, 5901), `ollama-detect` (custom, 11434), `openai-api-detect` (custom, 1234/1337/3000/8000), `gradio-detect` (custom, 7860), `koboldcpp-detect` (custom, 5001)
+**External scans** run: `ftp-anon`, `ssh-auth-methods`, `ssh2-enum-algos`, `*-ntlm-info`, `ssl-cert`, `ms-sql-ntlm-info`, `rdp-ntlm-info`, `docker-version`, `snmp-brute`, `snmp-sysdescr`, `ajp-headers`, `x11-access`, `dameware-detect` (custom, 6129), `cucm-detect` (custom, 6970), `ipmi-version`, `ipmi-cipher-zero`, `ipmi-hashdump` (custom, U:623), `ike-version` (U:500), `openvpn-detect` (custom, U:1194/1194), `vnc-info`, `realvnc-auth-bypass`, `vnc-title` (5900, 5901), `ollama-detect` (custom, 11434), `openai-api-detect` (custom, 1234/1337/3000/8000), `gradio-detect` (custom, 7860), `koboldcpp-detect` (custom, 5001)
 
-**Internal scans** run: `ftp-anon`, `rpcinfo`, `nfs-showmount`, `nfs-ls`, `smb-security-mode`, `smb2-security-mode`, `smb-vuln-ms17-010`, `smb-vuln-ms08-067`, `smb-double-pulsar-backdoor`, `smb-vuln-cve-2017-7494`, `rmi-dumpregistry`, `ms-sql-info`, `docker-version`, `snmp-brute`, `snmp-sysdescr`, `ajp-headers`, `x11-access`, `jdwp-info` (5005), `http-title` (8001), `banner` (61616), `dameware-detect` (custom, 6129), `cucm-detect` (custom, 6970), `nodejs-inspector` (custom, 9229), `kubelet-anon-check` (custom, 10250), `delve-debugger` (custom, 2345), `ipmi-version`, `ipmi-cipher-zero`, `ipmi-hashdump` (custom, U:623), `ike-version` (U:500), `openvpn-detect` (custom, U:1194/1194), `vnc-info`, `realvnc-auth-bypass` (5900, 5901), `ollama-detect` (custom, 11434), `openai-api-detect` (custom, 1234/1337/3000/8000), `gradio-detect` (custom, 7860), `koboldcpp-detect` (custom, 5001)
+**Internal scans** run: `ftp-anon`, `rpcinfo`, `nfs-showmount`, `nfs-ls`, `smb-security-mode`, `smb2-security-mode`, `smb-vuln-ms17-010`, `smb-vuln-ms08-067`, `smb-double-pulsar-backdoor`, `smb-vuln-cve-2017-7494`, `rmi-dumpregistry`, `ms-sql-info`, `docker-version`, `snmp-brute`, `snmp-sysdescr`, `ajp-headers`, `x11-access`, `jdwp-info` (5005), `http-title` (8001), `banner` (61616), `dameware-detect` (custom, 6129), `cucm-detect` (custom, 6970), `nodejs-inspector` (custom, 9229), `kubelet-anon-check` (custom, 10250), `delve-debugger` (custom, 2345), `ipmi-version`, `ipmi-cipher-zero`, `ipmi-hashdump` (custom, U:623), `ike-version` (U:500), `openvpn-detect` (custom, U:1194/1194), `vnc-info`, `realvnc-auth-bypass`, `vnc-title` (5900, 5901), `ollama-detect` (custom, 11434), `openai-api-detect` (custom, 1234/1337/3000/8000), `gradio-detect` (custom, 7860), `koboldcpp-detect` (custom, 5001)
 
 Port 9100 (JetDirect raw printing protocol) is included in the Specialized category. Hosts with port 9100 open are identified as printers; SNMP default community string and anonymous FTP findings are suppressed for these hosts to reduce noise.
 
@@ -374,6 +382,7 @@ After scanning, `generate_findings()` parses all nmap XML results and produces s
 | LOW | OpenVPN Service Detected (U:1194/1194; identification only — VPN exposure is expected, no "exposed externally" finding is raised) |
 | LOW | SQL Server instance discovered |
 | LOW | WSUS Service Detected (8530/8531; identification only — review CVE-2025-59287 patch status) |
+| LOW | VNC Desktop Name Disclosed (5900/5901, retrieved by `vnc-title` without credentials) |
 
 On Internal scans, if `ms-sql-info` discovers SQL Server named instances on non-standard ports, nmap is automatically re-run against those ports.
 
@@ -404,7 +413,7 @@ On External scans, each externally-exposed sensitive service is additionally vul
 | U:500 | IKE/IPsec VPN | Aggressive Mode + PSK auto-detected (HIGH); ike-version identifies vendor/mode |
 | U:1194, 1194 | OpenVPN | Custom NSE (`openvpn-detect`) completes the P_CONTROL_HARD_RESET handshake to confirm the protocol over UDP or TCP; identification only (LOW) — no version is disclosed pre-auth, and no "exposed externally" finding is raised since VPN reachability is expected. Servers using `tls-auth`/`tls-crypt` silently drop the probe and read as no match |
 | U:623 | IPMI / BMC | Cipher Zero auth bypass auto-detected (CRITICAL); RAKP hash disclosure for offline crack (HIGH, CVE-2013-4786) |
-| 5900, 5901 | VNC | No-auth auto-detected (CRITICAL); realvnc-auth-bypass checked (HIGH) |
+| 5900, 5901 | VNC | No-auth auto-detected (CRITICAL); realvnc-auth-bypass checked (HIGH); desktop name retrieved via vnc-title (LOW) |
 | 11434 | Ollama LLM Runtime | Custom NSE (`ollama-detect`) probes `/api/tags` and `/api/version`; unauthenticated access exposes model inventory and full inference API |
 | 1234, 1337 | LM Studio / OpenAI-compat API | Custom NSE (`openai-api-detect`) probes `/v1/models`; unauthenticated access exposes models and inference |
 | 3000, 8000 | OpenAI-compatible LLM API | Custom NSE (`openai-api-detect`) probes `/v1/models` with three-string fingerprint to avoid false positives on generic web apps |
@@ -433,4 +442,4 @@ On External scans, each externally-exposed sensitive service is additionally vul
 - **ActiveMQ (61616)** — [CVE-2023-46604 PoC](https://github.com/X1r0z/ActiveMQ-RCE) · [Rapid7 module](https://www.rapid7.com/db/modules/exploit/multi/misc/apache_activemq_rce_cve_2023_46604)
 - **IKE/IPsec (U:500)** — [ike-version NSE](https://nmap.org/nsedoc/scripts/ike-version.html) · ike-scan --aggressive for hash capture · hashcat mode 5300 (IKEv1) / 5400 (IKEv2)
 - **IPMI (U:623)** — [US-CERT TA13-207A](https://www.cisa.gov/news-events/alerts/2013/07/26/risks-using-intelligent-platform-management-interface-ipmi) · [hashcat mode 7300](https://hashcat.net/wiki/doku.php?id=hashcat)
-- **VNC (5900/5901)** — [CVE-2006-2369](https://nvd.nist.gov/vuln/detail/CVE-2006-2369) · [vnc-info NSE](https://nmap.org/nsedoc/scripts/vnc-info.html)
+- **VNC (5900/5901)** — [CVE-2006-2369](https://nvd.nist.gov/vuln/detail/CVE-2006-2369) · [vnc-info NSE](https://nmap.org/nsedoc/scripts/vnc-info.html) · [vnc-title NSE](https://nmap.org/nsedoc/scripts/vnc-title.html)

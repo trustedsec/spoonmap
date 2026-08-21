@@ -6,7 +6,18 @@ Each test:
 3. Asserts the script output (positive) or absence of output (negative)
 
 Requires nmap to be installed and tests to run as root (for nmap raw socket access).
-Skip the module if nmap is not found or if the required port is already in use.
+The module is skipped when nmap is not found.
+
+Port availability is checked per test, immediately before it runs, by
+``pytest_runtest_setup`` in ``tests/conftest.py``: a class names the port it needs
+with a ``required_tcp_port`` / ``required_udp_port`` attribute and is skipped when
+that port is occupied.  The checks used to be ``@pytest.mark.skipif`` decorators
+evaluated at import time, so anything that claimed a port between collection and
+the test turned an environment conflict into a failure.
+
+None of that touches what the tests assert: a script assertion is skipped only
+when the stub server could not be created at all, in which case the script was
+never exercised.  A broken NSE script still fails.
 
 Run exclusively:
     uv run pytest tests/test_nse_integration.py -v
@@ -31,17 +42,6 @@ pytestmark = pytest.mark.skipif(
     shutil.which('nmap') is None,
     reason='nmap not installed',
 )
-
-
-def _port_is_free(port: int) -> bool:
-    """Return True if nobody is listening on 127.0.0.1:port."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind(('127.0.0.1', port))
-            return True
-        except OSError:
-            return False
 
 
 class _ReuseAddrServer(socketserver.TCPServer):
@@ -73,7 +73,14 @@ class _StubServer:
                 except Exception:
                     pass
 
-        self._server = _ReuseAddrServer(('127.0.0.1', self._port), _Handler)
+        try:
+            self._server = _ReuseAddrServer(('127.0.0.1', self._port), _Handler)
+        except OSError as exc:
+            # conftest's pytest_runtest_setup checked this port moments ago, so
+            # something claimed it in between. Without a stub there is nothing
+            # for the NSE script to answer, and a negative assertion
+            # ("...not in output") would pass for the wrong reason. Skip.
+            pytest.skip(f'could not bind tcp port {self._port}: {exc}')
         self._thread = threading.Thread(
             target=self._server.serve_forever, daemon=True
         )
@@ -100,17 +107,6 @@ def _run_nmap(port: int, script_path: str) -> str:
     return result.stdout + result.stderr
 
 
-def _udp_port_is_free(port: int) -> bool:
-    """Return True if nobody is bound to 127.0.0.1:port/udp."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind(('127.0.0.1', port))
-            return True
-        except OSError:
-            return False
-
-
 class _UdpStubServer:
     """Context manager: UDP server that sends a fixed response to any datagram received.
 
@@ -127,7 +123,12 @@ class _UdpStubServer:
     def __enter__(self) -> '_UdpStubServer':
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(('127.0.0.1', self._port))
+        try:
+            self._sock.bind(('127.0.0.1', self._port))
+        except OSError as exc:
+            # Same reasoning as _StubServer: no stub, nothing to assert against.
+            self._sock.close()
+            pytest.skip(f'could not bind udp port {self._port}: {exc}')
         self._sock.settimeout(0.2)
 
         def _serve():
@@ -184,9 +185,9 @@ _NODEJS_INVALID = (
 )
 
 
-@pytest.mark.skipif(not _port_is_free(_NODEJS_PORT),
-                    reason=f'port {_NODEJS_PORT} already in use')
 class TestNodejsInspectorNse:
+    required_tcp_port = _NODEJS_PORT
+
 
     def test_detects_nodejs_inspector(self):
         """Stub returns valid /json/version → script reports version string."""
@@ -215,9 +216,9 @@ _DELVE_VALID = (
 _DELVE_INVALID = b'HELLO stranger\n'
 
 
-@pytest.mark.skipif(not _port_is_free(_DELVE_PORT),
-                    reason=f'port {_DELVE_PORT} already in use')
 class TestDelveDebuggerNse:
+    required_tcp_port = _DELVE_PORT
+
 
     def test_detects_delve_debugger(self):
         """Stub returns DAP response → script reports Delve responding."""
@@ -250,9 +251,9 @@ _KUBELET_UNAUTH = (
 )
 
 
-@pytest.mark.skipif(not _port_is_free(_KUBELET_PORT),
-                    reason=f'port {_KUBELET_PORT} already in use')
 class TestKubeletAnonCheckNse:
+    required_tcp_port = _KUBELET_PORT
+
 
     def test_detects_anonymous_access(self):
         """Stub returns HTTP 200 → script reports anonymous access enabled.
@@ -341,10 +342,10 @@ class TestCupsBrowsedRceNseLive:
         assert 'LIKELY VULNERABLE' not in output
 
 
-@pytest.mark.skipif(not _port_is_free(_CUPS_PORT),
-                    reason=f'port {_CUPS_PORT} already in use — stub tests require a free port')
 class TestCupsBrowsedRceNseStub:
     """Use a TCP stub server to exercise specific version strings and edge cases."""
+
+    required_tcp_port = _CUPS_PORT
 
     def test_flags_vulnerable_version(self):
         """Stub returns CUPS 2.0.1 banner → script reports LIKELY VULNERABLE."""
@@ -385,9 +386,9 @@ _OLLAMA_INVALID = (
 )
 
 
-@pytest.mark.skipif(not _port_is_free(_OLLAMA_PORT),
-                    reason=f'port {_OLLAMA_PORT} already in use — stub tests require a free port')
 class TestOllamaDetectNse:
+    required_tcp_port = _OLLAMA_PORT
+
     def test_detects_ollama_api(self):
         """Stub returns valid /api/tags body → script reports unauthenticated access."""
         with _StubServer(_OLLAMA_PORT, _OLLAMA_VALID):
@@ -418,9 +419,9 @@ _OPENAI_INVALID = (
 )
 
 
-@pytest.mark.skipif(not _port_is_free(_OPENAI_PORT),
-                    reason=f'port {_OPENAI_PORT} already in use — stub tests require a free port')
 class TestOpenaiApiDetectNse:
+    required_tcp_port = _OPENAI_PORT
+
     def test_detects_openai_compatible_api(self):
         """Stub returns valid /v1/models body → script reports unauthenticated access."""
         with _StubServer(_OPENAI_PORT, _OPENAI_VALID):
@@ -451,9 +452,9 @@ _GRADIO_INVALID = (
 )
 
 
-@pytest.mark.skipif(not _port_is_free(_GRADIO_PORT),
-                    reason=f'port {_GRADIO_PORT} already in use — stub tests require a free port')
 class TestGradioDetectNse:
+    required_tcp_port = _GRADIO_PORT
+
     def test_detects_gradio_ui(self):
         """Stub returns valid /info body with version+gradio → script reports access."""
         with _StubServer(_GRADIO_PORT, _GRADIO_VALID):
@@ -484,9 +485,9 @@ _KOBOLD_INVALID = (
 )
 
 
-@pytest.mark.skipif(not _port_is_free(_KOBOLD_PORT),
-                    reason=f'port {_KOBOLD_PORT} already in use — stub tests require a free port')
 class TestKoboldcppDetectNse:
+    required_tcp_port = _KOBOLD_PORT
+
     def test_detects_koboldcpp_api(self):
         """Stub returns valid /api/v1/model body → script reports unauthenticated access."""
         with _StubServer(_KOBOLD_PORT, _KOBOLD_VALID):
@@ -521,9 +522,9 @@ _WSUS_INVALID = (
 )
 
 
-@pytest.mark.skipif(not _port_is_free(_WSUS_PORT),
-                    reason=f'port {_WSUS_PORT} already in use — stub tests require a free port')
 class TestWsusDetectNse:
+    required_tcp_port = _WSUS_PORT
+
     def test_detects_wsus(self):
         """Stub returns a WSUS ASMX help page → script reports WSUS detected."""
         with _StubServer(_WSUS_PORT, _WSUS_VALID):
@@ -558,9 +559,11 @@ def _tcp_framed(payload: bytes) -> bytes:
     return bytes([(length >> 8) & 0xFF, length & 0xFF]) + payload
 
 
-@pytest.mark.skipif(not _udp_port_is_free(_OPENVPN_PORT),
-                    reason=f'udp port {_OPENVPN_PORT} already in use — stub tests require a free port')
+@pytest.mark.skipif(os.geteuid() != 0,
+                    reason='requires root for -sU raw socket scan')
 class TestOpenvpnDetectNseUdp:
+    required_udp_port = _OPENVPN_PORT
+
     def test_detects_openvpn_server_v2(self):
         """Stub replies with a P_CONTROL_HARD_RESET_SERVER_V2 -> script confirms OpenVPN over udp."""
         with _UdpStubServer(_OPENVPN_PORT, _OPENVPN_SERVER_HARD_RESET_V2):
@@ -576,9 +579,9 @@ class TestOpenvpnDetectNseUdp:
         assert 'OpenVPN server confirmed' not in output
 
 
-@pytest.mark.skipif(not _port_is_free(_OPENVPN_PORT),
-                    reason=f'port {_OPENVPN_PORT} already in use — stub tests require a free port')
 class TestOpenvpnDetectNseTcp:
+    required_tcp_port = _OPENVPN_PORT
+
     def test_detects_openvpn_server_v1(self):
         """Stub replies with a length-prefixed P_CONTROL_HARD_RESET_SERVER_V1 -> script confirms OpenVPN over tcp."""
         with _StubServer(_OPENVPN_PORT, _tcp_framed(_OPENVPN_SERVER_HARD_RESET_V1)):
