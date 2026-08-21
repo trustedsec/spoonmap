@@ -4437,9 +4437,9 @@ def _write_findings_txt(output_path, target_scan, findings):
                 lines.append(f'    {cmd}')
                 for extra in repro.get('extra_cmds', []):
                     base_dn = next(
-                        (l[len('Base DN:'):].strip()
-                         for l in grp['detail'].splitlines()
-                         if l.startswith('Base DN:')),
+                        (line[len('Base DN:'):].strip()
+                         for line in grp['detail'].splitlines()
+                         if line.startswith('Base DN:')),
                         '',
                     )
                     lines.append(f'    {extra.format(host=hosts[0], base_dn=base_dn, port=pnum)}')
@@ -5572,7 +5572,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 full_n = len(category_names) + 1
                 print(f'\t({full_n}) Full Port Scan  [1-65535, TCP only — no UDP]')
                 print(f'\t(a) All Categories  [{", ".join(category_names)}]')
-                print(f'\t(c) Custom Port Scan  [enter your own comma-separated ports]')
+                print('\t(c) Custom Port Scan  [enter your own comma-separated ports]')
                 print(_COLOR_INFO
                       + '\nNote: Full Port Scan covers TCP 1-65535 only.  It runs NO UDP '
                         'discovery, so the U: ports in the categories above (SNMP U:161, '
@@ -5894,7 +5894,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             if effective_host_count > 0:
                 print(_COLOR_INFO
                       + f'Work units ({work_units:,}) > threshold ({nmap_threshold:,}): '
-                      + f'using masscan for port discovery'
+                      + 'using masscan for port discovery'
                       + _COLOR_RESET)
             status_summary = mass_scan(
                 scan_type, dest_ports, source_port, max_rate,
