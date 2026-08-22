@@ -5357,7 +5357,7 @@ def _config_target_scan(value):
             return valid
     print(_COLOR_ERROR + f'ERROR: config.json: target_scan = {value!r} is not '
                          "'Internal' or 'External'." + _COLOR_RESET)
-    print('See config.json.sample for the expected keys, or delete '
+    print(f'See {_DIR}/config.json.sample for the expected keys, or delete '
           'config.json to be prompted instead.')
     sys.exit(1)
 
@@ -5365,7 +5365,7 @@ def _config_target_scan(value):
 def _load_config(config_parser, dir_path, resume=False):
     """Derive every scan setting from an already-parsed config.json dict.
 
-    *config_parser* is the JSON dict, *dir_path* the script directory that the
+    *config_parser* is the JSON dict, *dir_path* the operator directory that the
     three relative path settings resolve against, and *resume* whatever the
     --resume CLI flag already produced: the config's own 'resume' key is ORed
     into it so the flag can never be turned back off by the file.  Returns the
@@ -5380,7 +5380,7 @@ def _load_config(config_parser, dir_path, resume=False):
         print(_COLOR_ERROR + 'ERROR: config.json is missing required '
                              f'{"key" if len(missing) == 1 else "keys"}: '
                              + ', '.join(missing) + _COLOR_RESET)
-        print('See config.json.sample for the expected keys, or delete '
+        print(f'See {_DIR}/config.json.sample for the expected keys, or delete '
               'config.json to be prompted instead.')
         sys.exit(1)
 
@@ -5434,7 +5434,7 @@ def _load_config(config_parser, dir_path, resume=False):
     resume = resume or _config_bool('resume', config_parser.get('resume'), False)
     config_generated = bool(config_parser.get(_CONFIG_GENERATED_KEY))
 
-    # Resolve relative paths in config relative to the script directory
+    # Resolve relative paths in config relative to the operator directory
     if target_file and not os.path.isabs(target_file):
         target_file = os.path.join(dir_path, target_file)
     if output_path and not os.path.isabs(output_path):
@@ -5463,12 +5463,25 @@ def _load_config(config_parser, dir_path, resume=False):
     }
 
 
+def _operator_dir():
+    """Directory operator data (config.json, exclusions, output) resolves against.
+
+    Deliberately the CWD, not _DIR (the module's own location): an installed
+    `spoonmap`'s module directory lives inside uv's managed tool environment,
+    which is rebuilt whenever `uv tool upgrade` actually installs a new
+    version — anything stored there, config or scan results, is lost at that
+    point. That is the failure mode that makes the CWD the only defensible
+    choice, not merely a stylistic preference. Pulled out of main() — which
+    is pragma-no-cover — so this derivation itself stays under test.
+    """
+    return os.getcwd()
+
+
 # The Main Guts
 def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
     # already-independently-tested functions behind input()-driven prompts,
     # so there's little signal in mocking every prompt/subprocess in one
     # giant test versus exercising each called function directly.
-    global dir_path
     global output_path
 
     # Save initial terminal state
@@ -5496,7 +5509,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
 
 
         # Get options from configuration file if it exists
-        dir_path = os.path.dirname(os.path.realpath(__file__))
+        dir_path = _operator_dir()
 
         if '--cleanup' in sys.argv:
             _cleanup_cmd(dir_path)  # prints result and exits

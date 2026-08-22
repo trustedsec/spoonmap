@@ -7,8 +7,52 @@ This script is a wrapper for masscan and nmap. nmap handles host discovery and (
 
 Python 3.8+ is required (`requires-python` in `pyproject.toml`; CI floors at 3.8).
 
+## Installation
+
+SpooNMAP can be run straight from a checkout — no installation step needed, see
+"Usage" below — or installed as a standalone command with
+[uv](https://docs.astral.sh/uv/):
+
+```bash
+uv tool install git+https://github.com/trustedsec/spoonmap
+```
+
+This puts a `spoonmap` executable on your `PATH`, so you can invoke it as
+`spoonmap` from any directory instead of cloning the repo and running
+`./spoonmap.py`. **There is no PyPI package** — this project has never
+published to `pypi.org`, and the command above installs directly from the
+git repository instead. Use the full `git+https://...` form above, not a
+bare `uv tool install spoonmap`; whatever that name resolves to on PyPI, now
+or in the future, is not this project.
+
+To update to the latest commit:
+
+```bash
+uv tool upgrade spoonmap
+```
+
+Installing this way does not make SpooNMAP a self-contained scanner:
+`masscan` and `nmap` are still separate system tools that must be installed
+independently (see "Dependencies" above), exactly as when running from a
+checkout — `uv tool install` only packages SpooNMAP's own Python code and its
+bundled NSE scripts, not the external binaries it shells out to.
+
+The one thing worth understanding before installing this way: an installed
+`spoonmap`'s Python module lives wherever `uv` put its managed tool
+environment — not in a directory you would ever think to look in for a
+config file or scan output. That is exactly the scenario the "Where Files
+Live" section below is about — read that section for what resolves against
+your current directory and why; installing via `uv tool install` doesn't
+change the rule, it just makes the rule matter, since there is no checkout
+directory left for a config or output path to fall back to by habit.
+
 ## Usage
 Simply executing the script will prompt you for all required options.
+
+`config.json`, target/exclusion files, and scan output all resolve against
+the directory you run the command from — see "Where Files Live" below if
+your output isn't where you expect it, especially if you're used to invoking
+SpooNMAP by path from outside its own directory.
 
 If you use [uv](https://docs.astral.sh/uv/), you can run without a separate virtual environment:
 
@@ -145,6 +189,44 @@ uv run spoonmap.py --cleanup
 ./spoonmap.py --cleanup /path/to/output
 ```
 
+## Where Files Live
+
+Every operator-facing path resolves against the directory you run the command
+from — not the directory containing `spoonmap.py`. That covers `config.json`,
+`exclusions.txt`, the default output location, any relative `target_file` /
+`output_path` / `exclusions_file` value written inside `config.json`, and
+`--cleanup`'s search for a config to read `output_path` from. The reasoning is
+simple: your config and your scan results belong in the directory where you
+ran the engagement from, not wherever the program itself happens to sit on
+disk — those are frequently different places, and an operator has no reason to
+go looking in the latter for the former.
+
+**This is a behaviour change.** Previously these paths resolved against the
+directory containing `spoonmap.py` itself. If you always run `./spoonmap.py`
+or `uv run spoonmap.py` from inside the checkout, nothing changes — your CWD
+and the checkout are the same directory. But if you invoke it by an absolute
+or relative path from somewhere else —
+
+```bash
+cd /tmp
+/opt/spoonmap/spoonmap.py
+```
+
+— behaviour is different from before: this used to read `/opt/spoonmap/config.json`
+and write output under `/opt/spoonmap/`. It now reads `/tmp/config.json` and
+writes output under `/tmp/`. If you have a habit of invoking SpooNMAP from
+outside its own directory, check where your `config.json` and prior output
+actually are before your next run.
+
+**What does *not* follow this rule:** the bundled NSE scripts (`.nse` files
+invoked during `script_scan`) are program data, not operator data — they ship
+with SpooNMAP itself and always resolve from the directory containing the
+`spoonmap` module, regardless of your CWD. That directory holds a folder
+named `nse/` in a checkout and `spoonmap_nse/` in a `uv tool install`; which
+one you have on disk depends on how you got SpooNMAP, not on anything you
+configure. This is the one exception, and it exists so the script scan works
+identically no matter where you happen to run the tool from.
+
 ## Target File (ranges.txt)
 
 `ranges.txt` is committed to the repository as an empty placeholder and is marked `skip-worktree`, so git will never stage local edits to it. Fill it with your target ranges freely — they will never be accidentally committed.
@@ -171,7 +253,7 @@ git update-index --no-skip-worktree ranges.txt
 | `target_scan` | `"External"` / `"Internal"` | Selects discovery port lists and NSE script sets; no source-port override is applied |
 | `max_rate` | Packets/second string | See rate guidance below |
 | `target_file` | Path | One IP, CIDR, or hostname per line; `ranges.txt` is committed as a blank placeholder (see below) |
-| `output_path` | Path | Directory for all output; relative paths resolve to script dir |
+| `output_path` | Path | Directory for all output; relative paths resolve to the current working directory (see "Where Files Live" above) |
 | `exclusions_file` | Path | IPs/CIDRs to exclude; SpooNMAP pre-computes the set intersection with the target file and passes only the net target IPs to masscan (see below) |
 | `nmap_threads` | Integer | Concurrent nmap processes (default: 5); prompted under "Tune advanced settings" |
 | `masscan_batch_size` | Integer | Ports per masscan invocation (default: 5); prompted under "Tune advanced settings" |

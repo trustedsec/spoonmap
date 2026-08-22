@@ -89,6 +89,7 @@ from spoonmap import (
     _parse_masscan_ping_xml,
     _parse_nmap_sn_xml,
     _parse_result_xml,
+    _operator_dir,
     _quarantine_failed_output,
     _resolve_nse_dir,
     _aggregate_result_dir,
@@ -2536,6 +2537,10 @@ class TestLoadConfig:
         for key in ('banner_scan', 'max_rate', 'target_file', 'output_path'):
             assert key in out
         assert 'missing required keys' in out
+        # config.json.sample is program data next to the module (_DIR), not
+        # the operator's CWD, so the guidance must name a real path rather
+        # than a bare filename an installed user has no hope of finding.
+        assert f'{spoonmap._DIR}/config.json.sample' in out
 
     # ---- target_scan validation --------------------------------------------
 
@@ -2558,6 +2563,7 @@ class TestLoadConfig:
         out = capsys.readouterr().out
         assert 'target_scan' in out
         assert "'Internal' or 'External'" in out
+        assert f'{spoonmap._DIR}/config.json.sample' in out
 
     def test_null_target_scan_exits_rather_than_scanning(self, capsys):
         with pytest.raises(SystemExit):
@@ -11153,3 +11159,37 @@ class TestNseDirResolution:
             'referenced via _NSE_DIR so they resolve in an installed wheel: '
             + str(offenders)
         )
+
+
+class TestOperatorDirResolution:
+    """Operator data (config.json, exclusions, output) must resolve against
+    the CWD, never the module's own location — the opposite anchor from
+    _DIR/_NSE_DIR, which stay module-relative for bundled program data."""
+
+    def test_operator_dir_is_the_cwd(self, tmp_path, monkeypatch):
+        # Compare realpaths on both sides: os.getcwd() resolves symlinks in
+        # the path (e.g. macOS's /tmp -> /private/tmp), so comparing directly
+        # against str(tmp_path) would depend on pytest happening to hand out
+        # an already-resolved tmp_path rather than on the helper's behaviour.
+        monkeypatch.chdir(tmp_path)
+        assert _operator_dir() == os.path.realpath(str(tmp_path))
+
+    def test_operator_dir_follows_cwd_changes(self, tmp_path, monkeypatch):
+        # A real behavioural assertion, not a restatement of os.getcwd():
+        # confirm the helper tracks a change in CWD rather than caching one
+        # resolved at import time.
+        first = tmp_path / 'first'
+        second = tmp_path / 'second'
+        first.mkdir()
+        second.mkdir()
+        monkeypatch.chdir(first)
+        assert _operator_dir() == os.path.realpath(str(first))
+        monkeypatch.chdir(second)
+        assert _operator_dir() == os.path.realpath(str(second))
+
+    def test_operator_dir_is_not_module_relative(self, tmp_path, monkeypatch):
+        # Regression guard for PR #42: wherever the module is installed must
+        # never be where operator data resolves, independent of install
+        # mechanism.
+        monkeypatch.chdir(tmp_path)
+        assert _operator_dir() != spoonmap._DIR
