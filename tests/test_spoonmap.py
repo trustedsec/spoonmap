@@ -2059,6 +2059,29 @@ class TestFullPortScan:
             wait_secs=2,
         )
 
+    def test_full_scan_warns_when_rate_is_capped(self, tmp_path, capsys):
+        """A clamped rate is disclosed — the run summary shows the requested rate."""
+        spoonmap.output_path = str(tmp_path)
+        with patch('spoonmap._run_masscan_batch', return_value={'22': {'10.0.0.1'}}):
+            mass_scan('Full', ['1-65535'], '88', '5000', '/fake/targets.txt', '')
+        out = capsys.readouterr().out
+        assert 'capped at 1000 pps' in out
+        assert 'requested 5000' in out
+
+    def test_full_scan_no_warning_when_rate_under_cap(self, tmp_path, capsys):
+        """No notice when the operator's rate is already below the cap."""
+        spoonmap.output_path = str(tmp_path)
+        with patch('spoonmap._run_masscan_batch', return_value={'22': {'10.0.0.1'}}):
+            mass_scan('Full', ['1-65535'], '88', '500', '/fake/targets.txt', '')
+        assert 'capped' not in capsys.readouterr().out
+
+    def test_category_scan_does_not_warn_about_full_scan_cap(self, tmp_path, capsys):
+        """The cap applies only to Full — a batched scan uses the full rate silently."""
+        spoonmap.output_path = str(tmp_path)
+        with patch('spoonmap._run_masscan_batch', return_value={'22': {'10.0.0.1'}}):
+            mass_scan('Category', ['22'], '88', '5000', '/fake/targets.txt', '')
+        assert 'capped' not in capsys.readouterr().out
+
     def test_full_scan_writes_live_hosts_files(self, tmp_path):
         spoonmap.output_path = str(tmp_path)
         fake_results = {'22': {'10.0.0.5', '10.0.0.6'}}

@@ -1668,6 +1668,17 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             # most exposed to a live_hosts/ directory left over from a wider scope.
             _report_out_of_scope_retained(full_results, scope_ranges, target_file)
             return status_summary
+        # The run summary printed by main() shows the operator's requested
+        # max_rate, not full_scan_rate, so a silent clamp here reads as the rate
+        # having been ignored.  Disclose it at the point of use.
+        if int(full_scan_rate) < int(max_rate):
+            print(_COLOR_ERROR
+                  + f'Notice: Full port scan rate capped at {full_scan_rate} pps '
+                    f'(requested {max_rate}) — a 1-65535 sweep fans out every port '
+                    f'across every target at once, and the {target_scan} cap keeps '
+                    'firewall state tables bounded. Targeted port scans use the '
+                    'full requested rate.'
+                  + _COLOR_RESET)
         print(_COLOR_INFO + 'Full port scan: running masscan 1-65535 (no probe)...' + _COLOR_RESET)
         full_results = _run_masscan_batch(['1-65535'], full_scan_rate, output_file,
                                           target_file, source_port, exclusions_file,
