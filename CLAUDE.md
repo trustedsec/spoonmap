@@ -215,8 +215,11 @@ host. `--check-update` is the on-demand path and ignores the config.
 The gate lives in `_maybe_check_for_updates()` rather than inline in `main()`
 specifically so it can be tested — `main()` is under `pragma: no cover`, and
 "does a default config reach the network" is the one question here that must not
-go untested. Its test patches `urllib.request.urlopen` to raise if it is called
-at all. `_check_for_updates()` swallows every failure: a courtesy check must
+go untested. Its test patches `_check_for_updates()` itself and asserts it is
+never called when the check is disabled. Patching `urllib.request.urlopen` to
+raise instead does NOT work and was removed: `_check_for_updates()` catches
+broadly, so it swallows the test's own tripwire and the test passes even with the
+gate gone. `_check_for_updates()` swallows every failure: a courtesy check must
 never delay, prompt, or abort a scan. An unknown local version (running from a
 checkout) reports the latest release but never claims an update is available.
 
