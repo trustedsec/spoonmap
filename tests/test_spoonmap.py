@@ -2978,6 +2978,12 @@ class TestConfigDocs:
     def test_sample_has_no_generated_marker(self):
         assert _CONFIG_GENERATED_KEY not in self._sample()
 
+    def test_check_for_updates_defaults_to_false_in_sample(self):
+        """The security model requires this key to default false. Flipping it
+        in the sample is the most likely route to it being enabled by accident.
+        This test pins the value permanently."""
+        assert self._sample()['check_for_updates'] is False
+
     def test_scan_categories_choices_track_service_categories(self):
         choices = dict(_CONFIG_DOCS['scan_categories'])['__scan_categories_choices__']
         assert choices == 'All, Full, ' + ', '.join(SERVICE_CATEGORIES)
@@ -12511,13 +12517,9 @@ class TestUpdateCheckIsOptIn:
     """
 
     def test_a_config_that_never_mentions_the_key_makes_no_network_call(self):
-        def explode(*args, **kwargs):
-            raise AssertionError(
-                'a default config performed a network call at launch'
-            )
-
-        with patch('spoonmap.urllib.request.urlopen', side_effect=explode):
+        with patch('spoonmap._check_for_updates') as checked:
             spoonmap._maybe_check_for_updates(False)
+        assert not checked.called, 'a default config performed a network call at launch'
 
     def test_enabling_it_performs_the_check(self):
         with patch('spoonmap._check_for_updates') as checked:
@@ -12556,6 +12558,7 @@ class TestCheckForUpdates:
                         return_value=self._response('v0.1.0')):
             spoonmap._check_for_updates()
         out = capsys.readouterr().out
+        assert 'Update available' in out
         assert '0.1.0' in out
 
     def test_being_up_to_date_says_so_without_claiming_an_update(self, capsys):
@@ -12563,7 +12566,9 @@ class TestCheckForUpdates:
              patch('spoonmap.urllib.request.urlopen',
                         return_value=self._response('v0.1.0')):
             spoonmap._check_for_updates()
-        assert 'Update available' not in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert 'Update available' not in out
+        assert 'is up to date' in out
 
     def test_an_older_release_is_not_an_update(self, capsys):
         with patch('spoonmap._tool_version', return_value='0.2.0'), \
@@ -12600,6 +12605,7 @@ class TestCheckForUpdates:
         with patch('spoonmap._tool_version', return_value='0.0.1'), \
              patch('spoonmap.urllib.request.urlopen', return_value=resp):
             spoonmap._check_for_updates()  # must not raise
+        assert 'Update available' not in capsys.readouterr().out
 
     def test_a_release_with_no_tag_name_is_swallowed(self, capsys):
         resp = MagicMock()
@@ -12608,6 +12614,19 @@ class TestCheckForUpdates:
         with patch('spoonmap._tool_version', return_value='0.0.1'), \
              patch('spoonmap.urllib.request.urlopen', return_value=resp):
             spoonmap._check_for_updates()  # must not raise
+
+    def test_non_string_tag_name_is_coerced(self, capsys):
+        """A proxy or captive portal might return well-formed JSON with
+        unexpected field types. Non-string tag_name must not crash."""
+        for tag_value in (123, {'nested': 'dict'}):
+            body = json.dumps({'tag_name': tag_value}).encode()
+            resp = MagicMock()
+            resp.read.return_value = body
+            resp.__enter__.return_value = resp
+            with patch('spoonmap._tool_version', return_value='0.0.1'), \
+                 patch('spoonmap.urllib.request.urlopen', return_value=resp):
+                spoonmap._check_for_updates()  # must not raise
+            assert 'Update available' not in capsys.readouterr().out
 
 
 class TestParseReleaseTag:

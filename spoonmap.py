@@ -24,7 +24,6 @@ import threading
 import time
 import queue
 from queue import Queue
-import urllib.error
 import urllib.request
 import xml.etree.ElementTree as etree
 from importlib import metadata
@@ -5889,21 +5888,27 @@ def _parse_release_tag(text):
 
 
 def _check_for_updates(timeout=_UPDATE_CHECK_TIMEOUT):
-    """Report whether a newer release exists. Never raises, never blocks long.
+    """Report whether a newer release exists. Never raises; times out quickly.
 
     Every failure mode -- no route, DNS, TLS, rate limiting, an HTML error page
-    where JSON was expected, a release with no tag_name -- is swallowed. An
-    update check is a courtesy; a scan must never fail or stall because one did.
+    where JSON was expected, a release with no tag_name -- is swallowed. The
+    timeout bounds socket operations (connect, read) but not getaddrinfo, so
+    a blackholed resolver can still block past the timeout. An update check is
+    a courtesy; a scan must never fail or stall because one did.
     """
+    payload = None
     try:
         with urllib.request.urlopen(_RELEASE_API_URL, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode('utf-8', 'replace'))
-        latest_text = payload.get('tag_name', '')
     except Exception:
         # Intentionally broad: see the docstring. There is no failure here
         # worth interrupting an operator for, and the set of exceptions urllib
         # and json can raise between them is not worth enumerating wrongly.
         return
+
+    if not isinstance(payload, dict):
+        return
+    latest_text = str(payload.get('tag_name', ''))
 
     latest = _parse_release_tag(latest_text)
     if latest is None:
