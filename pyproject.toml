@@ -75,8 +75,8 @@ exclude_lines = [
     "if __name__ == .__main__.:",
 ]
 
-# The version is derived from git tags, not stored here. Tags are cut by
-# .github/workflows/{auto,nightly}-tag.yml from tools/next_version.py, so a
+# The version is derived from git tags, not stored here. Tags are cut by the
+# `tag` job in .github/workflows/ci.yml, using tools/next_version.py, so a
 # hand-maintained version string would only ever be a second, drifting copy
 # of what the tags already say.
 #

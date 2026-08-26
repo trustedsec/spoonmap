@@ -190,13 +190,20 @@ def test_the_tag_job_keeps_its_credentials():
 
 
 def test_every_other_checkout_drops_its_credentials():
-    """All other jobs must drop credentials. GitHub coerces to string."""
-    ci = _load('ci.yml')
-    for job_id, job in ci['jobs'].items():
-        if job_id == 'tag':
+    """All other jobs, in EVERY workflow file, must drop credentials -- not
+    just ci.yml's. release.yml also declares `contents: write` (for `gh
+    release create`) and is the other place a checkout could quietly gain a
+    push-capable token. `tag` (in ci.yml) is the single documented exception:
+    it is the only job anywhere that pushes a tag."""
+    for filename in os.listdir(WORKFLOWS):
+        if not filename.endswith(('.yml', '.yaml')):
             continue
-        persist = _checkout(job)['with']['persist-credentials']
-        assert str(persist).lower() == 'false', job_id
+        workflow = _load(filename)
+        for job_id, job in workflow['jobs'].items():
+            if filename == 'ci.yml' and job_id == 'tag':
+                continue
+            persist = _checkout(job)['with']['persist-credentials']
+            assert str(persist).lower() == 'false', f'{filename}:{job_id}'
 
 
 # --- the policy module is the only thing that produces a version -------------
@@ -375,10 +382,24 @@ def _run_create_tag(repo, script, new_tag):
 
 def test_create_tag_pushes_the_tag(repo_with_remote):
     repo, remote = repo_with_remote
+    branches_before = set(_git(remote, 'branch').split())
     script = _step_script(_job('ci.yml', 'tag'), 'Create tag')
     result = _run_create_tag(repo, script, 'v0.1.0')
     assert result.returncode == 0, result.stderr
     assert 'v0.1.0' in _git(remote, 'tag')
+
+    # The step must push ONLY the tag. `git push origin "refs/tags/$NEW_TAG"`
+    # mutated to add `HEAD:main` (or to `git push origin --tags`, which would
+    # also push any branch refs the local repo happens to carry) would leave
+    # the tag assertion above passing while silently also moving/creating a
+    # branch on the remote -- something this job has no business doing; only
+    # main and nightly themselves are supposed to advance, and only by a real
+    # merge, never by this tagging step.
+    branches_after = set(_git(remote, 'branch').split())
+    assert branches_after == branches_before, (
+        f'Create tag step changed the remote branch set: '
+        f'before={branches_before}, after={branches_after}'
+    )
 
 
 def test_create_tag_is_idempotent(repo_with_remote):
@@ -443,3 +464,19 @@ def test_the_release_workflow_uses_only_built_in_actions():
         if uses:
             assert uses.startswith('actions/'), \
                 f'release workflow uses non-built-in action: {uses}'
+
+
+# --- lint job scope -----------------------------------------------------
+
+
+def test_ruff_covers_every_python_source_directory():
+    """The lint job's ruff invocation must check spoonmap.py, tests/, AND
+    tools/. tools/next_version.py ships this repo's release-versioning policy
+    and is exercised by tests/test_next_version.py just like spoonmap.py
+    itself; dropping `tools/` from the ruff command leaves 24 tests passing
+    with nothing checking it."""
+    script = _step_script(_job('ci.yml', 'lint'), 'Ruff')
+    assert re.search(r'\bruff\s+check\b', script), script
+    for target in ('spoonmap.py', 'tests/', 'tools/'):
+        assert re.search(r'(?<![\w./])' + re.escape(target) + r'(?!\S)', script), \
+            f'ruff invocation is missing target {target!r}: {script!r}'

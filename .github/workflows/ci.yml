@@ -3,9 +3,10 @@ name: CI
 on:
   pull_request:
   push:
-    # `nightly` is here because nightly-tag.yml triggers on a completed CI run
-    # for that branch. Without it, pushes to nightly run no CI at all and the
-    # tagging workflow silently never fires.
+    # `nightly` is here because the `tag` job below runs inside this workflow
+    # and is gated on `needs: [...]` plus this push trigger for main/nightly.
+    # Without it, pushes to nightly run no CI at all and the tag job silently
+    # never fires.
     branches: [main, nightly]
 
 # A new push to the same PR supersedes the previous run. Scoped to pull_request
@@ -634,6 +635,39 @@ jobs:
           print(f'installed wheel: {len(paths)} NSE paths all resolve on disk')
           PYEOF
 
+      # main()'s `--version`/`--check-update` dispatch sits inside
+      # `# pragma: no cover`, so mutating either to `print('x')` leaves the
+      # whole pytest suite green -- _tool_version() and _check_for_updates()
+      # are unit-tested in isolation, but nothing exercises main()'s own
+      # argv handling. This step is that missing end-to-end guard, run
+      # against the installed wheel from the step above (not `./spoonmap.py`
+      # from the checkout): only an actual install has real distribution
+      # metadata, so this is also the one place that can assert the output
+      # is NOT _UNKNOWN_VERSION -- a checkout run would legitimately print
+      # that sentinel and any assertion here would be checking the wrong
+      # thing.
+      - name: Verify installed `spoonmap --version` prints a real version
+        run: |
+          wheel=$(ls dist/*.whl)
+          venv_dir=$(mktemp -d)
+          uv venv "$venv_dir/venv"
+          uv pip install --python "$venv_dir/venv/bin/python" "$wheel"
+          cd "$venv_dir"
+          version=$("$venv_dir/venv/bin/spoonmap" --version)
+          echo "spoonmap --version printed: $version"
+          if [ -z "$version" ]; then
+            echo "spoonmap --version printed nothing" >&2
+            exit 1
+          fi
+          if [ "$version" = "unknown (running from source)" ]; then
+            echo "spoonmap --version printed the running-from-source sentinel despite being installed from a wheel" >&2
+            exit 1
+          fi
+          echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+' || {
+            echo "spoonmap --version did not print something starting with a parseable X.Y.Z: $version" >&2
+            exit 1
+          }
+
   # Cuts release tags from the commits themselves, once every other job in this
   # run has passed. `nightly` cuts release candidates for whichever version the
   # batch is heading toward (v0.1.0rc1, v0.1.0rc2, ...) and `main` promotes that
@@ -674,7 +708,11 @@ jobs:
       contents: write
     # Two pushes landing back-to-back would otherwise both compute the same tag
     # and the second push would fail. Serialize per branch instead of
-    # cancelling, so no push is skipped.
+    # cancelling: a third push superseding a still-queued second run's tag job
+    # is coalescing, not lost work, because the baseline this job computes
+    # from is the highest tag already in the repo, not a cursor advanced by
+    # each run — the coalesced run still sees every commit since that tag and
+    # cuts the version that reflects all of them.
     concurrency:
       group: tag-${{ github.ref }}
       cancel-in-progress: false

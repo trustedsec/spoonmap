@@ -24,6 +24,7 @@ import threading
 import time
 import queue
 from queue import Queue
+import urllib.error
 import urllib.request
 import xml.etree.ElementTree as etree
 from importlib import metadata
@@ -5436,7 +5437,8 @@ _CONFIG_FIELD_ORDER = (
 def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_scan,
                               script_scan, target_scan, max_rate, target_file,
                               output_path, exclusions_file, nmap_threads,
-                              masscan_batch_size, nmap_threshold, host_discovery):
+                              masscan_batch_size, nmap_threshold, host_discovery,
+                              check_for_updates=False):
     """Build a config.json-compatible dict from interactively collected options.
 
     The result round-trips through main()'s config loader: reloading it
@@ -5453,6 +5455,15 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
     spellings still load (see _config_bool), so this is about the two files
     telling an operator the same thing.
 
+    ``check_for_updates`` has no interactive prompt of its own — it is only
+    ever turned on by hand-editing config.json — so it defaults to False here
+    and main() passes through whatever the prior config (or default) held.  It
+    must still be written explicitly rather than left out of ``values``: an
+    omitted key relied on _write_interactive_config()'s merge-with-existing-
+    file behaviour to survive a regeneration, which only worked by accident
+    (only when a config.json happened to still be on disk with the key set)
+    and silently dropped the setting on a first-ever write.
+
     Keys are emitted in ``_CONFIG_FIELD_ORDER`` with their ``_CONFIG_DOCS``
     entries interleaved, so the written file documents its editable fields the
     way config.json.sample does.  Doc entries appear only for fields actually
@@ -5464,6 +5475,7 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
         'script_scan': bool(script_scan),
         'host_discovery': bool(host_discovery),
         'resume': False,
+        'check_for_updates': bool(check_for_updates),
         'target_scan': target_scan,
         'max_rate': str(max_rate),
         'nmap_threads': int(nmap_threads),
@@ -5887,7 +5899,22 @@ def _parse_release_tag(text):
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
 
-def _check_for_updates(timeout=_UPDATE_CHECK_TIMEOUT):
+def _describe_update_check_failure(exc):
+    """A short, cheap-to-obtain description of why the update check failed.
+
+    Not exhaustive -- HTTPError and URLError cover the common jumpbox cases
+    (no releases yet -> 404, no egress -> URLError/timeout); anything else
+    falls back to the exception's class name rather than trying to enumerate
+    every failure urllib/json can produce.
+    """
+    if isinstance(exc, urllib.error.HTTPError):
+        return f'api.github.com returned HTTP {exc.code}'
+    if isinstance(exc, urllib.error.URLError):
+        return f'could not reach api.github.com ({exc.reason})'
+    return f'could not reach api.github.com ({type(exc).__name__})'
+
+
+def _check_for_updates(timeout=_UPDATE_CHECK_TIMEOUT, quiet=True):
     """Report whether a newer release exists. Never raises; times out quickly.
 
     Every failure mode -- no route, DNS, TLS, rate limiting, an HTML error page
@@ -5895,34 +5922,58 @@ def _check_for_updates(timeout=_UPDATE_CHECK_TIMEOUT):
     timeout bounds socket operations (connect, read) but not getaddrinfo, so
     a blackholed resolver can still block past the timeout. An update check is
     a courtesy; a scan must never fail or stall because one did.
+
+    ``quiet`` controls only whether a *failure* is reported, and defaults to
+    True to preserve that launch-time contract for _maybe_check_for_updates().
+    The on-demand ``--check-update`` path passes quiet=False: an operator who
+    explicitly asked for a check must not see silence indistinguishable from
+    "you are up to date", especially before this repo has cut its first
+    release, where the request fails every single time (api.github.com's
+    /releases/latest 404s with no releases published).
     """
     payload = None
     try:
         with urllib.request.urlopen(_RELEASE_API_URL, timeout=timeout) as resp:
             payload = json.loads(resp.read().decode('utf-8', 'replace'))
-    except Exception:
+    except Exception as exc:
         # Intentionally broad: see the docstring. There is no failure here
         # worth interrupting an operator for, and the set of exceptions urllib
         # and json can raise between them is not worth enumerating wrongly.
+        if not quiet:
+            print(_COLOR_ERROR
+                  + f'Update check failed: {_describe_update_check_failure(exc)}'
+                  + _COLOR_RESET)
         return
 
     if not isinstance(payload, dict):
+        if not quiet:
+            print(_COLOR_ERROR
+                  + 'Update check failed: api.github.com returned an unexpected response'
+                  + _COLOR_RESET)
         return
     latest_text = str(payload.get('tag_name', ''))
 
     latest = _parse_release_tag(latest_text)
     if latest is None:
+        if not quiet:
+            print(_COLOR_ERROR
+                  + f'Update check failed: could not parse a release version '
+                    f'from {latest_text!r}'
+                  + _COLOR_RESET)
         return
 
     current_text = _tool_version()
     current = _parse_release_tag(current_text)
     if current is None:
-        # Running from a checkout, or on a dev build. There is nothing to
-        # compare, so report the fact and make no claim about it -- telling
-        # every operator running from a clone that they are out of date would
-        # be wrong far more often than right.
-        print(f'Latest release: {latest_text} (local version unknown). '
-              f'See {_RELEASES_URL}')
+        # Running from a checkout, an rc/candidate tag, or a .postN.devN
+        # build -- _tool_version() (and --version) can name the local
+        # version precisely (e.g. "0.1.0rc1") while it is still not an exact
+        # X.Y.Z release tag, so "unknown" would contradict --version's own
+        # output. Report it as not comparable and make no claim about it --
+        # telling every such operator they are out of date would be wrong far
+        # more often than right.
+        print(f'Latest release: {latest_text} (local version {current_text} '
+              f'is not comparable to a release). See {_RELEASES_URL}')
         return
 
     if latest > current:
@@ -5958,9 +6009,12 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         print(_tool_version())
         sys.exit(0)
     # On-demand, regardless of config: asking whether an update exists should
-    # not require leaving the launch-time check switched on.
+    # not require leaving the launch-time check switched on. quiet=False here
+    # (unlike the launch-time call below) because an operator who explicitly
+    # asked for a check must be told when it failed rather than seeing
+    # silence indistinguishable from "you are up to date".
     if '--check-update' in sys.argv:
-        _check_for_updates()
+        _check_for_updates(quiet=False)
         sys.exit(0)
 
     # Save initial terminal state
@@ -5985,6 +6039,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         masscan_batch_size = 5  # Default number of ports per masscan invocation
         nmap_threshold = 5_000_000  # Default work-unit threshold for tool selection
         host_discovery = None   # None = prompt user; True/False = set from config
+        check_for_updates = False  # no interactive prompt; only set via config.json
 
 
         # Get options from configuration file if it exists
@@ -6020,8 +6075,9 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             host_discovery     = cfg['host_discovery']
             resume             = cfg['resume']
             config_generated   = cfg['config_generated']
+            check_for_updates  = cfg['check_for_updates']
 
-            _maybe_check_for_updates(cfg['check_for_updates'])
+            _maybe_check_for_updates(check_for_updates)
 
         # A config this tool wrote is a saved answer sheet, not a hand-authored
         # one, so ask about pre-existing output *before* the prompts: [d]elete and
@@ -6328,6 +6384,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 scan_categories, dest_ports, scan_type, banner_scan, script_scan,
                 target_scan, max_rate, target_file, output_path, exclusions_file,
                 nmap_threads, masscan_batch_size, nmap_threshold, host_discovery,
+                check_for_updates,
             )
             config_json_path = f'{dir_path}/config.json'
             if _write_interactive_config(config_json_path, interactive_config):

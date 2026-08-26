@@ -9,6 +9,7 @@ import readline
 import subprocess
 import textwrap
 import threading
+import urllib.error
 from pathlib import Path
 from queue import Empty, Queue
 from unittest.mock import MagicMock, patch
@@ -177,6 +178,48 @@ class TestToolVersion:
         # version cannot be parsed as a comparable release, so running from
         # a checkout never claims an update is available.
         assert spoonmap._parse_release_tag(spoonmap._UNKNOWN_VERSION) is None
+
+
+class TestMainVersionDispatch:
+    """main()'s `--version`/`--check-update` argv handling.
+
+    main() is `# pragma: no cover` for its interactive body, but the
+    --version/--check-update branch is handled before any prompting or
+    terminal-state work, so it can be exercised directly: patch sys.argv,
+    call main(), and confirm it exits 0 having called the right underlying
+    function. Without this, mutating either branch to `print('x')` left the
+    full suite green -- _tool_version() and _check_for_updates() were only
+    ever covered in isolation, never through main()'s own wiring.
+    """
+
+    def test_version_flag_prints_tool_version_and_exits(self, capsys):
+        with patch('sys.argv', ['spoonmap.py', '--version']), \
+             patch('spoonmap._tool_version', return_value='1.2.3'), \
+             pytest.raises(SystemExit) as exc_info:
+            spoonmap.main()
+        assert exc_info.value.code == 0
+        assert capsys.readouterr().out.strip() == '1.2.3'
+
+    def test_check_update_flag_calls_check_for_updates_non_quiet_and_exits(self):
+        with patch('sys.argv', ['spoonmap.py', '--check-update']), \
+             patch('spoonmap._check_for_updates') as mock_check, \
+             pytest.raises(SystemExit) as exc_info:
+            spoonmap.main()
+        assert exc_info.value.code == 0
+        mock_check.assert_called_once_with(quiet=False)
+
+    def test_neither_flag_does_not_short_circuit(self):
+        """A sanity check that this dispatch only fires for its own flags --
+        without it, a mutation that made the --version branch unconditional
+        would not be caught by the two tests above."""
+        with patch('sys.argv', ['spoonmap.py']), \
+             patch('spoonmap._tool_version') as mock_version, \
+             patch('spoonmap._check_for_updates') as mock_check, \
+             patch('spoonmap.save_terminal_state', side_effect=RuntimeError('stop')):
+            with pytest.raises(RuntimeError, match='stop'):
+                spoonmap.main()
+        mock_version.assert_not_called()
+        mock_check.assert_not_called()
 
 
 class TestRaiseFdLimit:
@@ -12640,6 +12683,109 @@ class TestCheckForUpdates:
                  patch('spoonmap.urllib.request.urlopen', return_value=resp):
                 spoonmap._check_for_updates()  # must not raise
             assert 'Update available' not in capsys.readouterr().out
+
+    def test_a_non_exact_local_version_says_not_comparable_not_unknown(self, capsys):
+        """An rc-tag or .postN.devN install has a real, precise version --
+        --version prints it -- so calling it "unknown" here would contradict
+        --version's own output. It must say the local version is not
+        comparable to a release, and still make no claim about being
+        behind."""
+        with patch('spoonmap._tool_version', return_value='0.1.0rc1'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        return_value=self._response('v0.1.0')):
+            spoonmap._check_for_updates()
+        out = capsys.readouterr().out
+        assert 'Update available' not in out
+        assert 'unknown' not in out
+        assert '0.1.0rc1' in out
+        assert 'not comparable' in out
+
+    # --- quiet vs. on-demand failure reporting (default quiet=True is the
+    # launch-time contract; --check-update passes quiet=False) --------------
+
+    def test_launch_time_failure_is_silent_by_default(self, capsys):
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        side_effect=OSError('no route to host')):
+            spoonmap._check_for_updates()  # quiet=True by default
+        assert capsys.readouterr().out == ''
+
+    def test_on_demand_failure_is_reported(self, capsys):
+        """--check-update passes quiet=False. Silence here is indistinguishable
+        from "you are up to date", and is what api.github.com's 404 (no
+        releases published yet) produces on every single invocation today."""
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        side_effect=OSError('no route to host')):
+            spoonmap._check_for_updates(quiet=False)
+        out = capsys.readouterr().out
+        assert out.strip() != ''
+        assert 'Update check failed' in out
+
+    def test_on_demand_http_error_names_the_status_code(self, capsys):
+        error = urllib.error.HTTPError(
+            spoonmap._RELEASE_API_URL, 404, 'Not Found', {}, None)
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen', side_effect=error):
+            spoonmap._check_for_updates(quiet=False)
+        assert '404' in capsys.readouterr().out
+
+    def test_on_demand_url_error_names_the_reason(self, capsys):
+        error = urllib.error.URLError('no route to host')
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen', side_effect=error):
+            spoonmap._check_for_updates(quiet=False)
+        assert 'no route to host' in capsys.readouterr().out
+
+    def test_on_demand_non_dict_payload_is_reported(self, capsys):
+        resp = MagicMock()
+        resp.read.return_value = b'[]'
+        resp.__enter__.return_value = resp
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen', return_value=resp):
+            spoonmap._check_for_updates(quiet=False)
+        assert 'Update check failed' in capsys.readouterr().out
+
+    def test_on_demand_unparseable_tag_is_reported(self, capsys):
+        resp = self._response('not-a-version')
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen', return_value=resp):
+            spoonmap._check_for_updates(quiet=False)
+        out = capsys.readouterr().out
+        assert 'Update check failed' in out
+        assert 'not-a-version' in out
+
+    def test_check_update_dispatch_uses_quiet_false(self):
+        """main()'s --check-update branch must pass quiet=False -- this is
+        what item 1 actually fixes; TestMainVersionDispatch covers the wiring
+        directly, this pins the same fact at the _check_for_updates() call
+        site's default."""
+        assert inspect.signature(spoonmap._check_for_updates).parameters['quiet'].default is True
+
+    # --- network-safety properties that must have real assertions behind
+    # them, not just comments (item 9) ---------------------------------------
+
+    def test_urlopen_is_called_with_a_timeout(self):
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        return_value=self._response('v0.1.0')) as mock_urlopen:
+            spoonmap._check_for_updates()
+        _, kwargs = mock_urlopen.call_args
+        assert 'timeout' in kwargs, 'urlopen must be called with an explicit timeout'
+        assert kwargs['timeout'] == spoonmap._UPDATE_CHECK_TIMEOUT
+
+    def test_the_timeout_constant_is_small(self):
+        """A courtesy check that runs before every scan must not become a
+        stalled engagement. Sane upper bound, not the exact value, so the
+        constant can still be tuned without this test becoming brittle."""
+        assert 0 < spoonmap._UPDATE_CHECK_TIMEOUT <= 30
+
+    def test_the_url_requests_the_latest_release_specifically(self):
+        """/releases (plural, no /latest) would include pre-releases, which
+        would advertise a nightly rc candidate as an available update to
+        every operator -- exactly what _RELEASE_API_URL's own comment says
+        must not happen."""
+        assert spoonmap._RELEASE_API_URL.rstrip('/').endswith('/releases/latest')
 
 
 class TestParseReleaseTag:

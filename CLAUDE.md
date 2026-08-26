@@ -203,6 +203,15 @@ Version arithmetic belongs in `tools/next_version.py`, where it is unit-tested,
 never in a workflow step. hate_crack carried ~70 lines of `cut -d.` duplicated
 across two YAML files before extracting this module; do not reintroduce it here.
 
+**`main` must contain `nightly`'s commits as ancestors — merge or fast-forward
+`nightly` into `main`, never squash.** `tools/next_version.py` computes
+`git log <last-tag>..HEAD` from whichever branch is tagging. A squash merge
+collapses `nightly`'s already-released commits into one commit unreachable
+from any prior tag, so that range re-lists them on `main` on every subsequent
+push, forever. This fails quietly, not loudly: versions stay monotonic (the
+squash commit itself is still "since the last release"), so nothing errors —
+the computed target is just wrong from then on.
+
 ## Update Checking
 
 `check_for_updates` in `config.json` defaults to **false**, and an absent key
@@ -220,8 +229,30 @@ never called when the check is disabled. Patching `urllib.request.urlopen` to
 raise instead does NOT work and was removed: `_check_for_updates()` catches
 broadly, so it swallows the test's own tripwire and the test passes even with the
 gate gone. `_check_for_updates()` swallows every failure: a courtesy check must
-never delay, prompt, or abort a scan. An unknown local version (running from a
-checkout) reports the latest release but never claims an update is available.
+never delay, prompt, or abort a scan. A local version that is not an exact
+release tag (running from a checkout, an rc build, a `.postN.devN` build) reports
+the latest release but says the local version is not comparable to one, and
+never claims an update is available.
+
+`_check_for_updates(quiet=True)` is the default and is what
+`_maybe_check_for_updates()` uses for the launch-time path — silence on failure
+is correct there. `--check-update` passes `quiet=False`: the on-demand path must
+say when the check itself failed, naming the failure cheaply (HTTP status,
+`URLError` reason, or exception class) when it can. Without this, an operator who
+explicitly ran `--check-update` saw the same nothing-printed, exit-0 outcome for
+"the network is unreachable" as for "you are up to date" — and this repo has cut
+no releases yet, so `/releases/latest` 404s and the on-demand path fails on every
+invocation until the first release ships. The broad `except Exception:` inside
+`_check_for_updates()` stays broad either way; `quiet` only controls whether the
+failure branch prints.
+
+`check_for_updates` round-trips through a regenerated `config.json`:
+`_build_interactive_config()` takes it as a parameter and writes it explicitly
+like every other field in `_CONFIG_FIELD_ORDER`, rather than relying on
+`_write_interactive_config()`'s merge-with-existing-file fallback to carry it
+forward — that fallback only works when a config.json happens to still be on
+disk with the key already set, and silently drops it on a first-ever
+regeneration.
 
 ## Architecture
 

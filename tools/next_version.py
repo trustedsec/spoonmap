@@ -31,10 +31,20 @@ to tags reachable from HEAD. ``main``'s release tag can sit on a commit that the
 then compute the next nightly from a stale baseline and hand out a version below
 the release that already shipped.
 
+This policy assumes ``main`` contains ``nightly``'s commits as ancestors --
+merge or fast-forward ``nightly`` into ``main``, never squash. A squash merge
+collapses ``nightly``'s already-released commits into one commit that is not
+reachable from any prior tag, so ``git log <last-tag>..HEAD`` on ``main``
+re-lists them on every subsequent push, forever. Versions still come out
+monotonic (there is always at least the squash commit itself since the last
+release), so this fails quietly rather than loudly: nothing errors, the
+computed target is just wrong.
+
 Everything above the git boundary is pure and unit-tested in
-tests/test_next_version.py. Both tagging workflows call this so the policy lives
-in exactly one place, expressed in Python where it can be tested rather than in
-YAML where it cannot.
+tests/test_next_version.py. The ``tag`` job in ``.github/workflows/ci.yml``
+calls this for both channels so the policy lives in exactly one place,
+expressed in Python where it can be tested rather than in YAML where it
+cannot.
 """
 
 from __future__ import annotations
