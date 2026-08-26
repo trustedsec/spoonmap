@@ -24,6 +24,11 @@ dev = [
     # pinned bandit itself but let its transitive deps float. Locking it here
     # means `uv run --frozen bandit` gets a fully reproducible dependency set.
     "bandit[toml]==1.9.4",
+    # Test-only. tests/test_next_version.py asserts candidate/release ordering
+    # against a real PEP 440 parser rather than by eyeball, because two
+    # different pre-release schemes have been got wrong before. Not a runtime
+    # dependency: spoonmap.py is stdlib-only.
+    "packaging>=24.0",
 ]
 
 [tool.uv]
