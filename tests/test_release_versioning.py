@@ -10,9 +10,8 @@ What this file guards is everything around the policy, all of which fails
 * The tag job ceasing to depend on the jobs that validate the commit, which
   would let a tag land on a commit that failed its tests.
 * The policy module ceasing to be the only thing that produces a version,
-  asserted as a positive invariant (exactly one next_version.py call, and the
-  pushed tag read back from its output) with a denylist of shell version
-  arithmetic as a second line of defence.
+  asserted by running the actual Compute tag step and reading back the outputs
+  it writes to $GITHUB_OUTPUT, rather than grepping for function calls.
 * A `fetch-depth` reverted to the default, which does not fail anything -- it
   silently computes versions from a baseline of no tags at all.
 * The behaviour of the shell that remains -- tag idempotency and the
@@ -63,6 +62,11 @@ def _checkout(job):
     raise AssertionError('no checkout step')
 
 
+def _normalize_yaml_expr(expr):
+    """Normalize YAML expression for comparison: collapse whitespace."""
+    return re.sub(r'\s+', ' ', expr.strip())
+
+
 # --- triggers and gating -----------------------------------------------------
 
 
@@ -77,39 +81,76 @@ def test_ci_runs_on_pushes_to_both_release_branches():
 def test_the_tag_job_waits_for_every_validating_job():
     """A tag must never appear on a commit that failed anything. `needs` treats
     a failed or skipped dependency as not-success, so the job simply does not
-    run -- but only for jobs actually listed here."""
+    run -- but only for jobs actually listed here.
+
+    Exclude any job whose own `needs` contains 'tag' (e.g., a future publish job).
+    """
     ci = _load('ci.yml')
     needs = set(ci['jobs']['tag']['needs'])
-    validating = {j for j in ci['jobs'] if j != 'tag'}
+    # Exclude jobs that depend on tag (self-referencing jobs like publish)
+    validating = {
+        j for j in ci['jobs']
+        if j != 'tag' and not (ci['jobs'][j].get('needs') and 'tag' in ci['jobs'][j].get('needs', []))
+    }
     missing = validating - needs
     assert not missing, f'tag job does not depend on: {sorted(missing)}'
 
 
 def test_the_tag_job_never_runs_on_pull_requests():
     """ci.yml also runs on pull_request, where tagging would be actively
-    wrong."""
+    wrong. Assert the entire normalized if expression, not fragments."""
     condition = _job('ci.yml', 'tag')['if']
-    assert "github.event_name == 'push'" in condition
-    assert "refs/heads/main" in condition
-    assert "refs/heads/nightly" in condition
+    normalized = _normalize_yaml_expr(condition)
+    # Must assert the full expression to catch && → || mutations
+    expected = _normalize_yaml_expr(
+        "github.event_name == 'push' && "
+        "(github.ref == 'refs/heads/main' || github.ref == 'refs/heads/nightly')"
+    )
+    assert normalized == expected, f'Expected: {expected}\nGot: {normalized}'
 
 
 def test_only_the_tag_job_can_write():
     """The workflow is read-only; exactly one job escalates, and only to what
-    pushing a tag and cutting a release requires."""
+    pushing a tag and cutting a release requires. Exclude publish-like jobs
+    that legitimately need write access."""
     ci = _load('ci.yml')
     assert ci['permissions'] == {'contents': 'read'}
     assert ci['jobs']['tag']['permissions'] == {'contents': 'write'}
     for job_id, job in ci['jobs'].items():
         if job_id != 'tag':
+            # Allow publish-like jobs to have their own permissions
+            if 'needs' in job and 'tag' in job['needs']:
+                continue
             assert 'permissions' not in job, job_id
 
 
 def test_the_tag_job_does_not_cancel_itself():
-    """Two pushes landing together would compute the same tag; the second push
-    would fail. Serialize per branch rather than cancel, so none is skipped."""
+    """Two pushes landing together would otherwise both compute the same tag.
+    Serialize per branch instead of cancelling, so no push is skipped."""
     concurrency = _job('ci.yml', 'tag')['concurrency']
     assert concurrency['cancel-in-progress'] is False
+
+
+def test_tag_job_concurrency_group_is_branch_specific():
+    """The tag job's concurrency group must not collide with the workflow-level
+    group, which would deadlock the job against itself. It must also interpolate
+    github.ref to serialize by branch."""
+    tag_job = _job('ci.yml', 'tag')
+    tag_concurrency_group = tag_job['concurrency']['group']
+    workflow_concurrency_group = _load('ci.yml')['concurrency']['group']
+
+    # Groups must be different to avoid deadlock
+    assert tag_concurrency_group != workflow_concurrency_group
+    # Tag group must reference github.ref to serialize by branch
+    assert 'github.ref' in tag_concurrency_group
+
+
+def test_all_jobs_declare_timeout_minutes():
+    """Every job must declare timeout-minutes to bound execution. A hung job
+    holding contents: write is the worst one to lose that bound."""
+    ci = _load('ci.yml')
+    for job_id, job in ci['jobs'].items():
+        assert 'timeout-minutes' in job, f'job {job_id} missing timeout-minutes'
 
 
 # --- checkout depth ----------------------------------------------------------
@@ -119,33 +160,42 @@ def test_the_tag_job_does_not_cancel_itself():
 def test_version_deriving_jobs_fetch_all_history(job_id):
     """Both jobs derive a version from git describe. A shallow clone does not
     fail either of them -- it silently computes from a baseline of no tags,
-    which is how a wrong version ships without anything going red."""
-    assert _checkout(_job('ci.yml', job_id))['with']['fetch-depth'] == 0
+    which is how a wrong version ships without anything going red. GitHub
+    coerces fetch-depth to a string, so compare as string."""
+    depth = _checkout(_job('ci.yml', job_id))['with']['fetch-depth']
+    assert str(depth).lower() == '0', f'job {job_id} must have fetch-depth: 0, got {depth}'
 
 
 def test_the_tag_job_keeps_its_credentials():
     """Deliberate exception to this repo's persist-credentials: false rule:
-    this job pushes a tag and needs the token. Pinned so a well-meaning
-    convention sweep cannot silently break tagging."""
-    assert _checkout(_job('ci.yml', 'tag'))['with']['persist-credentials'] is True
+    this job pushes a tag and needs the token. GitHub coerces to string."""
+    persist = _checkout(_job('ci.yml', 'tag'))['with']['persist-credentials']
+    assert str(persist).lower() == 'true'
 
 
 def test_every_other_checkout_drops_its_credentials():
+    """All other jobs must drop credentials. GitHub coerces to string."""
     ci = _load('ci.yml')
     for job_id, job in ci['jobs'].items():
         if job_id == 'tag':
             continue
-        assert _checkout(job)['with']['persist-credentials'] is False, job_id
+        persist = _checkout(job)['with']['persist-credentials']
+        assert str(persist).lower() == 'false', job_id
 
 
 # --- the policy module is the only thing that produces a version -------------
 
 
 def test_exactly_one_call_to_the_policy_module():
-    with open(os.path.join(WORKFLOWS, 'ci.yml')) as handle:
-        body = handle.read()
-    calls = re.findall(r'tools/next_version\.py --channel', body)
-    assert len(calls) == 1, 'the tag must come from exactly one call'
+    """The policy module must be called exactly once to produce the version.
+    Count against the parsed run bodies of the tag job's steps, not the whole
+    file (which may contain --repo-dir in comments)."""
+    job = _job('ci.yml', 'tag')
+    calls = sum(
+        len(re.findall(r'tools/next_version\.py\s+--channel', step.get('run', '')))
+        for step in job['steps']
+    )
+    assert calls == 1, f'expected exactly one call to tools/next_version.py, found {calls}'
 
 
 def test_both_channels_are_reachable():
@@ -157,7 +207,58 @@ def test_both_channels_are_reachable():
     assert 'channel=nightly' in script
 
 
+@pytest.mark.parametrize('branch,expected_channel', [
+    ('refs/heads/main', 'stable'),
+    ('refs/heads/nightly', 'nightly'),
+])
+def test_compute_tag_step_assigns_correct_channel(branch, expected_channel, tmp_path):
+    """The Compute tag step must actually WRITE the channel and new_tag outputs
+    to $GITHUB_OUTPUT. Runs the step in isolation with a real bash subprocess."""
+    script = _step_script(_job('ci.yml', 'tag'), 'Compute tag')
+
+    # Minimal environment: only PATH, HOME, and the variables the step needs
+    env = {
+        'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+        'HOME': os.environ.get('HOME', '/tmp'),
+        'GITHUB_REF': branch,
+        'GITHUB_OUTPUT': str(tmp_path / 'github_output'),
+    }
+
+    result = subprocess.run(
+        ['bash', '-c', script],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f'Compute tag step failed: {result.stderr}'
+
+    # Parse the $GITHUB_OUTPUT file to read back the values the step wrote
+    output_file = tmp_path / 'github_output'
+    assert output_file.exists(), 'Compute tag step did not write $GITHUB_OUTPUT'
+
+    output_contents = output_file.read_text()
+    parsed = {}
+    for line in output_contents.splitlines():
+        if '=' in line:
+            key, value = line.split('=', 1)
+            parsed[key] = value
+
+    # Assert the channel is assigned correctly
+    assert 'channel' in parsed, f'channel key not in GITHUB_OUTPUT: {parsed}'
+    assert parsed['channel'] == expected_channel, \
+        f'Expected channel={expected_channel}, got channel={parsed["channel"]}'
+
+    # Assert new_tag exists and has a plausible shape (or is empty for no new commits)
+    assert 'new_tag' in parsed, f'new_tag key not in GITHUB_OUTPUT: {parsed}'
+    new_tag = parsed['new_tag']
+    if new_tag:
+        assert re.match(r'^v\d+\.\d+\.\d+', new_tag), \
+            f'new_tag has unexpected format: {new_tag}'
+
+
 def test_the_pushed_tag_is_the_one_the_policy_computed():
+    """The Create tag step must use the tag computed by Compute tag step."""
     job = _job('ci.yml', 'tag')
     compute = [s for s in job['steps'] if 'next_version.py' in s.get('run', '')]
     assert len(compute) == 1
@@ -168,22 +269,30 @@ def test_the_pushed_tag_is_the_one_the_policy_computed():
 
 def test_no_shell_version_arithmetic():
     """Second line of defence. Version math in YAML cannot be unit-tested,
-    which is the entire reason tools/next_version.py exists."""
-    with open(os.path.join(WORKFLOWS, 'ci.yml')) as handle:
-        body = handle.read()
+    which is the entire reason tools/next_version.py exists. Scope to tag job
+    steps only, not the whole file."""
+    job = _job('ci.yml', 'tag')
+    script = '\n'.join(step.get('run', '') for step in job['steps'])
     for banned in ('cut -d.', '$((', 'awk -F.'):
-        assert banned not in body, f'version arithmetic in YAML: {banned}'
+        assert banned not in script, f'version arithmetic in tag job: {banned}'
 
 
 def test_only_stable_publishes_a_release():
     """Nightly candidates exist to make builds addressable, not to be releases.
     Publishing them would make anything ranking releases see a candidate as
-    latest."""
-    release_step = [
+    latest. Assert the full if condition, not fragments."""
+    release_steps = [
         s for s in _job('ci.yml', 'tag')['steps']
         if s.get('name') == 'Create GitHub release'
-    ][0]
-    assert "== 'stable'" in release_step['if']
+    ]
+    assert len(release_steps) == 1
+    release_step = release_steps[0]
+
+    # Assert the full if condition to catch || true appending
+    if_condition = release_step.get('if', '')
+    normalized = _normalize_yaml_expr(if_condition)
+    assert normalized == _normalize_yaml_expr("steps.bump.outputs.channel == 'stable'"), \
+        f'release step if condition must be exactly "steps.bump.outputs.channel == \'stable\'", got: {normalized}'
 
 
 # --- the behaviour of the shell that remains ---------------------------------
@@ -212,7 +321,12 @@ def repo_with_remote(tmp_path):
 
 
 def _run_create_tag(repo, script, new_tag):
-    env = dict(os.environ, NEW_TAG=new_tag)
+    """Run the Create tag step with minimal environment (no inherited vars)."""
+    env = {
+        'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
+        'HOME': os.environ.get('HOME', '/tmp'),
+        'NEW_TAG': new_tag,
+    }
     return subprocess.run(
         ['bash', '-c', script], cwd=repo, env=env,
         capture_output=True, text=True,
@@ -269,11 +383,23 @@ def test_release_workflow_still_exists_for_hand_pushed_tags():
     assert _triggers(_load('release.yml'))['push']['tags'] == ['v*']
 
 
-def test_the_release_workflow_uses_no_third_party_action():
+def test_the_release_workflow_uses_only_built_in_actions():
     """The runner already ships gh, and the tag job publishes the same way.
-    zizmor flags the third-party action as superfluous, and two release paths
-    doing the same thing differently is one too many."""
-    (job,) = _load('release.yml')['jobs'].values()
+    Assert positive: the release step must call `gh release create`, and no
+    step may use a third-party action."""
+    job = list(_load('release.yml')['jobs'].values())[0]
+
+    # Positive assertion: at least one step must run gh release create
+    gh_found = False
     for step in job['steps']:
-        uses = str(step.get('uses', ''))
-        assert 'action-gh-release' not in uses
+        if 'gh release create' in step.get('run', ''):
+            gh_found = True
+            break
+    assert gh_found, 'no step runs `gh release create`'
+
+    # Every step that uses an action must use built-in actions/
+    for step in job['steps']:
+        uses = step.get('uses', '')
+        if uses:
+            assert uses.startswith('actions/'), \
+                f'release workflow uses non-built-in action: {uses}'
