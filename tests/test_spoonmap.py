@@ -12628,6 +12628,19 @@ class TestCheckForUpdates:
                 spoonmap._check_for_updates()  # must not raise
             assert 'Update available' not in capsys.readouterr().out
 
+    def test_json_body_that_is_not_a_dict_is_swallowed(self, capsys):
+        """A proxy or captive portal might return valid JSON that is not an
+        object — a list, or a bare string. These are common error page
+        responses and must not crash."""
+        for body_bytes in (b'[]', b'"nope"'):
+            resp = MagicMock()
+            resp.read.return_value = body_bytes
+            resp.__enter__.return_value = resp
+            with patch('spoonmap._tool_version', return_value='0.0.1'), \
+                 patch('spoonmap.urllib.request.urlopen', return_value=resp):
+                spoonmap._check_for_updates()  # must not raise
+            assert 'Update available' not in capsys.readouterr().out
+
 
 class TestParseReleaseTag:
     """Version comparison, without a packaging dependency."""
