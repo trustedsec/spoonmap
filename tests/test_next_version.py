@@ -107,9 +107,10 @@ def test_non_feature_subjects_are_not_features(subject):
 
 
 def test_the_word_feature_in_a_body_does_not_promote_the_batch():
-    """Anchored at the subject on purpose. A fix whose body explains which
-    feature it repairs must not cut a minor release."""
-    message = "fix(attacks): correct the mask\n\nThis feature was broken: feat\n"
+    """Anchored at the subject on purpose. A fix whose body contains a line
+    starting with `feat:` (e.g., from git revert or squash-merge) must not cut
+    a minor release — only the subject matters."""
+    message = "fix: revert the thing\n\nThis reverts commit abc123.\n\nfeat: add the thing\n"
     assert not has_feature([message])
 
 
@@ -186,7 +187,7 @@ def test_nightly_cuts_a_candidate_for_the_next_version():
 
 
 def test_main_cuts_the_final_of_the_same_target():
-    """Merging nightly-dev down promotes the candidate rather than inventing a
+    """Merging nightly down promotes the candidate rather than inventing a
     different number: the fix-only cycle above ends at 2.20.1, not 2.21.0."""
     tags = ["v2.20.0", "v2.20.1rc1", "v2.20.1rc2"]
     assert compute("stable", tags, ["fix: a"]) == "v2.20.1"
@@ -300,7 +301,7 @@ def test_commit_messages_since_baseline_excludes_the_baseline_itself(tmp_path):
 
 
 def test_baseline_need_not_be_reachable_from_head(tmp_path):
-    """main's release tag can sit on a commit nightly-dev does not contain.
+    """main's release tag can sit on a commit nightly does not contain.
 
     A reachability-restricted baseline would compute the next nightly from a
     stale release and hand out a version below what already shipped.
@@ -319,7 +320,7 @@ def test_baseline_need_not_be_reachable_from_head(tmp_path):
     _git("commit", "-qm", "fix: released on main", cwd=repo)
     _git("tag", "v2.20.1", cwd=repo)
 
-    _git("checkout", "-q", "-b", "nightly-dev", "v2.20.0", cwd=repo)
+    _git("checkout", "-q", "-b", "nightly", "v2.20.0", cwd=repo)
     (repo / "f.txt").write_text("nightly\n")
     _git("add", "-A", cwd=repo)
     _git("commit", "-qm", "fix: on the nightly branch", cwd=repo)
@@ -333,6 +334,91 @@ def test_baseline_need_not_be_reachable_from_head(tmp_path):
         f"the next nightly must sort above the release that already shipped, got {got}"
     )
     assert parse("2.20.1") < parse(got.lstrip("v"))
+
+
+def test_main_prints_candidate_for_nightly(tmp_path, capsys):
+    """main(["--channel", "nightly", "--repo-dir", str(repo)]) returns 0 and
+    prints a candidate tag matching ^v\\d+\\.\\d+\\.\\d+rc\\d+$."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    (repo / "f.txt").write_text("a\n")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-qm", "fix: first thing", cwd=repo)
+
+    from tools.next_version import main
+
+    result = main(["--channel", "nightly", "--repo-dir", str(repo)])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip(), "nightly must print a tag"
+    assert captured.out.strip().startswith("v")
+    # Verify format: v0.0.1rc1
+    import re
+
+    assert re.match(r"^v\d+\.\d+\.\d+rc\d+$", captured.out.strip())
+
+
+def test_main_prints_final_for_stable(tmp_path, capsys):
+    """main(["--channel", "stable", "--repo-dir", str(repo)]) returns 0 and
+    prints a final tag matching ^v\\d+\\.\\d+\\.\\d+$."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    (repo / "f.txt").write_text("a\n")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-qm", "fix: first thing", cwd=repo)
+
+    from tools.next_version import main
+
+    result = main(["--channel", "stable", "--repo-dir", str(repo)])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip(), "stable must print a tag"
+    assert captured.out.strip().startswith("v")
+    # Verify format: v0.0.1 (no rc suffix)
+    import re
+
+    assert re.match(r"^v\d+\.\d+\.\d+$", captured.out.strip())
+
+
+def test_main_prints_nothing_when_already_tagged(tmp_path, capsys):
+    """main returns 0 and prints NOTHING when HEAD is already at the latest
+    final tag — the empty-batch case. This is what workflows treat as
+    'nothing to tag'."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    (repo / "f.txt").write_text("a\n")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-qm", "fix: first thing", cwd=repo)
+    _git("tag", "v0.0.1", cwd=repo)
+
+    from tools.next_version import main
+
+    result = main(["--channel", "stable", "--repo-dir", str(repo)])
+    assert result == 0
+    captured = capsys.readouterr()
+    assert (
+        captured.out.strip() == ""
+    ), f"empty batch must print nothing, got: {captured.out!r}"
+
+
+def test_git_tags_returns_tags_from_repo(tmp_path):
+    """git_tags() returns the tags of a real repository."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    (repo / "f.txt").write_text("a\n")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-qm", "feat: initial", cwd=repo)
+    _git("tag", "v0.1.0", cwd=repo)
+    _git("tag", "v0.1.0rc1", cwd=repo)
+
+    from tools.next_version import git_tags
+
+    tags = git_tags(str(repo))
+    assert sorted(tags) == ["v0.1.0", "v0.1.0rc1"]
 
 
 def test_a_repository_with_no_tags_cuts_the_first_patch():
