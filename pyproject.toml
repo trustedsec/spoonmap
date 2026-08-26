@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "spoonmap"
-version = "0.1.0"
+dynamic = ["version"]
 description = "masscan + nmap orchestration wrapper for fast network scanning"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -72,6 +72,19 @@ exclude_lines = [
     "if __name__ == .__main__.:",
 ]
 
+# The version is derived from git tags, not stored here. Tags are cut by
+# .github/workflows/{auto,nightly}-tag.yml from tools/next_version.py, so a
+# hand-maintained version string would only ever be a second, drifting copy
+# of what the tags already say.
+#
+#   no-guess-dev   an untagged commit after v0.0.1 reads 0.0.1.post1.dev1
+#                  rather than guessing the next release it might become.
+#   no-local-version  drops the +g<sha> suffix, which is not a valid version
+#                  for an index and makes tag-to-artifact comparison noisy.
+[tool.hatch.version]
+source = "vcs"
+raw-options = { version_scheme = "no-guess-dev", local_scheme = "no-local-version" }
+
 [tool.hatch.build.targets.wheel]
 only-include = ["spoonmap.py"]
 
@@ -111,6 +124,7 @@ include = [
     "spoonmap.py",
     "nse/",
     "tests/",
+    "tools/",
     "README.md",
     "CLAUDE.md",
     "config.json.sample",

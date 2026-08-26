@@ -363,6 +363,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+          # hatch-vcs derives the version from git describe. Under the default
+          # depth-1 clone this does not fail -- it silently produces a version
+          # computed from no tag at all (0.0.post1.dev1 where the answer is
+          # 0.0.1.post1.dev1), so every artifact this job inspects would carry
+          # a version no release ever had.
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
@@ -372,6 +378,32 @@ jobs:
 
       - name: Build sdist and wheel
         run: uv build
+
+      - name: Assert artifacts carry a VCS-derived version
+        run: |
+          python3 - <<'PYEOF'
+          import glob
+          import os
+          import sys
+
+          # A depth-1 clone yields 0.0.post1.dev1 -- a version derived from no
+          # tag. Once a tag exists, anything starting 0.0.post means the
+          # checkout could not see it. This is the assertion that would have
+          # caught a fetch-depth regression.
+          names = [os.path.basename(p) for p in glob.glob('dist/*')]
+          if not names:
+              sys.exit('no artifacts were built')
+          import subprocess
+          tags = subprocess.run(
+              ['git', 'tag'], capture_output=True, text=True, check=True
+          ).stdout.split()
+          if tags and any(n.startswith('spoonmap-0.0.post') for n in names):
+              sys.exit(
+                  'artifacts were versioned from no tag despite tags existing '
+                  '(shallow checkout?): ' + ', '.join(names)
+              )
+          print('artifact versions: ' + ', '.join(names))
+          PYEOF
 
       - name: Assert sdist excludes local scratch
         run: |
