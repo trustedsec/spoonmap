@@ -298,6 +298,18 @@ all, which is why the job now asserts the version it produced."
 
 ### Task 3: The tagging workflows
 
+> **Superseded in part, 2026-08-26.** The two `workflow_run`-triggered files
+> below (`nightly-tag.yml`, `auto-tag.yml`) were built, then removed: zizmor —
+> a required CI job — rates `workflow_run` an error-level dangerous trigger and
+> exits 14, and this repo does not silence findings with ignore comments.
+> Tagging is now a single `tag` job inside `.github/workflows/ci.yml`, gated on
+> `needs: [test, test-legacy, lint, bandit, nse-root, workflow-lint, build]`
+> and on `github.event_name == 'push'` for `main`/`nightly` only, with
+> job-level `permissions: contents: write`. `release.yml` survives for
+> hand-pushed tags but publishes via `gh release create` instead of a
+> third-party action. The YAML below is kept as the record of what was tried
+> and why it was rejected; see Tasks 6 and 7 for the current shape.
+
 **Files:**
 - Create: `.github/workflows/nightly-tag.yml`
 - Create: `.github/workflows/auto-tag.yml`
@@ -1099,18 +1111,38 @@ is a hardcoded https literal; B310 is scheme-blind and cannot see that."
 
 ### Task 6: Guard the wiring that breaks silently
 
+> **Design change, 2026-08-26 (supersedes this task's original form).** Tagging
+> no longer lives in separate `workflow_run`-triggered workflows. zizmor — a
+> required CI job — rejects `workflow_run` at error level as a
+> privilege-escalation vector and exits 14, and this repo does not silence
+> findings with ignore comments. Tagging is now a single `tag` job inside
+> `.github/workflows/ci.yml`, gated on `needs: [test, test-legacy, lint,
+> bandit, nse-root, workflow-lint, build]` and `if: github.event_name ==
+> 'push'` restricted to `main`/`nightly`, with job-level `permissions: contents:
+> write`. `auto-tag.yml` and `nightly-tag.yml` no longer exist. `release.yml`
+> remains, for hand-pushed tags, and publishes via `gh release create` rather
+> than a third-party action.
+
 **Files:**
 - Create: `tests/test_release_versioning.py`
 - Modify: `pyproject.toml` (dev group gains `pyyaml`)
-- Modify: `.github/workflows/ci.yml` (`test-legacy` job's `uv run` line, ~line 118)
+- Modify: `.github/workflows/ci.yml` (`test-legacy` job's `uv run` line, ~line 118; `lint` job's ruff line, ~line 151)
 
 **Interfaces:**
-- Consumes: the workflow files from Task 3, `tools/next_version.py` from Task 1.
+- Consumes: the `tag` job in `ci.yml` and `release.yml` from Task 3, `tools/next_version.py` from Task 1.
 - Produces: nothing other tasks consume.
 
-The policy is already tested. What is untested is everything around it: a trigger that never fires, a step that stops using the policy module, a tag that gets pushed without being the one that was computed. Those fail *silently* — no tag simply appears, and nobody notices for weeks.
+The policy is already tested. What is untested is everything around it: a tag
+job that stops depending on a test job, a step that stops using the policy
+module, a tag pushed without being the one that was computed, a `fetch-depth`
+quietly reverted. Those fail *silently* — no tag simply appears, or a wrong one
+does, and nobody notices for weeks.
 
-Assert behaviour by running the extracted step scripts, not by substring-matching YAML. hate_crack learned this the hard way: its substring assertions were defeated by replacing an entire `if`/`else` with an unconditional `git tag && git push`, and every test still passed because the substring lived elsewhere in the file.
+Assert behaviour by running the extracted step scripts, not by
+substring-matching YAML. hate_crack learned this the hard way: its substring
+assertions were defeated by replacing an entire `if`/`else` with an
+unconditional `git tag && git push`, and every test still passed because the
+substring lived elsewhere in the file.
 
 - [ ] **Step 1: Make the test dependencies available on every job**
 
@@ -1122,7 +1154,10 @@ In `pyproject.toml`'s `[dependency-groups].dev`, add:
     "pyyaml>=6.0",
 ```
 
-Then in `.github/workflows/ci.yml`, the `test-legacy` job resolves its own dependencies outside the project (`uv run --isolated --no-project ... --with pytest --with pytest-cov`), so it would hit an ImportError collecting the new modules. Extend that line:
+Then in `.github/workflows/ci.yml`, the `test-legacy` job resolves its own
+dependencies outside the project (`uv run --isolated --no-project ... --with
+pytest --with pytest-cov`), so it would hit an ImportError collecting the new
+modules. Extend that line:
 
 ```yaml
       - name: Run tests
@@ -1132,7 +1167,19 @@ Then in `.github/workflows/ci.yml`, the `test-legacy` job resolves its own depen
           pytest tests/ -v -rs
 ```
 
-`packaging` is for `tests/test_next_version.py` (Task 1). Do not solve this with `pytest.importorskip` — a skipped guard is a guard that silently is not running, which is the exact failure this whole file exists to prevent.
+`packaging` is for `tests/test_next_version.py`. It currently resolves only
+because pytest happens to depend on it transitively — one pytest release away
+from breaking. Do not solve any of this with `pytest.importorskip`: a skipped
+guard is a guard that silently is not running, which is the exact failure this
+whole file exists to prevent.
+
+Also extend the `lint` job's ruff invocation (~line 151) to cover the new
+directory, which is currently never linted in CI:
+
+```yaml
+      - name: Ruff
+        run: uv run --frozen ruff check spoonmap.py tests/ tools/
+```
 
 Run `uv lock` after editing the dev group.
 
@@ -1150,13 +1197,14 @@ re-implements it.
 What this file guards is everything around the policy, all of which fails
 *silently*:
 
-* A trigger that never fires. nightly-tag.yml keys on a completed CI run for
-  the `nightly` branch, so if ci.yml stops running on pushes to `nightly`, no
-  candidate is ever tagged and there is no error anywhere to notice.
+* The tag job ceasing to depend on the jobs that validate the commit, which
+  would let a tag land on a commit that failed its tests.
 * The policy module ceasing to be the only thing that produces a version,
-  asserted as a positive invariant (exactly one next_version.py call per
-  workflow, and the pushed tag read back from its output) with a denylist of
-  shell version arithmetic as a second line of defence.
+  asserted as a positive invariant (exactly one next_version.py call, and the
+  pushed tag read back from its output) with a denylist of shell version
+  arithmetic as a second line of defence.
+* A `fetch-depth` reverted to the default, which does not fail anything -- it
+  silently computes versions from a baseline of no tags at all.
 * The behaviour of the shell that remains -- tag idempotency and the
   empty-batch path -- asserted by extracting the step script from the YAML and
   running it against a real git repository and a real bare remote.
@@ -1181,106 +1229,151 @@ def _load(name):
         return yaml.safe_load(handle)
 
 
-def _steps(workflow):
-    (job,) = workflow['jobs'].values()
-    return job['steps']
-
-
-def _step_script(workflow, name):
-    for step in _steps(workflow):
-        if step.get('name') == name:
-            return step['run']
-    raise AssertionError(f'no step named {name!r}')
-
-
 # `on` is the YAML 1.1 boolean True, so a parsed workflow keys the trigger
 # block under True rather than 'on'. This bites everyone once.
 def _triggers(workflow):
     return workflow.get('on', workflow.get(True))
 
 
-# --- the triggers ------------------------------------------------------------
+def _job(name, job_id):
+    return _load(name)['jobs'][job_id]
 
 
-def test_ci_runs_on_pushes_to_nightly():
-    """Without this, nightly-tag.yml's workflow_run trigger has nothing to key
-    on and no candidate is ever cut. Nothing errors; tags just stop appearing."""
+def _step_script(job, step_name):
+    for step in job['steps']:
+        if step.get('name') == step_name:
+            return step['run']
+    raise AssertionError(f'no step named {step_name!r}')
+
+
+def _checkout(job):
+    for step in job['steps']:
+        if 'actions/checkout' in str(step.get('uses', '')):
+            return step
+    raise AssertionError('no checkout step')
+
+
+# --- triggers and gating -----------------------------------------------------
+
+
+def test_ci_runs_on_pushes_to_both_release_branches():
+    """A push to `nightly` that runs no CI would never reach the tag job, and
+    no candidate would ever be cut. Nothing errors; tags just stop appearing."""
     branches = _triggers(_load('ci.yml'))['push']['branches']
     assert 'nightly' in branches
     assert 'main' in branches
 
 
-@pytest.mark.parametrize('name,branch', [
-    ('nightly-tag.yml', 'nightly'),
-    ('auto-tag.yml', 'main'),
-])
-def test_tagging_workflows_wait_for_a_successful_ci_run(name, branch):
-    trigger = _triggers(_load(name))['workflow_run']
-    assert trigger['workflows'] == ['CI']
-    assert trigger['branches'] == [branch]
-
-    (job,) = _load(name)['jobs'].values()
-    assert "workflow_run.conclusion == 'success'" in job['if']
+def test_the_tag_job_waits_for_every_validating_job():
+    """A tag must never appear on a commit that failed anything. `needs` treats
+    a failed or skipped dependency as not-success, so the job simply does not
+    run -- but only for jobs actually listed here."""
+    ci = _load('ci.yml')
+    needs = set(ci['jobs']['tag']['needs'])
+    validating = {j for j in ci['jobs'] if j != 'tag'}
+    missing = validating - needs
+    assert not missing, f'tag job does not depend on: {sorted(missing)}'
 
 
-@pytest.mark.parametrize('name', ['nightly-tag.yml', 'auto-tag.yml'])
-def test_tagging_workflows_check_out_the_commit_ci_validated(name):
-    """workflow_run defaults to the default branch's tip, which is not
-    necessarily the commit that passed CI."""
-    checkout = _steps(_load(name))[0]
-    assert checkout['with']['ref'] == '${{ github.event.workflow_run.head_sha }}'
+def test_the_tag_job_never_runs_on_pull_requests():
+    """ci.yml also runs on pull_request, where tagging would be actively
+    wrong."""
+    condition = _job('ci.yml', 'tag')['if']
+    assert "github.event_name == 'push'" in condition
+    assert "refs/heads/main" in condition
+    assert "refs/heads/nightly" in condition
 
 
-@pytest.mark.parametrize('name', ['nightly-tag.yml', 'auto-tag.yml'])
-def test_tagging_workflows_fetch_all_history(name):
-    """The baseline is the highest final tag. A shallow clone has none, so the
-    job would compute from 0.0.0 and tag a version that already shipped."""
-    assert _steps(_load(name))[0]['with']['fetch-depth'] == 0
+def test_only_the_tag_job_can_write():
+    """The workflow is read-only; exactly one job escalates, and only to what
+    pushing a tag and cutting a release requires."""
+    ci = _load('ci.yml')
+    assert ci['permissions'] == {'contents': 'read'}
+    assert ci['jobs']['tag']['permissions'] == {'contents': 'write'}
+    for job_id, job in ci['jobs'].items():
+        if job_id != 'tag':
+            assert 'permissions' not in job, job_id
 
 
-@pytest.mark.parametrize('name', ['nightly-tag.yml', 'auto-tag.yml'])
-def test_tagging_workflows_do_not_cancel_each_other(name):
-    """Two merges landing together would compute the same tag; the second push
-    would fail. Serialize rather than cancel so no merge is skipped."""
-    assert _load(name)['concurrency']['cancel-in-progress'] is False
+def test_the_tag_job_does_not_cancel_itself():
+    """Two pushes landing together would compute the same tag; the second push
+    would fail. Serialize per branch rather than cancel, so none is skipped."""
+    concurrency = _job('ci.yml', 'tag')['concurrency']
+    assert concurrency['cancel-in-progress'] is False
+
+
+# --- checkout depth ----------------------------------------------------------
+
+
+@pytest.mark.parametrize('job_id', ['tag', 'build'])
+def test_version_deriving_jobs_fetch_all_history(job_id):
+    """Both jobs derive a version from git describe. A shallow clone does not
+    fail either of them -- it silently computes from a baseline of no tags,
+    which is how a wrong version ships without anything going red."""
+    assert _checkout(_job('ci.yml', job_id))['with']['fetch-depth'] == 0
+
+
+def test_the_tag_job_keeps_its_credentials():
+    """Deliberate exception to this repo's persist-credentials: false rule:
+    this job pushes a tag and needs the token. Pinned so a well-meaning
+    convention sweep cannot silently break tagging."""
+    assert _checkout(_job('ci.yml', 'tag'))['with']['persist-credentials'] is True
+
+
+def test_every_other_checkout_drops_its_credentials():
+    ci = _load('ci.yml')
+    for job_id, job in ci['jobs'].items():
+        if job_id == 'tag':
+            continue
+        assert _checkout(job)['with']['persist-credentials'] is False, job_id
 
 
 # --- the policy module is the only thing that produces a version -------------
 
 
-@pytest.mark.parametrize('name,channel', [
-    ('nightly-tag.yml', 'nightly'),
-    ('auto-tag.yml', 'stable'),
-])
-def test_exactly_one_call_to_the_policy_module(name, channel):
-    with open(os.path.join(WORKFLOWS, name)) as handle:
+def test_exactly_one_call_to_the_policy_module():
+    with open(os.path.join(WORKFLOWS, 'ci.yml')) as handle:
         body = handle.read()
-    calls = re.findall(r'tools/next_version\.py --channel (\w+)', body)
-    assert calls == [channel], (
-        'the tag must come from exactly one next_version.py call'
-    )
+    calls = re.findall(r'tools/next_version\.py --channel', body)
+    assert len(calls) == 1, 'the tag must come from exactly one call'
 
 
-@pytest.mark.parametrize('name', ['nightly-tag.yml', 'auto-tag.yml'])
-def test_the_pushed_tag_is_the_one_the_policy_computed(name):
-    workflow = _load(name)
-    compute = [s for s in _steps(workflow) if 'next_version.py' in s.get('run', '')]
+def test_both_channels_are_reachable():
+    """main cuts the final release, nightly cuts a candidate for the same
+    target. A job that only ever computed one channel would silently tag
+    nightly builds as releases, or never cut a release at all."""
+    script = _step_script(_job('ci.yml', 'tag'), 'Compute tag')
+    assert 'channel=stable' in script
+    assert 'channel=nightly' in script
+
+
+def test_the_pushed_tag_is_the_one_the_policy_computed():
+    job = _job('ci.yml', 'tag')
+    compute = [s for s in job['steps'] if 'next_version.py' in s.get('run', '')]
     assert len(compute) == 1
     step_id = compute[0]['id']
-    create = _step_script(workflow, 'Create tag')
-    assert 'NEW_TAG' in create
-    env = [s for s in _steps(workflow) if s.get('name') == 'Create tag'][0]['env']
-    assert env['NEW_TAG'] == '${{ steps.%s.outputs.new_tag }}' % step_id
+    create = [s for s in job['steps'] if s.get('name') == 'Create tag'][0]
+    assert create['env']['NEW_TAG'] == '${{ steps.%s.outputs.new_tag }}' % step_id
 
 
-@pytest.mark.parametrize('name', ['nightly-tag.yml', 'auto-tag.yml'])
-def test_no_shell_version_arithmetic(name):
+def test_no_shell_version_arithmetic():
     """Second line of defence. Version math in YAML cannot be unit-tested,
     which is the entire reason tools/next_version.py exists."""
-    with open(os.path.join(WORKFLOWS, name)) as handle:
+    with open(os.path.join(WORKFLOWS, 'ci.yml')) as handle:
         body = handle.read()
-    for banned in ('cut -d.', 'cut -d ".', '$((', 'awk -F.', 'sed -E s/v'):
+    for banned in ('cut -d.', '$((', 'awk -F.'):
         assert banned not in body, f'version arithmetic in YAML: {banned}'
+
+
+def test_only_stable_publishes_a_release():
+    """Nightly candidates exist to make builds addressable, not to be releases.
+    Publishing them would make anything ranking releases see a candidate as
+    latest."""
+    release_step = [
+        s for s in _job('ci.yml', 'tag')['steps']
+        if s.get('name') == 'Create GitHub release'
+    ][0]
+    assert "== 'stable'" in release_step['if']
 
 
 # --- the behaviour of the shell that remains ---------------------------------
@@ -1316,31 +1409,28 @@ def _run_create_tag(repo, script, new_tag):
     )
 
 
-@pytest.mark.parametrize('name', ['nightly-tag.yml', 'auto-tag.yml'])
-def test_create_tag_pushes_the_tag(repo_with_remote, name):
+def test_create_tag_pushes_the_tag(repo_with_remote):
     repo, remote = repo_with_remote
-    script = _step_script(_load(name), 'Create tag')
-    result = _run_create_tag(repo, script, 'v0.0.1')
+    script = _step_script(_job('ci.yml', 'tag'), 'Create tag')
+    result = _run_create_tag(repo, script, 'v0.1.0')
     assert result.returncode == 0, result.stderr
-    assert 'v0.0.1' in _git(remote, 'tag')
+    assert 'v0.1.0' in _git(remote, 'tag')
 
 
-@pytest.mark.parametrize('name', ['nightly-tag.yml', 'auto-tag.yml'])
-def test_create_tag_is_idempotent(repo_with_remote, name):
+def test_create_tag_is_idempotent(repo_with_remote):
     """A re-run of the workflow must not fail the job."""
     repo, _ = repo_with_remote
-    script = _step_script(_load(name), 'Create tag')
-    assert _run_create_tag(repo, script, 'v0.0.1').returncode == 0
-    second = _run_create_tag(repo, script, 'v0.0.1')
+    script = _step_script(_job('ci.yml', 'tag'), 'Create tag')
+    assert _run_create_tag(repo, script, 'v0.1.0').returncode == 0
+    second = _run_create_tag(repo, script, 'v0.1.0')
     assert second.returncode == 0, second.stderr
 
 
-@pytest.mark.parametrize('name', ['nightly-tag.yml', 'auto-tag.yml'])
-def test_an_empty_batch_tags_nothing_and_is_not_an_error(repo_with_remote, name):
+def test_an_empty_batch_tags_nothing_and_is_not_an_error(repo_with_remote):
     """No commits since the last release is a re-run, not a failure. Tagging
     "" would fail with a message about nothing in particular."""
     repo, remote = repo_with_remote
-    script = _step_script(_load(name), 'Create tag')
+    script = _step_script(_job('ci.yml', 'tag'), 'Create tag')
     result = _run_create_tag(repo, script, '')
     assert result.returncode == 0, result.stderr
     assert _git(remote, 'tag').strip() == ''
@@ -1358,37 +1448,64 @@ def test_the_policy_module_agrees_with_this_repository():
     assert result.returncode == 0, result.stderr
     output = result.stdout.strip()
     assert output == '' or re.match(r'^v\d+\.\d+\.\d+rc\d+$', output), output
+
+
+# --- the hand-pushed release path -------------------------------------------
+
+
+def test_release_workflow_still_exists_for_hand_pushed_tags():
+    """The policy never bumps a major automatically, so a major release is
+    `git tag v1.0.0 && git push`. This is what turns that into a release."""
+    assert _triggers(_load('release.yml'))['push']['tags'] == ['v*']
+
+
+def test_the_release_workflow_uses_no_third_party_action():
+    """The runner already ships gh, and the tag job publishes the same way.
+    zizmor flags the third-party action as superfluous, and two release paths
+    doing the same thing differently is one too many."""
+    (job,) = _load('release.yml')['jobs'].values()
+    for step in job['steps']:
+        uses = str(step.get('uses', ''))
+        assert 'action-gh-release' not in uses
 ```
 
 - [ ] **Step 3: Run them**
 
 Run: `uv run pytest tests/test_release_versioning.py -v`
-Expected: PASS. If `_triggers()` returns `None`, the workflow parsed `on` as the boolean `True` — that is what the helper handles; check you copied it intact.
+Expected: PASS. If `_triggers()` returns `None`, the workflow parsed `on` as the
+boolean `True` — that is what the helper handles; check you copied it intact.
 
 - [ ] **Step 4: Prove the guards actually guard**
 
-A test that cannot fail is not a guard. Mutate and confirm each one bites, on a scratch copy so the real files are never left broken:
+A test that cannot fail is not a guard. Mutate and confirm each bites, on a
+scratch copy so the real file is never left broken:
 
 ```bash
 cd /tmp/spoonmap-auto-versioning
 cp .github/workflows/ci.yml /tmp/ci.yml.good
 python3 - <<'EOF'
-import re
 p = '.github/workflows/ci.yml'
 s = open(p).read().replace('branches: [main, nightly]', 'branches: [main]')
 open(p, 'w').write(s)
 EOF
-uv run pytest tests/test_release_versioning.py::test_ci_runs_on_pushes_to_nightly -q
+uv run pytest tests/test_release_versioning.py::test_ci_runs_on_pushes_to_both_release_branches -q
 # Expected: FAIL
 cp /tmp/ci.yml.good .github/workflows/ci.yml
 ```
 
-Repeat for one behavioural guard: temporarily replace the `Create tag` step's `if`/`else` in `nightly-tag.yml` with an unconditional `git tag "$NEW_TAG" && git push origin "refs/tags/$NEW_TAG"`, confirm `test_create_tag_is_idempotent` and `test_an_empty_batch_tags_nothing_and_is_not_an_error` both FAIL, then restore. Report both mutation results in your summary — "the tests pass" is not evidence here.
+Repeat, restoring from `/tmp/ci.yml.good` each time, for three more:
+
+- Remove `fetch-depth: 0` from the `build` job's checkout → `test_version_deriving_jobs_fetch_all_history[build]` must FAIL. (This is the guard that replaces the dormant artifact-version assertion, which cannot fire while the repo has no tags.)
+- Drop one job from the `tag` job's `needs` list → `test_the_tag_job_waits_for_every_validating_job` must FAIL.
+- Replace the `Create tag` step's `if`/`else` with an unconditional `git tag "$NEW_TAG" && git push origin "refs/tags/$NEW_TAG"` → both `test_create_tag_is_idempotent` and `test_an_empty_batch_tags_nothing_and_is_not_an_error` must FAIL.
+
+Report all four mutation results with real output. "The tests pass" is not evidence here.
 
 - [ ] **Step 5: Confirm nothing is left mutated**
 
 Run: `git diff --stat && uv run pytest tests/ -q`
-Expected: the only diffs are the intended new/modified files, and the full suite passes at or above 95% coverage.
+Expected: the only diffs are the intended new/modified files, and the full suite
+passes at or above 95% coverage.
 
 - [ ] **Step 6: Commit**
 
@@ -1397,9 +1514,10 @@ git add tests/test_release_versioning.py pyproject.toml uv.lock .github/workflow
 git commit -m "test: guard the release-versioning wiring
 
 The policy is unit-tested; the wiring around it is what fails silently. A
-missing nightly push trigger, a step that stops calling next_version.py, or
-a tag pushed without being the one computed all produce no error -- tags
-just quietly stop appearing.
+tag job that stops depending on a test job, a step that stops calling
+next_version.py, a reverted fetch-depth, or a tag pushed without being the
+one computed all produce no error -- tags just quietly stop appearing, or
+appear wrong.
 
 Behavioural guards extract the step script from the YAML and run it against
 a real repo and a real bare remote. Substring assertions on YAML were
@@ -1408,8 +1526,12 @@ push while every test still passed."
 ```
 
 ---
-
 ### Task 7: Documentation
+
+> **Design change, 2026-08-26 (supersedes this task's original form).** Tagging
+> lives in a `tag` job inside `.github/workflows/ci.yml`, gated on `needs`, not
+> in separate `workflow_run`-triggered workflows. `auto-tag.yml` and
+> `nightly-tag.yml` do not exist. Do not document them.
 
 **Files:**
 - Modify: `README.md` (Usage section, after the `--cleanup` block ending ~line 190)
@@ -1449,7 +1571,10 @@ omitting it entirely means `false`. Only stable releases are reported —
 nightly release candidates are never advertised as updates.
 ````
 
-Also add `check_for_updates` to the `## config.json Parameters` section (~line 244), matching the surrounding format: default `false`, "Contact api.github.com at startup to check for a newer release. Off unless set; see `--check-update` for a one-off check."
+Also add `check_for_updates` to the `## config.json Parameters` section (~line
+244), matching the surrounding format: default `false`, "Contact api.github.com
+at startup to check for a newer release. Off unless set; see `--check-update`
+for a one-off check."
 
 - [ ] **Step 2: Document the release process in `CLAUDE.md`**
 
@@ -1471,28 +1596,37 @@ major is an irreversible published mistake waiting for one mistyped subject
 line. Push a major by hand and `release.yml` will publish it.
 
 `nightly` cuts candidates for the version the batch is heading toward
-(`v0.0.1rc1`, `v0.0.1rc2`, …) and `main` promotes that same target to its final
+(`v0.1.0rc1`, `v0.1.0rc2`, …) and `main` promotes that same target to its final
 release. Aiming candidates one version *forward* is what makes them sort
-correctly: `0.0.0 < 0.0.1rc1 < 0.0.1 < 0.1.0rc1 < 0.1.0`. This makes conventional
+correctly: `0.0.0 < 0.1.0rc1 < 0.1.0 < 0.2.0rc1 < 0.2.0`. This makes conventional
 commit subjects load-bearing — a `feat:` typo'd as `fix:` ships as a patch.
 
-Four things here fail silently rather than loudly, all guarded by
+The tagging lives in a `tag` job **inside `ci.yml`**, gated on
+`needs: [test, test-legacy, lint, bandit, nse-root, workflow-lint, build]` and
+on `github.event_name == 'push'` for `main`/`nightly` only. It is deliberately
+not a separate `workflow_run`-triggered workflow, which is how this was first
+built: zizmor — a required job in this same file — rates `workflow_run` an
+error-level dangerous trigger and exits 14, because it is the standard
+privilege-escalation vector, and this repo does not silence findings with ignore
+comments. Being a `needs` dependent buys the same "only tag what passed CI"
+guarantee without the trigger, and without checking out an explicitly-passed
+head SHA. Do not reintroduce `workflow_run` here.
+
+Things that fail silently rather than loudly, all guarded by
 `tests/test_release_versioning.py`:
 
-- **`ci.yml` must run on pushes to `nightly`.** `nightly-tag.yml` triggers on a
-  completed CI run for that branch; with no CI run there is nothing to key on and
-  no candidate is ever tagged, with no error anywhere.
-- **`nightly-tag.yml` must live on `main`.** GitHub only dispatches
-  `workflow_run` for workflows present on the default branch. A copy existing
-  only on `nightly` never fires.
-- **Both tagging jobs need `fetch-depth: 0`.** The baseline is the highest final
-  tag; a shallow clone sees none and computes from 0.0.0, handing out a version
-  that already shipped. The `build` job needs it for the same reason — verified:
-  a depth-1 clone does not fail there, it silently versions artifacts from no tag
-  at all.
-- **Both tagging jobs set `persist-credentials: true`**, against this repo's
-  convention everywhere else, because they push a tag. That exception is
-  commented at each site; do not "fix" it.
+- **`ci.yml` must run on pushes to `nightly`.** Otherwise the tag job never runs
+  there and no candidate is ever cut, with no error anywhere.
+- **The `tag` job must keep every validating job in `needs`.** Drop one and a
+  tag can land on a commit that failed it.
+- **`fetch-depth: 0` on both the `tag` and `build` jobs.** The baseline is the
+  highest final tag; a shallow clone sees none and computes from 0.0.0, handing
+  out a version that already shipped. Verified: a depth-1 clone does not fail —
+  it silently versions from no tag at all.
+- **The `tag` job sets `persist-credentials: true`**, against this repo's
+  convention everywhere else, because it pushes a tag. It is also the only job
+  with `contents: write`. That exception is commented at the site and pinned by
+  a test; do not "fix" it.
 
 Version arithmetic belongs in `tools/next_version.py`, where it is unit-tested,
 never in a workflow step. hate_crack carried ~70 lines of `cut -d.` duplicated
@@ -1518,7 +1652,12 @@ checkout) reports the latest release but never claims an update is available.
 
 - [ ] **Step 3: Verify the docs match reality**
 
-Re-read both edits against the code as it now stands. Every flag named must exist, every default stated must be the actual default, every line number or path referenced must resolve. Check specifically that `--version`, `--check-update`, and `check_for_updates` are spelled exactly as implemented in Tasks 4 and 5.
+Re-read both edits against the code as it now stands. Every flag named must
+exist, every default stated must be the actual default, every path referenced
+must resolve, and no workflow file is named that does not exist. Check
+specifically that `--version`, `--check-update`, and `check_for_updates` are
+spelled exactly as implemented in Tasks 4 and 5, and that the `needs` list
+quoted above matches `ci.yml` exactly.
 
 - [ ] **Step 4: Final full verification**
 
@@ -1528,10 +1667,14 @@ uv run pytest tests/ -q
 uv run --frozen ruff check spoonmap.py tests/ tools/
 uv run --frozen bandit -r spoonmap.py -c pyproject.toml -b .bandit-baseline.json
 uv lock --check
-uvx actionlint .github/workflows/*.yml
+uvx --from "actionlint-py==1.7.12.24" actionlint > /tmp/al.out 2>&1; echo "actionlint exit=$?"
+uvx zizmor==1.29.0 --persona=regular .github/workflows/ > /tmp/zz.out 2>&1; echo "zizmor exit=$?"
 git status --short
 ```
-Expected: suite green at or above 95% coverage, lint and SAST clean, lock current, workflows valid, no unintended files.
+Expected: suite green at or above 95% coverage, lint and SAST clean, lock
+current, both workflow linters exiting 0, no unintended files. Capture each exit
+code on its own line as shown — a pipeline would report the exit status of the
+last command in the pipe, not the linter's.
 
 - [ ] **Step 5: Commit**
 
@@ -1539,14 +1682,17 @@ Expected: suite green at or above 95% coverage, lint and SAST clean, lock curren
 git add README.md CLAUDE.md
 git commit -m "docs: document release versioning and opt-in update checking
 
-Records the four things in this setup that fail silently rather than
-loudly -- the nightly CI trigger, nightly-tag.yml having to live on main,
-fetch-depth on three jobs, and the persist-credentials exception -- since
-each one produces no error, just tags that quietly stop appearing."
+Records what fails silently rather than loudly -- the nightly CI trigger,
+the tag job's needs list, fetch-depth on two jobs, and the
+persist-credentials exception -- since each produces no error, just tags
+that quietly stop appearing or appear wrong.
+
+Also records why tagging is a needs-gated job rather than a workflow_run
+workflow, so the rejected design is not reintroduced by someone reading
+the upstream project it was ported from."
 ```
 
 ---
-
 ## Post-Implementation Notes
 
 Two consequences to expect on the first real run, both intended and both already
