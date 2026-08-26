@@ -613,80 +613,118 @@ def _target_entries(target_file):
         return None
 
 
-def _target_stamp_path(output_file):
-    """Sidecar path recording which targets *output_file* covered.
+def _coverage_record_path(output_file):
+    """Sidecar path recording what *output_file* covered.
 
     Deliberately not an .xml name: masscan_results/ is aggregated wholesale by
     _aggregate_result_dir(), which lists the directory rather than globbing, and
     _parse_result_xml() drops anything not ending in .xml.  So this file is
     invisible to every result consumer, exactly as portN.xml.failed is.
     """
-    return output_file + '.target'
+    return output_file + '.coverage'
 
 
-def _read_target_stamp(output_file):
-    """Return the target set recorded for *output_file*, or None if there is none."""
-    return _target_entries(_target_stamp_path(output_file))
+def _exclusion_entries(exclusions_file):
+    """Normalised exclusion set: empty when there is no exclusions file at all.
+
+    A falsy *exclusions_file* means "nothing was excluded", which is a real,
+    checkable state and not the same as an unreadable file (None) — the effective
+    scan target is `targets - exclusions`, so losing track of the second term
+    hides exactly as much as losing the first.
+    """
+    if not exclusions_file:
+        return set()
+    return _target_entries(exclusions_file)
 
 
-def _discard_target_stamp(output_file):
-    """Remove *output_file*'s coverage record, if any.
+def _read_coverage_record(output_file):
+    """Return ``{'targets': set, 'exclusions': set}`` for *output_file*, or None.
 
-    Used whenever a record cannot be written truthfully.  A record left behind
-    from an earlier, possibly narrower run would be applied to whatever output
-    sits there now, so the absent case (which the gate rejects) is the only safe
-    one.  Failure to remove is ignored: the gate reads the record and compares it,
-    so a stale record that cannot be deleted is caught there or not at all.
+    None covers absent, unreadable and malformed alike: all three mean "we cannot
+    say what this output covered", and the gate treats that as unusable rather
+    than guessing.
     """
     try:
-        os.remove(_target_stamp_path(output_file))
+        with open(_coverage_record_path(output_file), 'r', errors='replace') as fh:
+            data = json.load(fh)
+        return {'targets': set(data['targets']),
+                'exclusions': set(data['exclusions'])}
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+def _discard_coverage_record(output_file):
+    """Remove *output_file*'s coverage record, if any.
+
+    Called before a phase runs and on every path where a record cannot be written
+    truthfully.  A record left over from an earlier run would be applied to
+    whatever output sits there now, and if that earlier run covered *more* it
+    would validate a later, narrower output — so absent (which the gate rejects)
+    is the only safe state.  Failure to remove is ignored: there is nothing
+    better to do, and the gate still compares the record it finds.
+    """
+    try:
+        os.remove(_coverage_record_path(output_file))
     except OSError:
         pass
 
 
-def _stamp_target_coverage(output_file, target_file):
-    """Record which targets *output_file* covered.
+def _stamp_target_coverage(output_file, target_file, exclusions_file):
+    """Record what *output_file* actually covered: its targets and its exclusions.
 
     Call from success paths only, exactly as _EMPTY_RESULT_XML is stamped: a
     record written for a killed scan would assert coverage that never happened,
     which is worse than having none at all.
 
-    The full target list is stored rather than a digest of it, because the gate
-    needs to answer "did the cache cover everything this run would scan" — a
-    subset test — and a digest can only answer "was it exactly the same".  See
+    Both halves live in **one** file written by a single _atomic_write, not two
+    files written in sequence.  As two files, a KeyboardInterrupt between the
+    writes — routine during a scan, and a BaseException that an `except
+    Exception` handler does not catch — left a fresh target list beside a stale
+    exclusion list, and the gate accepted that pair as though the run had been
+    exclusion-free.  One file makes "both halves describe the same run" a
+    filesystem guarantee rather than a comment.  The lists are stored rather than
+    a digest of them because the gate compares by subset, not equality; see
     _resume_cache_usable().
 
-    Neither an unreadable target file nor a failed write raises.  The scan itself
-    already succeeded, so unwinding here would discard real results; the only
-    cost either way is that the next --resume redoes this phase.  Both failure
-    paths *delete* any existing record rather than leaving it: outputs are
-    rewritten in place across runs (and a failed nmap pass is renamed out of the
-    way by _quarantine_failed_output()), so a record that survives a failed write
-    would be read as describing output it never covered.
+    Neither an unreadable input nor a failed write raises on its own account: the
+    scan already succeeded, so unwinding here would discard real results, and the
+    only cost is that the next --resume redoes this phase.  Every failure path,
+    including an interrupt, first deletes any existing record — see
+    _discard_coverage_record() for why leaving one is worse than having none.
     """
-    entries = _target_entries(target_file)
-    if entries is None:
-        _discard_target_stamp(output_file)
+    targets = _target_entries(target_file)
+    exclusions = _exclusion_entries(exclusions_file)
+    unreadable = target_file if targets is None else (
+        exclusions_file if exclusions is None else None)
+    if unreadable is not None:
+        _discard_coverage_record(output_file)
         print(_COLOR_ERROR
-              + f'Warning: could not read {os.path.basename(target_file)} to record '
+              + f'Warning: could not read {os.path.basename(unreadable)} to record '
                 f'what {os.path.basename(output_file)} covered; a --resume will '
                 're-run this phase rather than trust it.'
               + _COLOR_RESET)
         return
+    body = json.dumps({'targets': sorted(targets),
+                       'exclusions': sorted(exclusions)}, indent=1) + '\n'
     try:
-        _atomic_write(_target_stamp_path(output_file),
-                      ''.join(entry + '\n' for entry in sorted(entries)))
+        _atomic_write(_coverage_record_path(output_file), body)
     except Exception as e:
-        _discard_target_stamp(output_file)
+        _discard_coverage_record(output_file)
         print(_COLOR_ERROR
               + f'Warning: could not record the target set for '
                 f'{os.path.basename(output_file)} ({e}); a --resume will re-run '
                 'this phase rather than trust it.'
               + _COLOR_RESET)
+    except BaseException:
+        # An interrupt mid-write leaves _atomic_write's temp file unrenamed, so
+        # the *previous* record survives — next to output this run just replaced.
+        # Drop it, then let the interrupt continue unwinding.
+        _discard_coverage_record(output_file)
+        raise
 
 
-def _resume_cache_usable(output_file, baseline_mtime, description, target_file,
-                         is_xml=True):
+def _resume_cache_usable(output_file, baseline_mtime, description, *,
+                         target_file, exclusions_file, is_xml=True):
     """True when cached *output_file* may satisfy a resume gate.
 
     Existence plus freshness is not enough.  A scan that was killed, or that
@@ -701,54 +739,85 @@ def _resume_cache_usable(output_file, baseline_mtime, description, target_file,
     list edited after the cache was written must force the work to be redone.
     Pass 0 for gates with no target-file baseline.
 
-    *target_file* is the file this run would hand to masscan/nmap as -iL, and is
-    required rather than defaulting: every phase whose target is discovery-derived
-    must be checked, and an easily-omitted keyword had already cost that check at
-    two of three call sites that left it out.  Pass None only where the target
-    provably cannot change without the mtime baseline changing too, and say why.
+    *target_file* and *exclusions_file* are what this run would hand to
+    masscan/nmap as -iL and --excludefile.  Both are keyword-only and neither has
+    a default, so omitting one is a TypeError rather than a silently skipped
+    check — an earlier optional-keyword form had already cost this at two of the
+    three call sites that left it out.  *exclusions_file* may be None for a phase
+    that passes no --excludefile; *target_file* may not, because every phase
+    scans something.
 
-    An mtime cannot stand in for this check: it records *when* a file changed, not
-    *what the cached scan covered*, so switching host discovery off — which widens
-    the target from the discovery file to the whole range while rewriting nothing —
-    left every cached phase satisfying its gate, reporting a narrow scan as a
-    complete wide one.
+    An mtime cannot stand in for either check: it records *when* a file changed,
+    not *what the cached scan covered*, so switching host discovery off — which
+    widens the target from the discovery file to the whole range while rewriting
+    nothing — left every cached phase satisfying its gate and reported a narrow
+    scan as a complete wide one.
 
-    The test is a **subset**, not equality: the cache is usable when everything
-    this run would scan was already covered.  Equality would reject a cache that
-    covered strictly more, and that is the common case, not a corner — the batch
-    phase's target is rebuilt every run from a probe that is deliberately not
-    resume-gated, and the iterative probe stops at the first port that finds
-    hosts, so which cached ports get folded in varies run to run.  Under equality
-    an ordinary difference in probe luck re-scanned every completed batch against
-    a *narrower* target than the cache it discarded, which is the opposite of what
-    --resume is for.
+    A phase's effective coverage is `targets - exclusions`, so the two halves are
+    compared in **opposite directions**:
+
+    - targets: usable when `current ⊆ stamped` — everything this run would scan
+      was already covered.  Equality would reject a cache that covered strictly
+      more, and that is the common case, not a corner: the batch phase's target is
+      rebuilt every run from a probe that is deliberately not resume-gated, and
+      the iterative probe stops at the first port that finds hosts, so which
+      cached ports get folded in varies run to run.  Under equality an ordinary
+      difference in probe luck re-scanned every completed batch against a
+      *narrower* target than the cache it discarded, i.e. --resume stopped
+      resuming.
+    - exclusions: usable when `current ⊇ stamped`.  Excluding *more* now means a
+      strictly smaller scan set, which the cache still covers.  Excluding
+      *fewer* — narrowing exclusions.txt because a host was cleared for testing —
+      brings something previously skipped into scope, and nothing else about the
+      run changes, so this is the only signal that it must be re-scanned.
+
+    Both comparisons are over normalised **lines**, not addresses.  `10.0.0.0/24`
+    and an explicit list of its hosts are different entries even though they scan
+    the same range, and an exclusion removed from a range the targets never
+    covered still forces a re-scan.  Deliberate: line comparison cannot
+    over-accept, only over-scan, whereas address-set arithmetic would import the
+    whole parsing surface (and its failure modes) into a resume gate.
     """
     if not os.path.exists(output_file):
         return False
     if _safe_mtime(output_file) < baseline_mtime:
         return False
-    if target_file is not None:
-        current = _target_entries(target_file)
-        if current is None:
-            print(_COLOR_INFO + f're-running {description}: this run\'s target '
-                                f'file ({os.path.basename(target_file)}) could not '
-                                'be read, so the cache cannot be trusted'
-                  + _COLOR_RESET)
-            return False
-        stamped = _read_target_stamp(output_file)
-        if stamped is None:
-            print(_COLOR_INFO + f're-running {description}: cached result does '
-                                'not record which targets it covered'
-                  + _COLOR_RESET)
-            return False
-        uncovered = current - stamped
-        if uncovered:
-            examples = ', '.join(sorted(uncovered)[:3])
+    # Both halves of "what would this run scan" have to be readable before the
+    # cache can be judged at all; an unreadable input is not evidence the cache
+    # is fine.
+    current_targets = _target_entries(target_file)
+    current_exclusions = _exclusion_entries(exclusions_file)
+    for label, value, name in (('target', current_targets, target_file),
+                               ('exclusions', current_exclusions, exclusions_file)):
+        if value is None:
             print(_COLOR_INFO
-                  + f're-running {description}: {len(uncovered)} target(s) in this '
-                    f'run were not covered by the cached result (e.g. {examples})'
-                  + _COLOR_RESET)
+                  + f're-running {description}: this run\'s {label} file '
+                    f'({os.path.basename(name)}) could not be read, so the '
+                    'cache cannot be trusted' + _COLOR_RESET)
             return False
+    record = _read_coverage_record(output_file)
+    if record is None:
+        print(_COLOR_INFO + f're-running {description}: cached result does not '
+                            'record what it covered' + _COLOR_RESET)
+        return False
+    uncovered = current_targets - record['targets']
+    if uncovered:
+        examples = ', '.join(sorted(uncovered)[:3])
+        print(_COLOR_INFO
+              + f're-running {description}: {len(uncovered)} target(s) in this run '
+                f'were not covered by the cached result (e.g. {examples})'
+              + _COLOR_RESET)
+        return False
+    unexcluded = record['exclusions'] - current_exclusions
+    if unexcluded:
+        examples = ', '.join(sorted(unexcluded)[:3])
+        noun = 'entry' if len(unexcluded) == 1 else 'entries'
+        print(_COLOR_INFO
+              + f're-running {description}: {len(unexcluded)} {noun} excluded when '
+                f'the cache was written {"is" if len(unexcluded) == 1 else "are"} '
+                f'now in scope (e.g. {examples})'
+              + _COLOR_RESET)
+        return False
     if is_xml:
         usable = _parse_result_xml(output_file) is not None
     else:
@@ -1105,17 +1174,25 @@ def _host_discovery(target_file, output_path, max_rate, exclusions_file,
     # If the target set changed since the cache was written, re-discover so
     # newly added ranges are not silently skipped.
     targets_mtime = _safe_mtime(target_file)
-    # target_file=None: this phase's target *is* the mtime baseline.  target_file
-    # here is resolved_targets.txt, written through _write_if_changed(), so an
-    # mtime bump and a content change are already equivalent and a stamp would
-    # add nothing.  (The exclusions file is a separate, still-uncovered input —
-    # see the Resume target coverage notes in CLAUDE.md.)
+    # Coverage-checked like every other phase.  The mtime baseline on
+    # resolved_targets.txt covers the targets half on its own (_write_if_changed()
+    # makes an mtime bump and a content change equivalent there), but not the
+    # exclusions half: this phase's real target is the exclusion-subtracted
+    # filtered_target below, so narrowing exclusions.txt changes what it scans
+    # while leaving resolved_targets.txt untouched.
     if resume and _resume_cache_usable(discovery_file, targets_mtime,
-                                       'host discovery', None, is_xml=False):
+                                       'host discovery',
+                                       target_file=target_file,
+                                       exclusions_file=exclusions_file,
+                                       is_xml=False):
         with open(discovery_file) as fh:
             count = sum(1 for line in fh if line.strip())
         print(_COLOR_INFO + f'Resume: skipping host discovery ({count} hosts cached)' + _COLOR_RESET)
         return discovery_file
+
+    # Any prior record describes output this run is about to replace; see
+    # _run_masscan_batch() for why it must go before the scan, not after.
+    _discard_coverage_record(discovery_file)
 
     # Pre-subtract exclusions so masscan's permutation only covers actual targets.
     # Without this, masscan iterates over the full target range at the configured
@@ -1150,6 +1227,12 @@ def _host_discovery(target_file, output_path, max_rate, exclusions_file,
     with open(discovery_file, 'w') as fh:
         for ip in sorted(live_ips, key=_ip_sort_key):
             fh.write(ip + '\n')
+
+    # Success path only: the 0-live-hosts case returns above without a record, as
+    # do the interrupts inside the sweeps.  Recorded against target_file and
+    # exclusions_file rather than the pre-filtered filtered_target, because those
+    # two are what the gate can re-derive on the next run.
+    _stamp_target_coverage(discovery_file, target_file, exclusions_file)
 
     return discovery_file
 
@@ -1217,6 +1300,11 @@ def _nmap_host_discovery(target_file, disc, source_port, exclusions_file):
 
 def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclusions_file, wait_secs=2):
     """Run masscan for one batch and return {port_key: set_of_ips}."""
+    # Drop any prior coverage record before overwriting the output it describes.
+    # Without this, a run killed by SIGKILL (or anything else that never reaches
+    # the stamp) would leave the previous run's record beside brand-new output —
+    # and if that record covered more, it would validate the narrower result.
+    _discard_coverage_record(output_file)
     masscan_cmd = [
         'masscan',
         '-p', ','.join(batch),
@@ -1287,7 +1375,7 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
     # early returns below.  Only the success path reaches here, which is the
     # whole point: a stamp on a killed batch would let the next --resume treat a
     # partial scan as covering the current targets.
-    _stamp_target_coverage(output_file, target_file)
+    _stamp_target_coverage(output_file, target_file, exclusions_file)
 
     # masscan writes nothing at all to -oX when a batch finds no open ports, so
     # "ran to completion, found nothing" and "was killed before writing" both
@@ -1438,12 +1526,17 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
     targets_mtime = _safe_mtime(target_file)
     if resume and _resume_cache_usable(output_file, targets_mtime,
                                        f'UDP port {port_num} discovery',
-                                       target_file):
+                                       target_file=target_file,
+                                       exclusions_file=exclusions_file):
         live_file = f'{_disc(output_path)}/live_hosts/port{_port_fname(udp_port)}.txt'
         if os.path.exists(live_file):
             with open(live_file) as fh:
                 return {line.strip() for line in fh if line.strip()}
         return set()
+
+    # Any prior record describes output this run is about to replace; see
+    # _run_masscan_batch() for why it must go before the scan, not after.
+    _discard_coverage_record(output_file)
 
     cmd = [
         'nmap', '-T4', '-sU', '-Pn',
@@ -1494,7 +1587,7 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
     # An interrupt re-raises and a missing nmap returns above, so neither is
     # stamped either.
     if proc.returncode == 0:
-        _stamp_target_coverage(output_file, target_file)
+        _stamp_target_coverage(output_file, target_file, exclusions_file)
     try:
         root = etree.parse(output_file)
         for host in root.findall('host'):
@@ -1567,7 +1660,8 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
     # usable results, reload from live_hosts/
     if resume and _resume_cache_usable(output_file, targets_mtime,
                                        'nmap port discovery',
-                                       target_file):
+                                       target_file=target_file,
+                                       exclusions_file=exclusions_file):
         print(_COLOR_INFO + 'Resume: skipping completed nmap port discovery' + _COLOR_RESET)
         live_hosts_dir = f'{disc}/live_hosts'
         if os.path.exists(live_hosts_dir):
@@ -1589,6 +1683,10 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
         port_spec = '1-65535'
     else:
         port_spec = ','.join(dest_ports)
+    # Any prior record describes output this run is about to replace; see
+    # _run_masscan_batch() for why it must go before the scan, not after.
+    _discard_coverage_record(output_file)
+
     scan_flags = ['-sS']
 
     try:
@@ -1686,7 +1784,7 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
     # Past the returncode check, so this is a clean nmap exit with output on
     # disk: record which targets it covered.  A non-zero exit, a missing nmap and
     # an interrupt all return or re-raise above and leave no stamp.
-    _stamp_target_coverage(output_file, target_file)
+    _stamp_target_coverage(output_file, target_file, exclusions_file)
 
     results = {}
     try:
@@ -1809,7 +1907,8 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         full_targets_mtime = _safe_mtime(full_targets_file)
         if resume and _resume_cache_usable(output_file, full_targets_mtime,
                                           'Full port scan',
-                                          discovered_target):
+                                          target_file=discovered_target,
+                                          exclusions_file=exclusions_file):
             print(_COLOR_INFO + 'Resume: skipping completed Full port scan' + _COLOR_RESET)
             live_hosts_dir = f'{disc}/live_hosts'
             full_results = {}
@@ -2104,7 +2203,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         if resume and _resume_cache_usable(
                 output_file, targets_mtime,
                 f'batch {batch_idx + 1}/{total_batches} ({batch_label})',
-                batch_target):
+                target_file=batch_target, exclusions_file=exclusions_file):
             print(_COLOR_INFO +
                   f'Resume: skipping completed batch {batch_idx + 1}/{total_batches} '
                   f'({batch_label})' + _COLOR_RESET)
@@ -2423,6 +2522,10 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 dest_port, input_file, output_file, source_port,
                 script_scan=script_scan, target_scan=target_scan,
             )
+            # Prior record goes before the scan that replaces its output, so an
+            # externally killed nmap cannot leave a record claiming coverage of
+            # whatever this pass writes.
+            _discard_coverage_record(output_file)
 
             try:
                 with lock:
@@ -2480,12 +2583,13 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                         _report_nmap_failure('banner scan', dest_port, nmap_process,
                                              ''.join(nmap_err_lines), output_file)
                     else:
-                        # Success: record which hosts this pass covered.  Keyed to
-                        # the IP list, not the hostname variant that may have been
-                        # the actual -iL, so it matches what nmap_scan()'s gate
-                        # checks.  Failure paths above quarantine instead, and an
-                        # interrupt falls through without stamping.
-                        _stamp_target_coverage(output_file, ip_list_file)
+                        # Keyed to the IP list, not the hostname variant that may
+                        # have been the actual -iL, so it matches what
+                        # nmap_scan()'s gate checks.  Under `lock` because it can
+                        # print a warning, and an unlocked print from a worker
+                        # interleaves mid-line with the others.
+                        with lock:
+                            _stamp_target_coverage(output_file, ip_list_file, None)
                         with lock:
                             completed_count[0] += 1
                             _print_completion_status(
@@ -2505,6 +2609,7 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                             script_scan=True, target_scan=target_scan,
                             script_only=True,
                         )
+                        _discard_coverage_record(nse_output)
                         nse_process = subprocess.Popen(
                             nse_cmd,
                             stdout=subprocess.DEVNULL,
@@ -2532,7 +2637,8 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                             # have their own outputs and their own resume gate, so
                             # one succeeding says nothing about the other.  An
                             # interrupt leaves no record either way.
-                            _stamp_target_coverage(nse_output, ip_list_file)
+                            with lock:
+                                _stamp_target_coverage(nse_output, ip_list_file, None)
 
             except FileNotFoundError:
                 with lock:
@@ -2606,12 +2712,14 @@ def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
             live_list = f'{live_hosts_dir}/{host_file}'
             banner_done = _resume_cache_usable(
                 f'{output_path}/nmap_results/port{_port_fname(dest_port)}.xml',
-                0, f'port {dest_port} banner scan', live_list)
+                0, f'port {dest_port} banner scan',
+                target_file=live_list, exclusions_file=None)
             scripts_exist = _get_scripts_for_port(dest_port, target_scan)
             script_done = (not script_scan or not scripts_exist or
                            _resume_cache_usable(
                                f'{output_path}/nse_results/port{_port_fname(dest_port)}.xml',
-                               0, f'port {dest_port} NSE scan', live_list))
+                               0, f'port {dest_port} NSE scan',
+                               target_file=live_list, exclusions_file=None))
             if not (banner_done and script_done):
                 files_to_scan.append(host_file)
 

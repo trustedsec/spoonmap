@@ -135,7 +135,7 @@ def _write_target_stamp(output_file, target_file):
     into a dozen failures with an opaque "cache was rejected" symptom.  The
     format and its normalisation are pinned directly by TestTargetEntries.
     """
-    spoonmap._stamp_target_coverage(str(output_file), str(target_file))
+    spoonmap._stamp_target_coverage(str(output_file), str(target_file), None)
 
 
 # ── small platform/utility helpers ─────────────────────────────────────────────
@@ -3134,53 +3134,89 @@ class TestSafeSize:
 
 
 class TestResumeCacheUsable:
+    """The content/freshness predicates, isolated from the coverage check.
+
+    Every case here supplies a real target file and a matching coverage record,
+    so a rejection can only come from the condition the test is named for.  Left
+    unstamped, the gate would reject everything for a missing record and the
+    "is usable" cases would be untestable.
+    """
+
+    def _target(self, tmp_path):
+        t = tmp_path / 'targets.txt'
+        t.write_text('10.0.0.1\n')
+        return t
+
     def test_missing_output_is_not_usable(self, tmp_path):
-        assert _resume_cache_usable(str(tmp_path / 'none.xml'), 0, 'thing', None) is False
+        t = self._target(tmp_path)
+        assert _resume_cache_usable(str(tmp_path / 'none.xml'), 0, 'thing',
+                                    target_file=str(t), exclusions_file=None) is False
 
     def test_fresh_parseable_xml_is_usable(self, tmp_path):
+        t = self._target(tmp_path)
         p = tmp_path / 'out.xml'
         p.write_text('<nmaprun/>')
+        _write_target_stamp(p, t)
         os.utime(str(p), (2000, 2000))
-        assert _resume_cache_usable(str(p), 1000, 'thing', None) is True
+        assert _resume_cache_usable(str(p), 1000, 'thing',
+                                    target_file=str(t), exclusions_file=None) is True
 
     def test_stale_xml_is_not_usable(self, tmp_path, capsys):
+        t = self._target(tmp_path)
         p = tmp_path / 'out.xml'
         p.write_text('<nmaprun/>')
+        _write_target_stamp(p, t)
         os.utime(str(p), (1000, 1000))
-        assert _resume_cache_usable(str(p), 2000, 'thing', None) is False
+        assert _resume_cache_usable(str(p), 2000, 'thing',
+                                    target_file=str(t), exclusions_file=None) is False
         # Staleness is not an "unusable content" condition — no content warning.
         assert 'cached result was empty' not in capsys.readouterr().out
 
     def test_zero_length_xml_is_not_usable(self, tmp_path, capsys):
+        t = self._target(tmp_path)
         p = tmp_path / 'out.xml'
         p.write_text('')
-        assert _resume_cache_usable(str(p), 0, 'port 445 discovery', None) is False
+        _write_target_stamp(p, t)
+        assert _resume_cache_usable(str(p), 0, 'port 445 discovery',
+                                    target_file=str(t), exclusions_file=None) is False
         assert 're-running port 445 discovery' in capsys.readouterr().out
 
     def test_unparseable_xml_is_not_usable(self, tmp_path, capsys):
+        t = self._target(tmp_path)
         p = tmp_path / 'out.xml'
         p.write_text('<nmaprun><host>')  # unclosed tags
-        assert _resume_cache_usable(str(p), 0, 'port 445 discovery', None) is False
+        _write_target_stamp(p, t)
+        assert _resume_cache_usable(str(p), 0, 'port 445 discovery',
+                                    target_file=str(t), exclusions_file=None) is False
         assert 'cached result was empty' in capsys.readouterr().out
 
     def test_nonempty_text_output_is_usable(self, tmp_path):
+        t = self._target(tmp_path)
         p = tmp_path / 'hosts.txt'
         p.write_text('10.0.0.1\n')
-        assert _resume_cache_usable(str(p), 0, 'thing', None, is_xml=False) is True
+        _write_target_stamp(p, t)
+        assert _resume_cache_usable(str(p), 0, 'thing', target_file=str(t),
+                                    exclusions_file=None, is_xml=False) is True
 
     def test_empty_text_output_is_not_usable(self, tmp_path, capsys):
+        t = self._target(tmp_path)
         p = tmp_path / 'hosts.txt'
         p.write_text('')
-        assert _resume_cache_usable(str(p), 0, 'host discovery', None, is_xml=False) is False
+        _write_target_stamp(p, t)
+        assert _resume_cache_usable(str(p), 0, 'host discovery', target_file=str(t),
+                                    exclusions_file=None, is_xml=False) is False
         assert 're-running host discovery' in capsys.readouterr().out
 
     def test_text_predicate_not_applied_as_xml(self, tmp_path):
         # A .txt host list would always fail _parse_result_xml's suffix check;
         # is_xml=False must use the non-empty predicate instead.
+        t = self._target(tmp_path)
         p = tmp_path / 'hosts.txt'
         p.write_text('10.0.0.1\n')
+        _write_target_stamp(p, t)
         assert _parse_result_xml(str(p)) is None
-        assert _resume_cache_usable(str(p), 0, 'thing', None, is_xml=False) is True
+        assert _resume_cache_usable(str(p), 0, 'thing', target_file=str(t),
+                                    exclusions_file=None, is_xml=False) is True
 
 
 class TestWriteIfChanged:
@@ -3275,6 +3311,7 @@ class TestHostDiscoveryResumeFreshness:
         target.write_text('10.0.0.1\n')
         cache = disc / 'live_hosts_discovery.txt'
         cache.write_text('10.0.0.1\n')
+        _write_target_stamp(cache, target)
         return out, target, cache
 
     def test_fresh_cache_is_reused(self, tmp_path, capsys):
@@ -6372,16 +6409,25 @@ class TestQuarantineFailedOutput:
     def test_existing_output_is_renamed_and_rejected_by_the_resume_gate(self, tmp_path):
         # A failed nmap can still leave a valid, hostless XML: parseable, so the
         # gate accepted it and the port was never re-scanned.
+        target = tmp_path / 'hosts.txt'
+        target.write_text('10.0.0.1\n')
         out = tmp_path / 'port80.xml'
         out.write_text('<nmaprun/>')
-        assert _resume_cache_usable(str(out), 0, 'port 80 banner scan', None) is True
+        _write_target_stamp(out, target)
+        assert _resume_cache_usable(str(out), 0, 'port 80 banner scan',
+                                    target_file=str(target),
+                                    exclusions_file=None) is True
 
         failed = _quarantine_failed_output(str(out))
 
         assert failed == str(out) + '.failed'
         assert not out.exists()
         assert (tmp_path / 'port80.xml.failed').read_text() == '<nmaprun/>'
-        assert _resume_cache_usable(str(out), 0, 'port 80 banner scan', None) is False
+        # Rejected on the output's absence, even though its coverage record
+        # survives the rename — the gate tests existence first.
+        assert _resume_cache_usable(str(out), 0, 'port 80 banner scan',
+                                    target_file=str(target),
+                                    exclusions_file=None) is False
 
     def test_quarantined_name_is_invisible_to_result_parsing(self, tmp_path):
         # The suffix must not end in .xml, or aggregation would pick the failed
@@ -6747,7 +6793,10 @@ class TestNmapWorker:
         banner_xml = f'{tmp_path}/nmap_results/port80.xml'
         assert not os.path.exists(banner_xml)
         assert Path(banner_xml + '.failed').read_text() == '<nmaprun/>'
-        assert _resume_cache_usable(banner_xml, 0, 'port 80 banner scan', None) is False
+        assert _resume_cache_usable(
+            banner_xml, 0, 'port 80 banner scan',
+            target_file=f'{tmp_path}/discovery/live_hosts/port80.txt',
+            exclusions_file=None) is False
         out = capsys.readouterr().out
         assert 'WILL be re-scanned on resume' in out
         assert 'port80.xml.failed' in out
@@ -8627,6 +8676,10 @@ class TestRunMasscanBatchBehavior:
         honestly-empty batch instead of redoing it on every resume.
         """
         output_xml = tmp_path / 'out.xml'
+        # A readable target file, so the batch's own coverage record is written
+        # and the gate below turns on the placeholder, not a missing record.
+        targets = tmp_path / 'targets.txt'
+        targets.write_text('10.0.0.1\n')
 
         def fake_popen(cmd, **kwargs):
             output_xml.write_text('')  # masscan found nothing
@@ -8636,12 +8689,14 @@ class TestRunMasscanBatchBehavior:
              patch('spoonmap.save_terminal_state', return_value=None), \
              patch('spoonmap.restore_terminal_state'):
             results = _run_masscan_batch(['445'], '1000', str(output_xml),
-                                         '/fake/targets.txt', None, None)
+                                         str(targets), None, None)
 
         assert results == {}
         # Still reads as "no results" downstream, but now as usable output.
         assert _parse_result_xml(str(output_xml)).findall('host') == []
-        assert _resume_cache_usable(str(output_xml), 0, 'batch 1/1 (445)', None) is True
+        assert _resume_cache_usable(str(output_xml), 0, 'batch 1/1 (445)',
+                                    target_file=str(targets),
+                                    exclusions_file=None) is True
 
     def test_placeholder_write_leaves_no_temp_file(self, tmp_path):
         """The placeholder goes through _atomic_write, so no .tmp is left behind."""
@@ -8662,6 +8717,8 @@ class TestRunMasscanBatchBehavior:
     def test_nonzero_exit_leaves_empty_output_empty(self, tmp_path):
         """A failed run must NOT be stamped — that would cache the failure."""
         output_xml = tmp_path / 'out.xml'
+        targets = tmp_path / 'targets.txt'
+        targets.write_text('10.0.0.1\n')
 
         def fake_popen(cmd, **kwargs):
             output_xml.write_text('')
@@ -8672,10 +8729,13 @@ class TestRunMasscanBatchBehavior:
              patch('spoonmap.restore_terminal_state'):
             with pytest.raises(SystemExit):
                 _run_masscan_batch(['445'], '1000', str(output_xml),
-                                   '/fake/targets.txt', None, None)
+                                   str(targets), None, None)
 
         assert output_xml.read_text() == ''
-        assert _resume_cache_usable(str(output_xml), 0, 'batch 1/1 (445)', None) is False
+        assert not Path(str(output_xml) + '.coverage').exists()
+        assert _resume_cache_usable(str(output_xml), 0, 'batch 1/1 (445)',
+                                    target_file=str(targets),
+                                    exclusions_file=None) is False
 
     def test_interrupt_leaves_empty_output_empty(self, tmp_path):
         """Same for a Ctrl-C: the batch did not complete, so no placeholder."""
@@ -11389,8 +11449,8 @@ class TestResumeTargetStamp:
 
     def test_identical_target_accepts_cache(self, tmp_path):
         target, output = self._cached(tmp_path)
-        spoonmap._stamp_target_coverage(str(output), str(target))
-        assert spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
+        spoonmap._stamp_target_coverage(str(output), str(target), None)
+        assert spoonmap._resume_cache_usable(str(output), 0, 'phase', target_file=str(target), exclusions_file=None)
 
     def test_cache_covering_a_superset_is_accepted(self, tmp_path, capsys):
         """The load-bearing case: equality here made --resume thrash.
@@ -11402,16 +11462,16 @@ class TestResumeTargetStamp:
         one, which is the opposite of what --resume is for.
         """
         target, output = self._cached(tmp_path, '10.0.0.1\n10.0.0.2\n10.0.0.3\n')
-        spoonmap._stamp_target_coverage(str(output), str(target))
+        spoonmap._stamp_target_coverage(str(output), str(target), None)
         target.write_text('10.0.0.2\n')
-        assert spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
+        assert spoonmap._resume_cache_usable(str(output), 0, 'phase', target_file=str(target), exclusions_file=None)
         assert 're-running' not in capsys.readouterr().out
 
     def test_a_single_uncovered_target_rejects_cache(self, tmp_path, capsys):
         target, output = self._cached(tmp_path, '10.0.0.1\n')
-        spoonmap._stamp_target_coverage(str(output), str(target))
+        spoonmap._stamp_target_coverage(str(output), str(target), None)
         target.write_text('10.0.0.1\n10.0.0.9\n')   # scope widened
-        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase', target_file=str(target), exclusions_file=None)
         out = capsys.readouterr().out
         assert '1 target(s) in this run were not covered' in out
         assert '10.0.0.9' in out, 'the message must name what forced the re-scan'
@@ -11420,81 +11480,52 @@ class TestResumeTargetStamp:
         # Output from before stamping existed: one redundant re-scan is the safe
         # direction, a silently narrow result is not.
         target, output = self._cached(tmp_path)
-        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
-        assert 'does not record which targets' in capsys.readouterr().out
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase', target_file=str(target), exclusions_file=None)
+        assert 'does not record what it covered' in capsys.readouterr().out
 
     def test_unreadable_current_target_rejects_with_its_own_reason(self, tmp_path, capsys):
         target, output = self._cached(tmp_path)
-        spoonmap._stamp_target_coverage(str(output), str(target))
+        spoonmap._stamp_target_coverage(str(output), str(target), None)
         target.unlink()
-        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase', target_file=str(target), exclusions_file=None)
         # Distinct from a coverage mismatch: the cache may well be fine.
         assert 'could not be read' in capsys.readouterr().out
 
     def test_reordered_target_file_still_accepts_cache(self, tmp_path):
         target, output = self._cached(tmp_path, '10.0.0.1\n10.0.0.2\n')
-        spoonmap._stamp_target_coverage(str(output), str(target))
+        spoonmap._stamp_target_coverage(str(output), str(target), None)
         target.write_text('10.0.0.2\n10.0.0.1\n')
-        assert spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
+        assert spoonmap._resume_cache_usable(str(output), 0, 'phase', target_file=str(target), exclusions_file=None)
 
-    def test_gate_with_target_none_skips_the_coverage_check(self, tmp_path):
-        # _host_discovery() and nmap_scan()'s gates pass None deliberately.
-        _target, output = self._cached(tmp_path)
-        assert spoonmap._resume_cache_usable(str(output), 0, 'phase', None)
+    def test_exclusions_none_is_a_supported_shape(self, tmp_path):
+        # nmap_scan()'s two passes pass exclusions_file=None: they add no
+        # --excludefile at all.  target_file has no such escape — every phase
+        # scans something, so there is no caller that may omit it.
+        target, output = self._cached(tmp_path)
+        spoonmap._stamp_target_coverage(str(output), str(target), None)
+        assert spoonmap._resume_cache_usable(str(output), 0, 'phase',
+                                             target_file=str(target),
+                                             exclusions_file=None)
 
     def test_unreadable_target_warns_instead_of_stamping(self, tmp_path, capsys):
         _target, output = self._cached(tmp_path)
-        spoonmap._stamp_target_coverage(str(output), str(tmp_path / 'absent.txt'))
-        assert not os.path.exists(str(output) + '.target')
+        spoonmap._stamp_target_coverage(str(output), str(tmp_path / 'absent.txt'), None)
+        assert not os.path.exists(str(output) + '.coverage')
         assert 'could not read' in capsys.readouterr().out
 
     def test_stamp_write_failure_warns_instead_of_raising(self, tmp_path, capsys):
         # The scan already succeeded; raising here would discard real results.
         target, output = self._cached(tmp_path)
         with patch('spoonmap._atomic_write', side_effect=OSError('ENOSPC')):
-            spoonmap._stamp_target_coverage(str(output), str(target))
+            spoonmap._stamp_target_coverage(str(output), str(target), None)
         assert 'could not record the target set' in capsys.readouterr().out
 
     def test_orphaned_stamp_without_its_output_is_harmless(self, tmp_path):
         target, output = self._cached(tmp_path)
-        spoonmap._stamp_target_coverage(str(output), str(target))
+        spoonmap._stamp_target_coverage(str(output), str(target), None)
         output.unlink()
-        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase', target_file=str(target), exclusions_file=None)
 
-    def test_cleanup_removes_the_stamp_sidecars(self, tmp_path):
-        # They live under discovery/, which _delete_previous_results() rmtrees;
-        # pin that rather than rediscovering it the next time the layout moves.
-        disc = tmp_path / 'discovery' / 'masscan_results'
-        disc.mkdir(parents=True)
-        target = tmp_path / 'targets.txt'
-        target.write_text('10.0.0.1\n')
-        output = disc / 'portFull.xml'
-        output.write_text('<nmaprun/>')
-        spoonmap._stamp_target_coverage(str(output), str(target))
-        assert (disc / 'portFull.xml.target').exists()
-        spoonmap._delete_previous_results(str(tmp_path))
-        assert not (tmp_path / 'discovery').exists()
-
-    def test_stamp_sidecar_is_invisible_to_result_aggregation(self, tmp_path):
-        # masscan_results/ is aggregated by listing the directory, so a sidecar
-        # that parsed as a result file would corrupt spoonmap_output.*.
-        result_dir = tmp_path / 'masscan_results'
-        result_dir.mkdir()
-        xml = result_dir / 'portFull.xml'
-        xml.write_text(
-            '<?xml version="1.0"?><nmaprun><host>'
-            '<address addr="10.0.0.1" addrtype="ipv4"/>'
-            '<ports><port protocol="tcp" portid="80">'
-            '<state state="open"/></port></ports>'
-            '</host></nmaprun>'
-        )
-        target = tmp_path / 'targets.txt'
-        target.write_text('10.0.0.1\n')
-        spoonmap._stamp_target_coverage(str(xml), str(target))
-        assert (result_dir / 'portFull.xml.target').exists()
-        hosts_json, xml_hosts = spoonmap._aggregate_result_dir(str(result_dir) + '/', {})
-        assert [h['ip'] for h in hosts_json] == ['10.0.0.1']
-        assert set(xml_hosts) == {'10.0.0.1'}
 
 
 class TestResumeTargetStampIntegration:
@@ -11512,7 +11543,7 @@ class TestResumeTargetStampIntegration:
 
         def fake_batch(batch, rate, output_file, target_file, *a, **kw):
             Path(output_file).write_text('<nmaprun/>')
-            spoonmap._stamp_target_coverage(output_file, target_file)
+            spoonmap._stamp_target_coverage(output_file, target_file, None)
             return {'22': {'10.0.0.1'}}
 
         with patch('spoonmap._run_masscan_batch', side_effect=fake_batch):
@@ -11569,7 +11600,7 @@ class TestResumeTargetStampIntegration:
             with pytest.raises(KeyboardInterrupt):
                 spoonmap._run_masscan_batch(['80'], '1000', output_file,
                                             str(targets), '', '')
-        assert not os.path.exists(output_file + '.target')
+        assert not os.path.exists(output_file + '.coverage')
 
     def test_failed_masscan_exit_leaves_no_stamp(self, tmp_path):
         """Same for a non-zero exit, which sys.exit()s before the stamp."""
@@ -11592,7 +11623,7 @@ class TestResumeTargetStampIntegration:
             with pytest.raises(SystemExit):
                 spoonmap._run_masscan_batch(['80'], '1000', output_file,
                                             str(targets), '', '')
-        assert not os.path.exists(output_file + '.target')
+        assert not os.path.exists(output_file + '.coverage')
 
     def test_successful_masscan_stamps_the_target_it_scanned(self, tmp_path):
         """The positive counterpart: a clean exit records its target set."""
@@ -11612,8 +11643,9 @@ class TestResumeTargetStampIntegration:
              patch('spoonmap.restore_terminal_state'):
             spoonmap._run_masscan_batch(['80'], '1000', output_file,
                                         str(targets), '', '')
-        stamp = Path(output_file + '.target')
-        assert set(stamp.read_text().split()) == spoonmap._target_entries(str(targets))
+        record = spoonmap._read_coverage_record(output_file)
+        assert record['targets'] == spoonmap._target_entries(str(targets))
+        assert record['exclusions'] == set()
 
 
 class TestResumeTargetStampBatchPhase:
@@ -11639,7 +11671,7 @@ class TestResumeTargetStampBatchPhase:
 
         def fake_batch(batch, rate, output_file, target_file, *a, **kw):
             Path(output_file).write_text('<nmaprun/>')
-            spoonmap._stamp_target_coverage(output_file, target_file)
+            spoonmap._stamp_target_coverage(output_file, target_file, None)
             if 'probe_fast' in output_file:
                 return {'80': set(probe_hits)}
             if 'probe_slow' in output_file:
@@ -11727,7 +11759,7 @@ class TestResumeTargetStampNmapDiscovery:
              patch('spoonmap.save_terminal_state', return_value=None), \
              patch('spoonmap.restore_terminal_state'):
             spoonmap._nmap_udp_discovery('U:53', str(target), str(tmp_path), '', None)
-        assert Path(str(xml) + '.target').read_text().split() == ['10.0.0.5']
+        assert spoonmap._read_coverage_record(str(xml))['targets'] == {'10.0.0.5'}
 
         # Same target → resume; widened target → re-scan.
         with patch('spoonmap.subprocess.Popen') as mock_popen:
@@ -11769,7 +11801,7 @@ class TestResumeTargetStampNmapDiscovery:
              patch('spoonmap.restore_terminal_state'):
             spoonmap._nmap_udp_discovery('U:53', str(target), str(tmp_path), '', None)
         assert xml.exists(), 'the partial result stays readable on disk'
-        assert not Path(str(xml) + '.target').exists()
+        assert not Path(str(xml) + '.coverage').exists()
 
     def test_port_discovery_stamps_on_success_then_resumes(self, tmp_path):
         disc = tmp_path / 'discovery'
@@ -11794,7 +11826,7 @@ class TestResumeTargetStampNmapDiscovery:
              patch('spoonmap.save_terminal_state', return_value=None), \
              patch('spoonmap.restore_terminal_state'):
             spoonmap._nmap_port_discovery(['80'], str(target), '', None)
-        assert Path(str(xml) + '.target').read_text().split() == ['10.0.0.1']
+        assert spoonmap._read_coverage_record(str(xml))['targets'] == {'10.0.0.1'}
 
         with patch('spoonmap.subprocess.Popen') as mock_popen, \
              patch('spoonmap.restore_terminal_state'):
@@ -11930,60 +11962,517 @@ class TestNmapWorkerTargetCoverage:
 
     def test_successful_banner_pass_records_its_coverage(self, tmp_path):
         self._run(tmp_path)
-        stamp = Path(f'{tmp_path}/nmap_results/port80.xml.target')
-        assert set(stamp.read_text().split()) == {'10.0.0.1', '10.0.0.2'}
+        record = spoonmap._read_coverage_record(f'{tmp_path}/nmap_results/port80.xml')
+        assert record['targets'] == {'10.0.0.1', '10.0.0.2'}
 
     def test_failed_banner_pass_records_nothing(self, tmp_path):
         # The failure path quarantines the XML; a coverage record left beside it
         # would be applied to whatever lands there next.
         self._run(tmp_path, returncode=1)
-        assert not Path(f'{tmp_path}/nmap_results/port80.xml.target').exists()
+        assert not Path(f'{tmp_path}/nmap_results/port80.xml.coverage').exists()
 
     def test_successful_nse_pass_records_its_own_coverage(self, tmp_path):
         self._run(tmp_path, script_scan=True, scripts='ftp-anon')
-        assert Path(f'{tmp_path}/nse_results/port80.xml.target').exists()
-        assert Path(f'{tmp_path}/nmap_results/port80.xml.target').exists()
+        assert Path(f'{tmp_path}/nse_results/port80.xml.coverage').exists()
+        assert Path(f'{tmp_path}/nmap_results/port80.xml.coverage').exists()
 
     def test_failed_nse_pass_records_nothing_for_that_pass(self, tmp_path):
         self._run(tmp_path, returncode=1, script_scan=True, scripts='ftp-anon')
-        assert not Path(f'{tmp_path}/nse_results/port80.xml.target').exists()
+        assert not Path(f'{tmp_path}/nse_results/port80.xml.coverage').exists()
 
     def test_hostname_variant_does_not_change_what_is_recorded(self, tmp_path):
         """The record keys on the IP list even when nmap got the hostname file,
         because that is what nmap_scan()'s gate compares against."""
         self._run(tmp_path, ip_to_hostname={'10.0.0.1': 'host1.internal'})
-        stamp = Path(f'{tmp_path}/nmap_results/port80.xml.target')
-        assert set(stamp.read_text().split()) == {'10.0.0.1', '10.0.0.2'}
+        record = spoonmap._read_coverage_record(f'{tmp_path}/nmap_results/port80.xml')
+        assert record['targets'] == {'10.0.0.1', '10.0.0.2'}
 
 
 class TestStaleCoverageRecordIsDiscarded:
     """A record that cannot be written truthfully must be removed, not left."""
-
-    def test_failed_write_removes_an_earlier_record(self, tmp_path):
-        target = tmp_path / 'targets.txt'
-        target.write_text('10.0.0.1\n')
-        output = tmp_path / 'out.xml'
-        output.write_text('<nmaprun/>')
-        spoonmap._stamp_target_coverage(str(output), str(target))
-        assert Path(str(output) + '.target').exists()
-
-        # A later, wider run whose record cannot be written must not leave the
-        # earlier narrow record to validate it.
-        target.write_text('10.0.0.1\n10.0.0.2\n')
-        with patch('spoonmap._atomic_write', side_effect=OSError('ENOSPC')):
-            spoonmap._stamp_target_coverage(str(output), str(target))
-        assert not Path(str(output) + '.target').exists()
-        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
 
     def test_unreadable_target_removes_an_earlier_record(self, tmp_path):
         target = tmp_path / 'targets.txt'
         target.write_text('10.0.0.1\n')
         output = tmp_path / 'out.xml'
         output.write_text('<nmaprun/>')
-        spoonmap._stamp_target_coverage(str(output), str(target))
+        spoonmap._stamp_target_coverage(str(output), str(target), None)
         target.unlink()
-        spoonmap._stamp_target_coverage(str(output), str(target))
-        assert not Path(str(output) + '.target').exists()
+        spoonmap._stamp_target_coverage(str(output), str(target), None)
+        assert not Path(str(output) + '.coverage').exists()
 
     def test_discarding_a_missing_record_is_not_an_error(self, tmp_path):
-        spoonmap._discard_target_stamp(str(tmp_path / 'never-existed.xml'))
+        spoonmap._discard_coverage_record(str(tmp_path / 'never-existed.xml'))
+
+
+class TestExclusionsCoverage:
+    """Issue #48: coverage is `targets - exclusions`, so narrowing the exclusions
+    file widens the real scan with nothing else on disk changing."""
+
+    def _cached(self, tmp_path, excl_text='192.168.1.1\n'):
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.0/24\n')
+        excl = tmp_path / 'exclusions.txt'
+        excl.write_text(excl_text)
+        output = tmp_path / 'out.xml'
+        output.write_text('<nmaprun/>')
+        spoonmap._stamp_target_coverage(str(output), str(target), str(excl))
+        return target, excl, output
+
+    def test_unchanged_exclusions_accept_the_cache(self, tmp_path):
+        target, excl, output = self._cached(tmp_path)
+        assert spoonmap._resume_cache_usable(str(output), 0, 'phase',
+                                             target_file=str(target), exclusions_file=str(excl))
+
+    def test_narrowing_exclusions_rejects_the_cache(self, tmp_path, capsys):
+        """The headline case: a host cleared for testing is removed from
+        exclusions.txt, so it is now in scope and was never scanned."""
+        target, excl, output = self._cached(tmp_path, '192.168.1.1\n10.0.0.9\n')
+        excl.write_text('192.168.1.1\n')           # 10.0.0.9 cleared for testing
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase',
+                                                 target_file=str(target), exclusions_file=str(excl))
+        out = capsys.readouterr().out
+        assert '1 entry excluded when the cache was written is now in scope' in out
+        assert '10.0.0.9' in out
+
+    def test_emptying_the_exclusions_file_rejects_the_cache(self, tmp_path):
+        target, excl, output = self._cached(tmp_path)
+        excl.write_text('')
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase',
+                                                 target_file=str(target), exclusions_file=str(excl))
+
+    def test_dropping_the_exclusions_file_entirely_rejects_the_cache(self, tmp_path):
+        target, _excl, output = self._cached(tmp_path)
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase',
+                                                 target_file=str(target), exclusions_file=None)
+
+    def test_widening_exclusions_still_accepts_the_cache(self, tmp_path, capsys):
+        """Excluding more means a strictly smaller scan set, which the cache
+        already covers — the opposite direction from the targets check."""
+        target, excl, output = self._cached(tmp_path)
+        excl.write_text('192.168.1.1\n192.168.1.2\n')
+        assert spoonmap._resume_cache_usable(str(output), 0, 'phase',
+                                             target_file=str(target), exclusions_file=str(excl))
+        assert 're-running' not in capsys.readouterr().out
+
+    def test_adding_exclusions_where_there_were_none_still_accepts(self, tmp_path):
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.0/24\n')
+        output = tmp_path / 'out.xml'
+        output.write_text('<nmaprun/>')
+        spoonmap._stamp_target_coverage(str(output), str(target), None)
+        excl = tmp_path / 'exclusions.txt'
+        excl.write_text('10.0.0.9\n')
+        assert spoonmap._resume_cache_usable(str(output), 0, 'phase',
+                                            target_file=str(target), exclusions_file=str(excl))
+
+    def test_unreadable_exclusions_file_rejects_the_cache(self, tmp_path, capsys):
+        target, excl, output = self._cached(tmp_path)
+        excl.unlink()
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase',
+                                                 target_file=str(target), exclusions_file=str(excl))
+        out = capsys.readouterr().out
+        assert 'exclusions file' in out
+        assert 'could not be read' in out
+
+    def test_a_missing_record_rejects_the_cache(self, tmp_path, capsys):
+        """An output from before coverage tracking must not read as
+        exclusion-free, which would over-accept every such cache."""
+        target, excl, output = self._cached(tmp_path)
+        Path(str(output) + '.coverage').unlink()
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase',
+                                                 target_file=str(target), exclusions_file=str(excl))
+        assert 'does not record what it covered' in capsys.readouterr().out
+
+    def test_a_malformed_record_rejects_the_cache(self, tmp_path, capsys):
+        """Truncated or hand-edited JSON must read as "cannot say", not as
+        "nothing excluded" — that is the state the empty-file encoding used to
+        make ambiguous."""
+        target, excl, output = self._cached(tmp_path)
+        Path(str(output) + '.coverage').write_text('{"targets": [')
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase',
+                                                 target_file=str(target), exclusions_file=str(excl))
+        assert 'does not record what it covered' in capsys.readouterr().out
+
+    def test_an_empty_exclusion_set_is_recorded_explicitly(self, tmp_path):
+        """"Nothing was excluded" is a recorded fact, not an absent one."""
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.0/24\n')
+        output = tmp_path / 'out.xml'
+        output.write_text('<nmaprun/>')
+        spoonmap._stamp_target_coverage(str(output), str(target), None)
+        assert spoonmap._read_coverage_record(str(output)) == {
+            'targets': {'10.0.0.0/24'}, 'exclusions': set()}
+        assert spoonmap._resume_cache_usable(str(output), 0, 'phase',
+                                            target_file=str(target), exclusions_file=None)
+
+    def test_unreadable_exclusions_file_records_nothing(self, tmp_path, capsys):
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.0/24\n')
+        output = tmp_path / 'out.xml'
+        output.write_text('<nmaprun/>')
+        spoonmap._stamp_target_coverage(str(output), str(target),
+                                        str(tmp_path / 'absent-excl.txt'))
+        assert not Path(str(output) + '.coverage').exists()
+        assert 'could not read absent-excl.txt' in capsys.readouterr().out
+
+
+class TestHostDiscoveryExclusionsCoverage:
+    """_host_discovery()'s mtime baseline covers its targets but not its
+    exclusions: its real target is the exclusion-subtracted filtered_target."""
+
+    def _completed_run(self, tmp_path, excl_text):
+        out = tmp_path / 'out'
+        disc = out / 'discovery'
+        disc.mkdir(parents=True)
+        target = disc / 'resolved_targets.txt'
+        target.write_text('10.0.0.0/24\n')
+        excl = tmp_path / 'exclusions.txt'
+        excl.write_text(excl_text)
+        with patch('spoonmap._internal_host_discovery', return_value={'10.0.0.1'}), \
+             patch('spoonmap._build_discovery_target_file',
+                   return_value=(str(target), 256)):
+            result = _host_discovery(str(target), str(out), '1000', str(excl),
+                                     scan_type='Internal')
+        assert result is not None
+        # Hold the cache newer than the targets file so only the coverage check
+        # can reject it.
+        os.utime(str(target), (1000, 1000))
+        os.utime(result, (2000, 2000))
+        return target, excl, result
+
+    def test_narrowed_exclusions_force_rediscovery(self, tmp_path, capsys):
+        target, excl, _cache = self._completed_run(tmp_path, '10.0.0.9\n10.0.0.10\n')
+        excl.write_text('10.0.0.9\n')
+        with patch('spoonmap._internal_host_discovery',
+                   return_value={'10.0.0.1'}) as m, \
+             patch('spoonmap._build_discovery_target_file',
+                   return_value=(str(target), 256)):
+            _host_discovery(str(target), str(tmp_path / 'out'), '1000', str(excl),
+                            scan_type='Internal', resume=True)
+        assert m.called, '10.0.0.10 is newly in scope and was never discovered'
+        assert 'now in scope' in capsys.readouterr().out
+
+    def test_unchanged_exclusions_still_skip_discovery(self, tmp_path, capsys):
+        target, excl, _cache = self._completed_run(tmp_path, '10.0.0.9\n')
+        with patch('spoonmap._internal_host_discovery') as m, \
+             patch('spoonmap._build_discovery_target_file',
+                   return_value=(str(target), 256)):
+            _host_discovery(str(target), str(tmp_path / 'out'), '1000', str(excl),
+                            scan_type='Internal', resume=True)
+        assert not m.called
+        assert 'skipping host discovery' in capsys.readouterr().out
+
+
+class TestExclusionsCoveragePerPhase:
+    """Each phase must actually pass its exclusions file to its gate and its record.
+
+    The gate-level tests above prove the comparison works; these prove it is
+    wired in. Both directions are needed to pin the wiring: dropping exclusions
+    at the *gate* makes it reject whenever any exclusion exists (caught by the
+    "unchanged still resumes" cases), while dropping them at the *record* makes it
+    accept a narrowed exclusions file (caught by the "narrowed re-scans" cases).
+    These use the real _run_masscan_batch()/nmap paths with only subprocess.Popen
+    faked, so the record the second pass reads is the one production wrote.
+    """
+
+    def _masscan_popen(self, seen_batches=None):
+        def fake_popen(cmd, **kwargs):
+            out_path = cmd[cmd.index('-oX') + 1]
+            if seen_batches is not None and ('/batch_' in out_path or 'portFull' in out_path):
+                seen_batches.append(out_path)
+            Path(out_path).write_text('')   # found nothing; placeholder is stamped
+            proc = MagicMock()
+            proc.wait.return_value = 0
+            proc.returncode = 0
+            proc.pid = 12345
+            proc.stderr = io.BytesIO(b'')
+            return proc
+        return fake_popen
+
+    def _setup(self, tmp_path, excl_text):
+        spoonmap.output_path = str(tmp_path)
+        targets = tmp_path / 'discovery' / 'resolved_targets.txt'
+        targets.parent.mkdir(parents=True)
+        targets.write_text('10.0.0.0/24\n')
+        os.utime(str(targets), (1000, 1000))
+        excl = tmp_path / 'exclusions.txt'
+        excl.write_text(excl_text)
+        return targets, excl
+
+    def _run_full(self, tmp_path, targets, excl, resume, seen):
+        with patch('spoonmap.subprocess.Popen', side_effect=self._masscan_popen(seen)), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            mass_scan('Full', ['1-65535'], '88', '2000', str(targets), str(excl),
+                      resume=resume)
+
+    def test_full_sweep_narrowed_exclusions_rescan(self, tmp_path, capsys):
+        targets, excl = self._setup(tmp_path, '10.0.0.9\n10.0.0.10\n')
+        self._run_full(tmp_path, targets, excl, False, None)
+        capsys.readouterr()
+        excl.write_text('10.0.0.9\n')
+        seen = []
+        self._run_full(tmp_path, targets, excl, True, seen)
+        assert seen, '10.0.0.10 is newly in scope, so the sweep must re-run'
+        assert 'now in scope' in capsys.readouterr().out
+
+    def test_full_sweep_unchanged_exclusions_resume(self, tmp_path, capsys):
+        targets, excl = self._setup(tmp_path, '10.0.0.9\n')
+        self._run_full(tmp_path, targets, excl, False, None)
+        capsys.readouterr()
+        seen = []
+        self._run_full(tmp_path, targets, excl, True, seen)
+        assert seen == [], 'unchanged exclusions must still resume'
+        assert 'skipping completed Full port scan' in capsys.readouterr().out
+
+    def _run_batches(self, tmp_path, targets, excl, resume, seen):
+        with patch('spoonmap.subprocess.Popen', side_effect=self._masscan_popen(seen)), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            mass_scan('All', ['80', '443'], '53', '10000', str(targets), str(excl),
+                      batch_size=10, resume=resume)
+
+    def test_port_batches_narrowed_exclusions_rescan(self, tmp_path, capsys):
+        targets, excl = self._setup(tmp_path, '10.0.0.9\n10.0.0.10\n')
+        first = []
+        self._run_batches(tmp_path, targets, excl, False, first)
+        assert first, 'setup: a main batch must have run'
+        capsys.readouterr()
+        excl.write_text('10.0.0.9\n')
+        seen = []
+        self._run_batches(tmp_path, targets, excl, True, seen)
+        assert seen, 'the cached batch must be re-scanned'
+        assert 'now in scope' in capsys.readouterr().out
+
+    def test_port_batches_unchanged_exclusions_resume(self, tmp_path, capsys):
+        targets, excl = self._setup(tmp_path, '10.0.0.9\n')
+        first = []
+        self._run_batches(tmp_path, targets, excl, False, first)
+        assert first
+        capsys.readouterr()
+        seen = []
+        self._run_batches(tmp_path, targets, excl, True, seen)
+        assert seen == [], 'unchanged exclusions must still resume'
+        assert 'skipping completed batch' in capsys.readouterr().out
+
+    def _nmap_proc(self):
+        proc = MagicMock()
+        proc.poll.return_value = 0
+        proc.wait.return_value = 0
+        proc.returncode = 0
+        proc.stdout = io.StringIO('')
+        proc.stderr = io.StringIO('')
+        return proc
+
+    def _nmap_dirs(self, tmp_path):
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        (disc / 'live_hosts').mkdir(parents=True)
+        spoonmap.output_path = str(tmp_path)
+        return disc
+
+    def test_nmap_port_discovery_both_directions(self, tmp_path, capsys):
+        disc = self._nmap_dirs(tmp_path)
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
+        excl = tmp_path / 'exclusions.txt'
+        excl.write_text('10.0.0.9\n10.0.0.10\n')
+        xml = disc / 'masscan_results' / 'portDirect.xml'
+
+        def fake_popen(cmd, **kwargs):
+            Path(cmd[cmd.index('-oX') + 1]).write_text('<nmaprun/>')
+            return self._nmap_proc()
+
+        def run(resume):
+            with patch('spoonmap.subprocess.Popen', side_effect=fake_popen) as mp, \
+                 patch('spoonmap.save_terminal_state', return_value=None), \
+                 patch('spoonmap.restore_terminal_state'):
+                _nmap_port_discovery(['80'], str(target), '', str(excl), resume=resume)
+            return mp
+
+        run(False)
+        os.utime(str(target), (1000, 1000))
+        os.utime(str(xml), (2000, 2000))
+        capsys.readouterr()
+        assert not run(True).called, 'unchanged exclusions must still resume'
+
+        excl.write_text('10.0.0.9\n')
+        os.utime(str(target), (1000, 1000))
+        os.utime(str(xml), (2000, 2000))
+        capsys.readouterr()
+        assert run(True).called, 'a newly in-scope host must force a re-scan'
+        assert 'now in scope' in capsys.readouterr().out
+
+    def test_nmap_udp_discovery_both_directions(self, tmp_path, capsys):
+        disc = self._nmap_dirs(tmp_path)
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.5\n')
+        excl = tmp_path / 'exclusions.txt'
+        excl.write_text('10.0.0.9\n10.0.0.10\n')
+        xml = disc / 'masscan_results' / 'portU_53.xml'
+
+        def fake_popen(cmd, **kwargs):
+            Path(cmd[cmd.index('-oX') + 1]).write_text(
+                '<?xml version="1.0"?><nmaprun><host>'
+                '<address addr="10.0.0.5" addrtype="ipv4"/>'
+                '<ports><port protocol="udp" portid="53">'
+                '<state state="open"/></port></ports></host></nmaprun>'
+            )
+            return self._nmap_proc()
+
+        def run(resume):
+            with patch('spoonmap.subprocess.Popen', side_effect=fake_popen) as mp, \
+                 patch('spoonmap.save_terminal_state', return_value=None), \
+                 patch('spoonmap.restore_terminal_state'):
+                _nmap_udp_discovery('U:53', str(target), str(tmp_path), '',
+                                    str(excl), resume=resume)
+            return mp
+
+        run(False)
+        os.utime(str(target), (1000, 1000))
+        os.utime(str(xml), (2000, 2000))
+        capsys.readouterr()
+        assert not run(True).called, 'unchanged exclusions must still resume'
+
+        excl.write_text('10.0.0.9\n')
+        os.utime(str(target), (1000, 1000))
+        os.utime(str(xml), (2000, 2000))
+        capsys.readouterr()
+        assert run(True).called, 'a newly in-scope host must force a re-scan'
+        assert 'now in scope' in capsys.readouterr().out
+
+
+class TestCoverageRecordIsSingleAndAtomic:
+    """One record, one atomic write.
+
+    As two sidecars written in sequence, a KeyboardInterrupt between them left a
+    fresh target list beside a stale exclusion list, and the gate accepted that
+    pair as an exclusion-free scan.
+    """
+
+    def _stamped(self, tmp_path, excl_text=None):
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.0/24\n')
+        excl = None
+        if excl_text is not None:
+            excl = tmp_path / 'exclusions.txt'
+            excl.write_text(excl_text)
+        output = tmp_path / 'out.xml'
+        output.write_text('<nmaprun/>')
+        return target, excl, output
+
+    def test_both_halves_live_in_one_file(self, tmp_path):
+        target, excl, output = self._stamped(tmp_path, '10.0.0.9\n')
+        spoonmap._stamp_target_coverage(str(output), str(target), str(excl))
+        assert spoonmap._read_coverage_record(str(output)) == {
+            'targets': {'10.0.0.0/24'}, 'exclusions': {'10.0.0.9'}}
+        # No second sidecar to fall out of step with the first.
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            'exclusions.txt', 'out.xml', 'out.xml.coverage', 'targets.txt']
+
+    def test_interrupt_during_the_write_discards_the_record(self, tmp_path):
+        """The demonstrated over-accept: run 1 exclusion-free, run 2 interrupted
+        mid-write, run 3 accepting run 1's record as though run 2 had happened."""
+        target, _e, output = self._stamped(tmp_path)
+        spoonmap._stamp_target_coverage(str(output), str(target), None)
+        assert spoonmap._read_coverage_record(str(output))['exclusions'] == set()
+
+        excl = tmp_path / 'exclusions.txt'
+        excl.write_text('10.0.0.9\n')
+        with patch('spoonmap._atomic_write', side_effect=KeyboardInterrupt):
+            with pytest.raises(KeyboardInterrupt):
+                spoonmap._stamp_target_coverage(str(output), str(target), str(excl))
+
+        assert spoonmap._read_coverage_record(str(output)) is None
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase',
+                                                 target_file=str(target),
+                                                 exclusions_file=str(excl))
+
+    def test_a_wider_surviving_record_cannot_validate_a_narrower_output(self, tmp_path):
+        """The hazard the discard exists for.
+
+        A record kept from a wide run would accept a later narrow output, since
+        the narrow target is a subset of it. Asserting on a *narrower* leftover
+        record proves nothing: the targets check rejects that regardless.
+        """
+        target, _e, output = self._stamped(tmp_path)
+        target.write_text('10.0.0.1\n10.0.0.2\n10.0.0.3\n')
+        spoonmap._stamp_target_coverage(str(output), str(target), None)
+
+        # A later, narrower run rewrites the output but cannot record it.
+        target.write_text('10.0.0.1\n')
+        with patch('spoonmap._atomic_write', side_effect=OSError('ENOSPC')):
+            spoonmap._stamp_target_coverage(str(output), str(target), None)
+
+        assert spoonmap._read_coverage_record(str(output)) is None, (
+            'the wider record must not survive to validate this output'
+        )
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase',
+                                                 target_file=str(target),
+                                                 exclusions_file=None)
+
+    def test_masscan_clears_the_record_before_it_scans(self, tmp_path):
+        """A run killed outright never reaches the stamp, so the record has to be
+        dropped up front — otherwise the previous run's record describes output
+        that no longer exists."""
+        targets = tmp_path / 'targets.txt'
+        targets.write_text('10.0.0.1\n')
+        output_xml = tmp_path / 'out.xml'
+        output_xml.write_text('<nmaprun/>')
+        spoonmap._stamp_target_coverage(str(output_xml), str(targets), None)
+        assert Path(str(output_xml) + '.coverage').exists()
+
+        # SIGKILL stand-in: the process dies inside Popen, so no stamp runs.
+        with patch('spoonmap.subprocess.Popen', side_effect=KeyboardInterrupt), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            with pytest.raises(KeyboardInterrupt):
+                spoonmap._run_masscan_batch(['445'], '1000', str(output_xml),
+                                            str(targets), None, None)
+        assert not Path(str(output_xml) + '.coverage').exists()
+
+    def test_exclusion_respelling_errs_toward_rescanning(self, tmp_path):
+        """Line-level, not address-level: an equivalent respelling re-scans.
+
+        Safe direction by construction — it can cost a redundant scan but never
+        skip one.
+        """
+        target, excl, output = self._stamped(tmp_path, '10.0.0.9\n')
+        spoonmap._stamp_target_coverage(str(output), str(target), str(excl))
+        excl.write_text('10.0.0.9/32\n')      # same address, different line
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase',
+                                                 target_file=str(target),
+                                                 exclusions_file=str(excl))
+
+    def test_record_is_invisible_to_result_aggregation(self, tmp_path):
+        result_dir = tmp_path / 'masscan_results'
+        result_dir.mkdir()
+        xml = result_dir / 'portFull.xml'
+        xml.write_text(
+            '<?xml version="1.0"?><nmaprun><host>'
+            '<address addr="10.0.0.1" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="80">'
+            '<state state="open"/></port></ports></host></nmaprun>'
+        )
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
+        excl = tmp_path / 'exclusions.txt'
+        excl.write_text('10.0.0.9\n')
+        spoonmap._stamp_target_coverage(str(xml), str(target), str(excl))
+        assert (result_dir / 'portFull.xml.coverage').exists()
+        hosts_json, xml_hosts = spoonmap._aggregate_result_dir(str(result_dir) + '/', {})
+        assert [h['ip'] for h in hosts_json] == ['10.0.0.1']
+        assert set(xml_hosts) == {'10.0.0.1'}
+
+    def test_cleanup_removes_the_record(self, tmp_path):
+        disc = tmp_path / 'discovery' / 'masscan_results'
+        disc.mkdir(parents=True)
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
+        output = disc / 'portFull.xml'
+        output.write_text('<nmaprun/>')
+        spoonmap._stamp_target_coverage(str(output), str(target), None)
+        assert (disc / 'portFull.xml.coverage').exists()
+        spoonmap._delete_previous_results(str(tmp_path))
+        assert not (tmp_path / 'discovery').exists()
