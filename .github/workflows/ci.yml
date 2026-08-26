@@ -474,7 +474,7 @@ jobs:
           # today, but is intentionally a separate, hand-maintained list — see
           # the step comment for why it must not be read from that same file.
           required = (
-              'spoonmap.py', 'nse/', 'tests/', 'README.md', 'CLAUDE.md',
+              'spoonmap.py', 'nse/', 'tests/', 'tools/', 'README.md', 'CLAUDE.md',
               'config.json.sample', 'exclusions.txt', 'pyproject.toml',
               'uv.lock', '.bandit-baseline.json', '.github/workflows/',
           )
@@ -512,9 +512,28 @@ jobs:
                   'sdist nse/ does not match git-tracked nse/ exactly '
                   f'— missing: {nse_missing}, extra: {nse_extra}'
               )
+
+          tracked_tools = subprocess.run(
+              ['git', 'ls-files', 'tools/'],
+              capture_output=True, text=True, check=True,
+          ).stdout.splitlines()
+          tracked_tools_set = {t[len('tools/'):] for t in tracked_tools}
+          sdist_tools = {
+              s[len('tools/'):] for s in stripped
+              if s.startswith('tools/') and not s.endswith('/')
+          }
+          tools_missing = sorted(tracked_tools_set - sdist_tools)
+          tools_extra = sorted(sdist_tools - tracked_tools_set)
+          if tools_missing or tools_extra:
+              sys.exit(
+                  'sdist tools/ does not match git-tracked tools/ exactly '
+                  f'— missing: {tools_missing}, extra: {tools_extra}'
+              )
+
           print(
               f'sdist has all {len(required)} required entries; '
-              f'nse/ matches git-tracked files exactly ({len(tracked_nse)} files)'
+              f'nse/ matches git-tracked files exactly ({len(tracked_nse)} files); '
+              f'tools/ matches git-tracked files exactly ({len(tracked_tools_set)} files)'
           )
           PYEOF
 

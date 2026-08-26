@@ -363,7 +363,6 @@ wheels = [
 
 [[package]]
 name = "spoonmap"
-version = "0.1.0"
 source = { editable = "." }
 
 [package.dev-dependencies]
