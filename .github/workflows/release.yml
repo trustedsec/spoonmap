@@ -6,9 +6,9 @@ name: Release
 # line -- so a major release is `git tag v1.0.0 && git push`, and this is what
 # turns that into a release.
 #
-# Tags pushed by auto-tag.yml do NOT reach here: GitHub does not dispatch
-# workflow events for refs pushed with GITHUB_TOKEN. That job creates its own
-# release.
+# Tags pushed by the tag job in ci.yml do NOT reach here: GitHub does not
+# dispatch workflow events for refs pushed with GITHUB_TOKEN. That job creates
+# its own release.
 on:
   push:
     tags:
@@ -28,6 +28,17 @@ jobs:
           # exists, so unlike the two tagging workflows it needs no credentials.
           persist-credentials: false
 
-      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
-        with:
-          generate_release_notes: true
+      # `gh release create` rather than a third-party action: the runner already
+      # ships gh, and the tag job in ci.yml already publishes this way. Two
+      # release paths doing the same thing two different ways is one too many.
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, nothing to do"
+            exit 0
+          fi
+          gh release create "$TAG" --generate-notes
