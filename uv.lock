@@ -371,6 +371,7 @@ dev = [
     { name = "packaging", marker = "python_full_version >= '3.10'" },
     { name = "pytest", marker = "python_full_version >= '3.10'" },
     { name = "pytest-cov", marker = "python_full_version >= '3.10'" },
+    { name = "pyyaml", marker = "python_full_version >= '3.10'" },
     { name = "ruff", marker = "python_full_version >= '3.10'" },
 ]
 
@@ -382,6 +383,7 @@ dev = [
     { name = "packaging", specifier = ">=24.0" },
     { name = "pytest", specifier = ">=9.0.3" },
     { name = "pytest-cov", specifier = ">=5.0.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", specifier = "==0.16.4" },
 ]
 

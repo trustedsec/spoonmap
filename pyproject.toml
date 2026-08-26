@@ -29,6 +29,9 @@ dev = [
     # different pre-release schemes have been got wrong before. Not a runtime
     # dependency: spoonmap.py is stdlib-only.
     "packaging>=24.0",
+    # Test-only. tests/test_release_versioning.py parses the workflow YAML to
+    # assert the CI triggers and tagging steps still wire together.
+    "pyyaml>=6.0",
 ]
 
 [tool.uv]

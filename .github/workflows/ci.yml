@@ -122,7 +122,7 @@ jobs:
       - name: Run tests
         run: >
           uv run --isolated --no-project --python ${{ matrix.python-version }}
-          --with pytest --with pytest-cov
+          --with pytest --with pytest-cov --with pyyaml --with packaging
           pytest tests/ -v -rs
 
   # Separate job, not a step on `test`: a lint failure and a test failure are
@@ -151,7 +151,7 @@ jobs:
         run: uv lock --check
 
       - name: Ruff
-        run: uv run --frozen ruff check spoonmap.py tests/
+        run: uv run --frozen ruff check spoonmap.py tests/ tools/
 
   # SAST against a committed baseline: spoonmap shells out to masscan/nmap and
   # parses their XML, so a bare run reports 32 reviewed findings (subprocess
