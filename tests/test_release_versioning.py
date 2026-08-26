@@ -87,10 +87,22 @@ def test_the_tag_job_waits_for_every_validating_job():
     """
     ci = _load('ci.yml')
     needs = set(ci['jobs']['tag']['needs'])
+
+    # Helper to normalize job's needs list, handling both list and string forms
+    def get_needs_set(job_def):
+        job_needs = job_def.get('needs')
+        if isinstance(job_needs, str):
+            # Normalize string form to list to avoid substring matching
+            return {job_needs}
+        elif isinstance(job_needs, list):
+            return set(job_needs)
+        else:
+            return set()
+
     # Exclude jobs that depend on tag (self-referencing jobs like publish)
     validating = {
         j for j in ci['jobs']
-        if j != 'tag' and not (ci['jobs'][j].get('needs') and 'tag' in ci['jobs'][j].get('needs', []))
+        if j != 'tag' and 'tag' not in get_needs_set(ci['jobs'][j])
     }
     missing = validating - needs
     assert not missing, f'tag job does not depend on: {sorted(missing)}'
@@ -111,16 +123,20 @@ def test_the_tag_job_never_runs_on_pull_requests():
 
 def test_only_the_tag_job_can_write():
     """The workflow is read-only; exactly one job escalates, and only to what
-    pushing a tag and cutting a release requires. Exclude publish-like jobs
-    that legitimately need write access."""
+    pushing a tag and cutting a release requires."""
+    # Jobs permitted to declare their own `permissions:`. Adding a name here is
+    # a deliberate decision to let another job escalate, and it should come with
+    # a reason -- `tag` needs contents: write to push a tag and cut a release.
+    # A derived rule was tried here and removed: exempting anything that depends
+    # on `tag` let a future job grant itself contents: write with nothing
+    # tripping, which is the invariant this test exists to hold.
+    MAY_DECLARE_PERMISSIONS = {'tag'}
+
     ci = _load('ci.yml')
     assert ci['permissions'] == {'contents': 'read'}
     assert ci['jobs']['tag']['permissions'] == {'contents': 'write'}
     for job_id, job in ci['jobs'].items():
-        if job_id != 'tag':
-            # Allow publish-like jobs to have their own permissions
-            if 'needs' in job and 'tag' in job['needs']:
-                continue
+        if job_id not in MAY_DECLARE_PERMISSIONS:
             assert 'permissions' not in job, job_id
 
 
@@ -249,12 +265,16 @@ def test_compute_tag_step_assigns_correct_channel(branch, expected_channel, tmp_
     assert parsed['channel'] == expected_channel, \
         f'Expected channel={expected_channel}, got channel={parsed["channel"]}'
 
-    # Assert new_tag exists and has a plausible shape (or is empty for no new commits)
+    # Assert new_tag key exists and is non-empty in this environment.
+    # Empty is only legitimate when HEAD sits exactly on a tag (no new commits),
+    # which is not the case in this test repo. The key must exist and have a value
+    # to catch mutations that write then blank it. Do NOT use `if new_tag:` guards
+    # that would skip validation of a blanked value.
     assert 'new_tag' in parsed, f'new_tag key not in GITHUB_OUTPUT: {parsed}'
     new_tag = parsed['new_tag']
-    if new_tag:
-        assert re.match(r'^v\d+\.\d+\.\d+', new_tag), \
-            f'new_tag has unexpected format: {new_tag}'
+    assert new_tag, f'new_tag must not be empty in this environment, got: {new_tag!r}'
+    assert re.match(r'^v\d+\.\d+\.\d+', new_tag), \
+        f'new_tag has unexpected format: {new_tag}'
 
 
 def test_the_pushed_tag_is_the_one_the_policy_computed():
