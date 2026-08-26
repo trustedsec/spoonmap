@@ -7036,8 +7036,11 @@ class TestNmapScan:
         spoonmap.output_path = str(tmp_path)
         os.makedirs(f'{tmp_path}/discovery/live_hosts')
         os.makedirs(f'{tmp_path}/nmap_results')
-        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n')
-        (Path(tmp_path) / 'nmap_results' / 'port80.xml').write_text('<nmaprun/>')
+        live = Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt'
+        live.write_text('10.0.0.1\n')
+        cached = Path(tmp_path) / 'nmap_results' / 'port80.xml'
+        cached.write_text('<nmaprun/>')
+        _write_target_stamp(cached, live)
 
         with patch('spoonmap.nmap_worker') as mock_worker:
             nmap_scan('88', max_threads=2, script_scan=False)
@@ -7068,8 +7071,15 @@ class TestNmapScan:
         os.makedirs(f'{tmp_path}/discovery/live_hosts')
         os.makedirs(f'{tmp_path}/nmap_results')
         os.makedirs(f'{tmp_path}/nse_results')
-        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n')
-        (Path(tmp_path) / 'nmap_results' / 'port80.xml').write_text(xml_text)
+        live = Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt'
+        live.write_text('10.0.0.1\n')
+        cached = Path(tmp_path) / 'nmap_results' / 'port80.xml'
+        cached.write_text(xml_text)
+        # Stamped so these fixtures isolate the condition they name: without a
+        # coverage record the gate rejects for that reason instead, and every
+        # "stays skipped" assertion would pass or hang for the wrong cause.
+        _write_target_stamp(cached, live)
+        return live
 
     def test_zero_length_banner_xml_is_rescanned(self, tmp_path, capsys):
         # nmap_worker's own docstring notes an individual nmap PID can be killed
@@ -7098,8 +7108,11 @@ class TestNmapScan:
 
     def _setup_nse_cache(self, tmp_path, nse_xml_text):
         """Complete banner result plus an NSE result holding *nse_xml_text*."""
-        self._setup_banner_cache(tmp_path, '<nmaprun/>')
-        (Path(tmp_path) / 'nse_results' / 'port80.xml').write_text(nse_xml_text)
+        live = self._setup_banner_cache(tmp_path, '<nmaprun/>')
+        cached = Path(tmp_path) / 'nse_results' / 'port80.xml'
+        cached.write_text(nse_xml_text)
+        _write_target_stamp(cached, live)
+        return live
 
     def test_both_passes_complete_skips_port(self, tmp_path, capsys):
         # Load-bearing direction for the NSE half: valid banner + valid NSE
@@ -7274,9 +7287,14 @@ class TestNmapScan:
         spoonmap.output_path = str(tmp_path)
         os.makedirs(f'{tmp_path}/discovery/live_hosts')
         os.makedirs(f'{tmp_path}/nmap_results')
-        (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n')
+        live = Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt'
+        live.write_text('10.0.0.1\n')
         (Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80_hostnames.txt').write_text('host.internal\n')
-        (Path(tmp_path) / 'nmap_results' / 'port80.xml').write_text('<nmaprun/>')
+        cached = Path(tmp_path) / 'nmap_results' / 'port80.xml'
+        cached.write_text('<nmaprun/>')
+        # Recorded against the IP list, not the _hostnames.txt variant: the gate
+        # keys on the canonical per-port list even when nmap gets the other one.
+        _write_target_stamp(cached, live)
 
         with patch('spoonmap.nmap_worker') as mock_worker:
             nmap_scan('88', max_threads=2, script_scan=False)
@@ -11793,3 +11811,179 @@ class TestResumeTargetStampNmapDiscovery:
              patch('spoonmap.restore_terminal_state'):
             spoonmap._nmap_port_discovery(['80'], str(target), '', None, resume=True)
         assert mock_popen.called, 'a target added since the cache must re-scan'
+
+
+class TestBannerAndNseTargetCoverage:
+    """Issue #47: the per-port host list grows every run, so the banner and NSE
+    resume gates must check what the cached XML actually covered."""
+
+    def _setup(self, tmp_path, hosts='10.0.0.1\n'):
+        spoonmap.output_path = str(tmp_path)
+        os.makedirs(f'{tmp_path}/discovery/live_hosts', exist_ok=True)
+        os.makedirs(f'{tmp_path}/nmap_results', exist_ok=True)
+        os.makedirs(f'{tmp_path}/nse_results', exist_ok=True)
+        live = Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt'
+        live.write_text(hosts)
+        return live
+
+    def test_a_grown_host_list_rescans_the_banner_pass(self, tmp_path, capsys):
+        """The scenario #46 left open: the probe re-runs every resume and unions
+        a newly-found host into live_hosts/port80.txt, but the cached XML from
+        the previous run still parses, so the host was never banner-scanned."""
+        live = self._setup(tmp_path)
+        cached = Path(tmp_path) / 'nmap_results' / 'port80.xml'
+        cached.write_text('<nmaprun/>')
+        _write_target_stamp(cached, live)
+
+        live.write_text('10.0.0.1\n10.0.0.9\n')   # probe found another host
+
+        with patch('spoonmap.nmap_worker', side_effect=_fake_worker_drain) as mock_worker:
+            nmap_scan('88', max_threads=2, script_scan=False)
+
+        out = capsys.readouterr().out
+        assert mock_worker.called, 'the new host must be banner-scanned'
+        assert 'were not covered by the cached result' in out
+        assert '10.0.0.9' in out
+        assert 'already been scanned' not in out
+
+    def test_an_unchanged_host_list_still_skips_the_port(self, tmp_path, capsys):
+        live = self._setup(tmp_path)
+        cached = Path(tmp_path) / 'nmap_results' / 'port80.xml'
+        cached.write_text('<nmaprun/>')
+        _write_target_stamp(cached, live)
+
+        with patch('spoonmap.nmap_worker') as mock_worker:
+            nmap_scan('88', max_threads=2, script_scan=False)
+
+        assert not mock_worker.called
+        assert 'already been scanned' in capsys.readouterr().out
+
+    def test_a_shrunk_host_list_still_skips_the_port(self, tmp_path):
+        """Subset semantics: the cache covered more than this run would scan."""
+        live = self._setup(tmp_path, '10.0.0.1\n10.0.0.9\n')
+        cached = Path(tmp_path) / 'nmap_results' / 'port80.xml'
+        cached.write_text('<nmaprun/>')
+        _write_target_stamp(cached, live)
+
+        live.write_text('10.0.0.1\n')
+
+        with patch('spoonmap.nmap_worker') as mock_worker:
+            nmap_scan('88', max_threads=2, script_scan=False)
+        assert not mock_worker.called
+
+    def test_nse_coverage_is_recorded_independently_of_the_banner_pass(self, tmp_path, capsys):
+        """A complete banner pass says nothing about the NSE pass's coverage."""
+        live = self._setup(tmp_path)
+        banner = Path(tmp_path) / 'nmap_results' / 'port80.xml'
+        banner.write_text('<nmaprun/>')
+        nse = Path(tmp_path) / 'nse_results' / 'port80.xml'
+        nse.write_text('<nmaprun/>')
+        _write_target_stamp(nse, live)
+        # Banner pass covered a host list from before 10.0.0.9 appeared; NSE
+        # covered the current one.
+        live.write_text('10.0.0.1\n10.0.0.9\n')
+        _write_target_stamp(banner, live)
+        live.write_text('10.0.0.1\n10.0.0.9\n')
+
+        with patch('spoonmap.nmap_worker', side_effect=_fake_worker_drain) as mock_worker, \
+             patch('spoonmap._get_scripts_for_port', return_value='ftp-anon'):
+            nmap_scan('88', max_threads=2, script_scan=True)
+
+        out = capsys.readouterr().out
+        assert mock_worker.called, 'the NSE pass has not covered 10.0.0.9'
+        assert 're-running port 80 NSE scan' in out
+
+
+class TestNmapWorkerTargetCoverage:
+    """nmap_worker() must record coverage per pass, and only on success."""
+
+    def _run(self, tmp_path, returncode=0, script_scan=False, scripts='',
+             ip_to_hostname=None, interrupt=False):
+        spoonmap.output_path = str(tmp_path)
+        for d in ('nmap_results', 'nse_results', 'discovery/live_hosts'):
+            os.makedirs(f'{tmp_path}/{d}', exist_ok=True)
+        live = Path(tmp_path) / 'discovery' / 'live_hosts' / 'port80.txt'
+        live.write_text('10.0.0.1\n10.0.0.2\n')
+
+        work_queue = Queue()
+        work_queue.put('port80.txt')
+        work_queue.put(None)
+        interrupt_event = threading.Event()
+
+        def popen_side_effect(*a, **k):
+            proc = MagicMock()
+            proc.poll.return_value = 0
+            proc.wait.return_value = 0
+            proc.returncode = returncode
+            proc.stderr = io.StringIO('boom' if returncode else '')
+            if interrupt:
+                interrupt_event.set()
+            return proc
+
+        with patch('spoonmap._build_nmap_cmd', return_value=['nmap', 'fake']), \
+             patch('spoonmap._get_scripts_for_port', return_value=scripts), \
+             patch('spoonmap.create_hostname_target_file'), \
+             patch('spoonmap.subprocess.Popen', side_effect=popen_side_effect):
+            nmap_worker(work_queue, [0], 1, '88', threading.Lock(), interrupt_event,
+                        ip_to_hostname, script_scan=script_scan)
+        return live
+
+    def test_successful_banner_pass_records_its_coverage(self, tmp_path):
+        self._run(tmp_path)
+        stamp = Path(f'{tmp_path}/nmap_results/port80.xml.target')
+        assert set(stamp.read_text().split()) == {'10.0.0.1', '10.0.0.2'}
+
+    def test_failed_banner_pass_records_nothing(self, tmp_path):
+        # The failure path quarantines the XML; a coverage record left beside it
+        # would be applied to whatever lands there next.
+        self._run(tmp_path, returncode=1)
+        assert not Path(f'{tmp_path}/nmap_results/port80.xml.target').exists()
+
+    def test_successful_nse_pass_records_its_own_coverage(self, tmp_path):
+        self._run(tmp_path, script_scan=True, scripts='ftp-anon')
+        assert Path(f'{tmp_path}/nse_results/port80.xml.target').exists()
+        assert Path(f'{tmp_path}/nmap_results/port80.xml.target').exists()
+
+    def test_failed_nse_pass_records_nothing_for_that_pass(self, tmp_path):
+        self._run(tmp_path, returncode=1, script_scan=True, scripts='ftp-anon')
+        assert not Path(f'{tmp_path}/nse_results/port80.xml.target').exists()
+
+    def test_hostname_variant_does_not_change_what_is_recorded(self, tmp_path):
+        """The record keys on the IP list even when nmap got the hostname file,
+        because that is what nmap_scan()'s gate compares against."""
+        self._run(tmp_path, ip_to_hostname={'10.0.0.1': 'host1.internal'})
+        stamp = Path(f'{tmp_path}/nmap_results/port80.xml.target')
+        assert set(stamp.read_text().split()) == {'10.0.0.1', '10.0.0.2'}
+
+
+class TestStaleCoverageRecordIsDiscarded:
+    """A record that cannot be written truthfully must be removed, not left."""
+
+    def test_failed_write_removes_an_earlier_record(self, tmp_path):
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
+        output = tmp_path / 'out.xml'
+        output.write_text('<nmaprun/>')
+        spoonmap._stamp_target_coverage(str(output), str(target))
+        assert Path(str(output) + '.target').exists()
+
+        # A later, wider run whose record cannot be written must not leave the
+        # earlier narrow record to validate it.
+        target.write_text('10.0.0.1\n10.0.0.2\n')
+        with patch('spoonmap._atomic_write', side_effect=OSError('ENOSPC')):
+            spoonmap._stamp_target_coverage(str(output), str(target))
+        assert not Path(str(output) + '.target').exists()
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
+
+    def test_unreadable_target_removes_an_earlier_record(self, tmp_path):
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
+        output = tmp_path / 'out.xml'
+        output.write_text('<nmaprun/>')
+        spoonmap._stamp_target_coverage(str(output), str(target))
+        target.unlink()
+        spoonmap._stamp_target_coverage(str(output), str(target))
+        assert not Path(str(output) + '.target').exists()
+
+    def test_discarding_a_missing_record_is_not_an_error(self, tmp_path):
+        spoonmap._discard_target_stamp(str(tmp_path / 'never-existed.xml'))

@@ -629,12 +629,27 @@ def _read_target_stamp(output_file):
     return _target_entries(_target_stamp_path(output_file))
 
 
+def _discard_target_stamp(output_file):
+    """Remove *output_file*'s coverage record, if any.
+
+    Used whenever a record cannot be written truthfully.  A record left behind
+    from an earlier, possibly narrower run would be applied to whatever output
+    sits there now, so the absent case (which the gate rejects) is the only safe
+    one.  Failure to remove is ignored: the gate reads the record and compares it,
+    so a stale record that cannot be deleted is caught there or not at all.
+    """
+    try:
+        os.remove(_target_stamp_path(output_file))
+    except OSError:
+        pass
+
+
 def _stamp_target_coverage(output_file, target_file):
     """Record which targets *output_file* covered.
 
     Call from success paths only, exactly as _EMPTY_RESULT_XML is stamped: a
-    stamp written for a killed scan would assert coverage that never happened,
-    which is worse than having no stamp at all.
+    record written for a killed scan would assert coverage that never happened,
+    which is worse than having none at all.
 
     The full target list is stored rather than a digest of it, because the gate
     needs to answer "did the cache cover everything this run would scan" — a
@@ -643,10 +658,15 @@ def _stamp_target_coverage(output_file, target_file):
 
     Neither an unreadable target file nor a failed write raises.  The scan itself
     already succeeded, so unwinding here would discard real results; the only
-    cost either way is that the next --resume redoes this phase.
+    cost either way is that the next --resume redoes this phase.  Both failure
+    paths *delete* any existing record rather than leaving it: outputs are
+    rewritten in place across runs (and a failed nmap pass is renamed out of the
+    way by _quarantine_failed_output()), so a record that survives a failed write
+    would be read as describing output it never covered.
     """
     entries = _target_entries(target_file)
     if entries is None:
+        _discard_target_stamp(output_file)
         print(_COLOR_ERROR
               + f'Warning: could not read {os.path.basename(target_file)} to record '
                 f'what {os.path.basename(output_file)} covered; a --resume will '
@@ -657,6 +677,7 @@ def _stamp_target_coverage(output_file, target_file):
         _atomic_write(_target_stamp_path(output_file),
                       ''.join(entry + '\n' for entry in sorted(entries)))
     except Exception as e:
+        _discard_target_stamp(output_file)
         print(_COLOR_ERROR
               + f'Warning: could not record the target set for '
                 f'{os.path.basename(output_file)} ({e}); a --resume will re-run '
@@ -2387,6 +2408,10 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
             dest_port = _fname_port((host_file.split('.')[0])[4:])
             output_file = f'{output_path}/nmap_results/port{_port_fname(dest_port)}.xml'
             input_file = f'{_disc(output_path)}/live_hosts/port{_port_fname(dest_port)}.txt'
+            # The canonical per-port host list, kept separately from input_file
+            # because that may be swapped for the hostname variant below.  Both
+            # the resume gate and the coverage record key on this one.
+            ip_list_file = input_file
 
             # Create hostname-based target file if we have hostname mappings
             if ip_to_hostname:
@@ -2455,6 +2480,12 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                         _report_nmap_failure('banner scan', dest_port, nmap_process,
                                              ''.join(nmap_err_lines), output_file)
                     else:
+                        # Success: record which hosts this pass covered.  Keyed to
+                        # the IP list, not the hostname variant that may have been
+                        # the actual -iL, so it matches what nmap_scan()'s gate
+                        # checks.  Failure paths above quarantine instead, and an
+                        # interrupt falls through without stamping.
+                        _stamp_target_coverage(output_file, ip_list_file)
                         with lock:
                             completed_count[0] += 1
                             _print_completion_status(
@@ -2496,6 +2527,12 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                         if nse_process.returncode != 0 and not interrupt_event.is_set():
                             _report_nmap_failure('NSE script pass', dest_port, nse_process,
                                                  ''.join(nse_err_lines), nse_output)
+                        elif nse_process.returncode == 0 and not interrupt_event.is_set():
+                            # Recorded separately from the banner pass: the two
+                            # have their own outputs and their own resume gate, so
+                            # one succeeding says nothing about the other.  An
+                            # interrupt leaves no record either way.
+                            _stamp_target_coverage(nse_output, ip_list_file)
 
             except FileNotFoundError:
                 with lock:
@@ -2559,21 +2596,22 @@ def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
             # An nmap killed part-way through leaves a zero-length or truncated
             # portN.xml; require parseable content in both passes so that port is
             # rescanned instead of being treated as scanned forever.
-            # target_file=None here is a known gap, not a safe case: the -iL for
-            # this pass is live_hosts/portNN.txt, which grows by union across
-            # runs, so a host added on a later run is not banner-scanned while
-            # the cached XML still parses.  Closing it needs a stamp written from
-            # nmap_worker() and is tracked separately; masscan-side coverage
-            # (which decides what reaches live_hosts/ at all) is what this gate's
-            # callers fixed.
+            # Coverage-checked against the per-port host list, because that list
+            # is written as a *union* by the probe, the batch phase and the Full
+            # sweep — so it grows across runs and a cached XML that still parses
+            # is no evidence it covered the hosts in it now.  The IP list is the
+            # right thing to check even though nmap_worker() may hand nmap the
+            # portNN_hostnames.txt variant: that file is a pure derivation of
+            # this one, regenerated every run, and does not exist yet here.
+            live_list = f'{live_hosts_dir}/{host_file}'
             banner_done = _resume_cache_usable(
                 f'{output_path}/nmap_results/port{_port_fname(dest_port)}.xml',
-                0, f'port {dest_port} banner scan', None)
+                0, f'port {dest_port} banner scan', live_list)
             scripts_exist = _get_scripts_for_port(dest_port, target_scan)
             script_done = (not script_scan or not scripts_exist or
                            _resume_cache_usable(
                                f'{output_path}/nse_results/port{_port_fname(dest_port)}.xml',
-                               0, f'port {dest_port} NSE scan', None))
+                               0, f'port {dest_port} NSE scan', live_list))
             if not (banner_done and script_done):
                 files_to_scan.append(host_file)
 
