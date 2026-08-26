@@ -120,6 +120,10 @@ commit's in-progress run and erase its green check.
 
 Pass `--cleanup [dir]` to remove prior scan output non-interactively (reads `output_path` from `config.json` if no directory is given).
 
+## Command-Line Argument Parsing
+
+The CLI is parsed with `argparse` (`_build_arg_parser()`/`_parse_args()` in `spoonmap.py`, called once at the top of `main()`), not hand-rolled `'--flag' in sys.argv` checks. An unrecognized argument now exits non-zero with a usage message instead of being silently ignored: previously, any typo (`--verison`, `-v` before this flag existed, etc.) fell straight through into `main()`'s prompts, and with a `config.json` present — the documented "skip all prompts" mode — nothing then stood between that and masscan going out the door against a client's network. `--version`/`-v`/`-V`, `--check-update`, `--resume`, `--cleanup` (`nargs='?'`, distinguishing absent/bare/with-a-path), and `--target` are all argparse options now; `_resolve_cli_target()` and `_cleanup_cmd()` take the already-parsed value rather than re-reading `sys.argv`. `--version` is checked before `--check-update` in `main()`, so passing both together prints the version and exits without performing the update check.
+
 ## Operator Path Resolution
 
 Every operator-facing path — `config.json`, `exclusions.txt`, the default

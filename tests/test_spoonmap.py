@@ -54,7 +54,8 @@ from spoonmap import (
     _CONFIG_GENERATED_KEY,
     _host_discovery,
     _atomic_write,
-    _cli_target_from_argv,
+    _build_arg_parser,
+    _parse_args,
     _parse_range_line,
     _parse_target_arg,
     _parse_target_ranges,
@@ -3840,9 +3841,8 @@ class TestCleanupCmd:
 
     def test_cleanup_with_explicit_path(self, tmp_path, capsys):
         self._make_scan_data(tmp_path)
-        with patch('sys.argv', ['spoonmap.py', '--cleanup', str(tmp_path)]):
-            with pytest.raises(SystemExit) as exc:
-                _cleanup_cmd(str(tmp_path))
+        with pytest.raises(SystemExit) as exc:
+            _cleanup_cmd(str(tmp_path), str(tmp_path))
         assert exc.value.code == 0
         assert not (tmp_path / 'nmap_results').exists()
         assert not (tmp_path / 'findings.txt').exists()
@@ -3854,9 +3854,8 @@ class TestCleanupCmd:
         self._make_scan_data(out_dir)
         cfg = tmp_path / 'config.json'
         cfg.write_text(f'{{"output_path": "{out_dir}"}}')
-        with patch('sys.argv', ['spoonmap.py', '--cleanup']):
-            with pytest.raises(SystemExit) as exc:
-                _cleanup_cmd(str(tmp_path))
+        with pytest.raises(SystemExit) as exc:
+            _cleanup_cmd(str(tmp_path), None)
         assert exc.value.code == 0
         assert not _previous_results_exist(str(out_dir))
 
@@ -3867,9 +3866,8 @@ class TestCleanupCmd:
         self._make_scan_data(out_dir)
         cfg = tmp_path / 'config.json'
         cfg.write_text('{"output_path": "relative_output"}')
-        with patch('sys.argv', ['spoonmap.py', '--cleanup']):
-            with pytest.raises(SystemExit) as exc:
-                _cleanup_cmd(str(tmp_path))
+        with pytest.raises(SystemExit) as exc:
+            _cleanup_cmd(str(tmp_path), None)
         assert exc.value.code == 0
         assert not _previous_results_exist(str(out_dir))
 
@@ -3877,30 +3875,26 @@ class TestCleanupCmd:
         # --cleanup is the documented recovery command; a truncated config.json
         # must not make it fail with the same traceback as normal startup.
         (tmp_path / 'config.json').write_text('{"output_path":')
-        with patch('sys.argv', ['spoonmap.py', '--cleanup']):
-            with pytest.raises(SystemExit) as exc:
-                _cleanup_cmd(str(tmp_path))
+        with pytest.raises(SystemExit) as exc:
+            _cleanup_cmd(str(tmp_path), None)
         assert exc.value.code == 1
         assert 'could not parse' in capsys.readouterr().out
 
     def test_cleanup_no_data_exits_cleanly(self, tmp_path, capsys):
-        with patch('sys.argv', ['spoonmap.py', '--cleanup', str(tmp_path)]):
-            with pytest.raises(SystemExit) as exc:
-                _cleanup_cmd(str(tmp_path))
+        with pytest.raises(SystemExit) as exc:
+            _cleanup_cmd(str(tmp_path), str(tmp_path))
         assert exc.value.code == 0
         assert 'No scan data' in capsys.readouterr().out
 
     def test_cleanup_missing_dir_exits_error(self, tmp_path, capsys):
         missing = str(tmp_path / 'nonexistent')
-        with patch('sys.argv', ['spoonmap.py', '--cleanup', missing]):
-            with pytest.raises(SystemExit) as exc:
-                _cleanup_cmd(str(tmp_path))
+        with pytest.raises(SystemExit) as exc:
+            _cleanup_cmd(str(tmp_path), missing)
         assert exc.value.code == 1
 
     def test_cleanup_no_path_no_config_exits_error(self, tmp_path, capsys):
-        with patch('sys.argv', ['spoonmap.py', '--cleanup']):
-            with pytest.raises(SystemExit) as exc:
-                _cleanup_cmd(str(tmp_path))
+        with pytest.raises(SystemExit) as exc:
+            _cleanup_cmd(str(tmp_path), None)
         assert exc.value.code == 1
         assert 'Usage' in capsys.readouterr().out
 
@@ -3908,9 +3902,8 @@ class TestCleanupCmd:
         self._make_scan_data(tmp_path)
         (tmp_path / 'findings.json').write_text('[]')
         (tmp_path / 'spoonmap_output.json').write_text('[]')
-        with patch('sys.argv', ['spoonmap.py', '--cleanup', str(tmp_path)]):
-            with pytest.raises(SystemExit):
-                _cleanup_cmd(str(tmp_path))
+        with pytest.raises(SystemExit):
+            _cleanup_cmd(str(tmp_path), str(tmp_path))
         assert not (tmp_path / 'findings.json').exists()
         assert not (tmp_path / 'spoonmap_output.json').exists()
 
@@ -11073,52 +11066,172 @@ class TestParseTargetArg:
             _parse_target_arg('10.0.0.1,nope')
 
 
-class TestCliTargetFromArgv:
-    """--target extraction from argv."""
+class TestParseArgs:
+    """_parse_args(): the argparse-based CLI surface.
 
-    def test_absent_returns_none(self):
-        assert _cli_target_from_argv(['spoonmap.py']) is None
+    This is the fix for the underlying bug: before argparse, flags were
+    matched with bare `'--flag' in sys.argv`, so any unrecognized argument
+    (a typo, `-v`/`-V`, `--help`) was silently ignored and the run fell
+    through into a real scan under a config-driven run. Every test here
+    exercises _parse_args() directly, which is module-level (not inside
+    main(), which is `# pragma: no cover`) specifically so this rejection
+    path stays under test.
+    """
 
-    def test_value_returned(self):
-        assert _cli_target_from_argv(
-            ['spoonmap.py', '--target', '10.0.0.5']) == '10.0.0.5'
+    # ── unknown arguments must stop the run, not get ignored ──────────────
 
-    def test_value_missing_at_end_rejected(self):
-        with pytest.raises(ValueError, match='requires an address'):
-            _cli_target_from_argv(['spoonmap.py', '--target'])
+    def test_unknown_long_flag_exits_nonzero(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _parse_args(['--verison'])
+        assert exc.value.code != 0
+        assert 'unrecognized' in capsys.readouterr().err
 
-    def test_next_flag_not_consumed_as_value(self):
+    def test_unknown_short_flag_exits_nonzero(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _parse_args(['-x'])
+        assert exc.value.code != 0
+        assert 'unrecognized' in capsys.readouterr().err
+
+    def test_no_args_is_fine(self):
+        """The documented no-flags invocation must still parse cleanly."""
+        args = _parse_args([])
+        assert args.version is False
+        assert args.check_update is False
+        assert args.resume is False
+        assert args.cleanup is None
+        assert args.target is None
+
+    # ── --version / -v / -V ────────────────────────────────────────────────
+
+    def test_version_long_flag(self):
+        assert _parse_args(['--version']).version is True
+
+    def test_version_lowercase_short_flag(self):
+        assert _parse_args(['-v']).version is True
+
+    def test_version_uppercase_short_flag(self):
+        assert _parse_args(['-V']).version is True
+
+    # ── --help ──────────────────────────────────────────────────────────────
+
+    def test_help_long_flag_exits_zero(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _parse_args(['--help'])
+        assert exc.value.code == 0
+        assert 'spoonmap' in capsys.readouterr().out
+
+    def test_help_short_flag_exits_zero(self):
+        with pytest.raises(SystemExit) as exc:
+            _parse_args(['-h'])
+        assert exc.value.code == 0
+
+    def test_help_text_documents_every_flag(self, capsys):
+        with pytest.raises(SystemExit):
+            _parse_args(['--help'])
+        out = capsys.readouterr().out
+        for flag in ('--version', '--check-update', '--resume', '--cleanup',
+                     '--target'):
+            assert flag in out
+
+    # ── --cleanup: absent / bare / with a path are three distinct states ──
+
+    def test_cleanup_absent(self):
+        assert _parse_args([]).cleanup is None
+
+    def test_cleanup_bare(self):
+        args = _parse_args(['--cleanup'])
+        assert args.cleanup is spoonmap._CLEANUP_NO_PATH
+        assert args.cleanup is not None
+
+    def test_cleanup_with_path(self):
+        assert _parse_args(['--cleanup', '/tmp/out']).cleanup == '/tmp/out'
+
+    def test_cleanup_three_states_are_distinguishable(self):
+        absent = _parse_args([]).cleanup
+        bare = _parse_args(['--cleanup']).cleanup
+        with_path = _parse_args(['--cleanup', '/tmp/out']).cleanup
+        assert absent is None
+        assert bare is spoonmap._CLEANUP_NO_PATH
+        assert with_path == '/tmp/out'
+        assert absent != bare != with_path
+
+    # ── --target ────────────────────────────────────────────────────────────
+
+    def test_target_with_value(self):
+        assert _parse_args(['--target', '10.0.0.5']).target == '10.0.0.5'
+
+    def test_target_missing_value_exits_nonzero(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _parse_args(['--target'])
+        assert exc.value.code != 0
+        assert 'expected one argument' in capsys.readouterr().err
+
+    def test_target_next_flag_not_consumed_as_value(self, capsys):
         """--target --resume must not treat --resume as an address."""
-        with pytest.raises(ValueError, match='requires an address'):
-            _cli_target_from_argv(['spoonmap.py', '--target', '--resume'])
+        with pytest.raises(SystemExit) as exc:
+            _parse_args(['--target', '--resume'])
+        assert exc.value.code != 0
+        assert 'expected one argument' in capsys.readouterr().err
 
-    def test_coexists_with_other_flags(self):
-        assert _cli_target_from_argv(
-            ['spoonmap.py', '--resume', '--target', '10.0.0.5']) == '10.0.0.5'
+    # ── --resume / --check-update ──────────────────────────────────────────
+
+    def test_resume_flag(self):
+        assert _parse_args(['--resume']).resume is True
+
+    def test_check_update_flag(self):
+        assert _parse_args(['--check-update']).check_update is True
+
+    # ── combined flags, per the documented precedence ──────────────────────
+
+    def test_version_and_check_update_together_both_parse(self):
+        """Both flags parse; main() applies the documented precedence
+        (--version wins) at dispatch time -- see TestMainVersionDispatch."""
+        args = _parse_args(['--version', '--check-update'])
+        assert args.version is True
+        assert args.check_update is True
+
+    def test_resume_and_target_together(self):
+        args = _parse_args(['--resume', '--target', '10.0.0.5'])
+        assert args.resume is True
+        assert args.target == '10.0.0.5'
+
+    def test_cleanup_and_resume_together(self):
+        args = _parse_args(['--cleanup', '/tmp/out', '--resume'])
+        assert args.cleanup == '/tmp/out'
+        assert args.resume is True
+
+
+class TestBuildArgParser:
+    """_build_arg_parser(): the parser _parse_args() drives."""
+
+    def test_prog_name(self):
+        assert _build_arg_parser().prog == 'spoonmap'
+
+    def test_has_a_description(self):
+        assert _build_arg_parser().description
 
 
 class TestResolveCliTarget:
-    """main()'s entry point: returns tokens or exits non-zero."""
+    """main()'s entry point: returns tokens or exits non-zero.
+
+    _cli_target_from_argv() (hand-rolled argv extraction) was deleted when
+    the CLI moved to argparse: argparse itself now rejects a missing or
+    option-like --target value, so _resolve_cli_target() takes the already-
+    extracted value (argparse's `args.target`) rather than raw argv.
+    """
 
     def test_absent_returns_none(self):
-        assert _resolve_cli_target(['spoonmap.py']) is None
+        assert _resolve_cli_target(None) is None
 
     def test_valid_returns_tokens(self):
-        assert _resolve_cli_target(
-            ['spoonmap.py', '--target', '10.0.0.0/24']) == ['10.0.0.0/24']
+        assert _resolve_cli_target('10.0.0.0/24') == ['10.0.0.0/24']
 
     def test_invalid_exits_nonzero(self, capsys):
         """A bad address must abort the run, not scan an empty target set."""
         with pytest.raises(SystemExit) as exc:
-            _resolve_cli_target(['spoonmap.py', '--target', 'nope'])
+            _resolve_cli_target('nope')
         assert exc.value.code == 1
         assert 'ERROR' in capsys.readouterr().out
-
-    def test_missing_value_exits_nonzero(self, capsys):
-        with pytest.raises(SystemExit) as exc:
-            _resolve_cli_target(['spoonmap.py', '--target'])
-        assert exc.value.code == 1
-        assert 'requires an address' in capsys.readouterr().out
 
 
 class TestWriteCliTargetFile:

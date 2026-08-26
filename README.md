@@ -193,6 +193,9 @@ To print the installed version:
 
 ```bash
 spoonmap --version
+# -v and -V are accepted as short forms of --version and behave identically
+spoonmap -v
+spoonmap -V
 ```
 
 The version comes from the installed package's metadata, which is derived from
@@ -214,6 +217,19 @@ performs a single check on demand. To enable the check at every startup, set
 `"check_for_updates": true` in `config.json`; the key defaults to `false` and
 omitting it entirely means `false`. Only stable releases are reported —
 nightly release candidates are never advertised as updates.
+
+For a summary of every flag, use `--help` (or `-h`):
+
+```bash
+./spoonmap.py --help
+```
+
+The command line is parsed with Python's `argparse`, so an unrecognized flag
+(a typo like `--verison`, or anything else not listed above) is rejected with
+a usage message and a non-zero exit rather than being silently ignored — a
+mistyped flag must stop the run, not fall through into a scan. If both
+`--version` and `--check-update` are given together, `--version` takes
+precedence and the update check is not performed.
 
 ## Where Files Live
 

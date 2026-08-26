@@ -3,6 +3,7 @@
 # Author: Spoonman (Larry.Spohn@TrustedSec.com)
 # QA and Personal Pythonian Consultant: Bandrel (Justin.Bollinger@TrustedSec.com)
 
+import argparse
 import bisect
 import collections
 import contextlib
@@ -281,31 +282,83 @@ def _parse_target_arg(value):
     return tokens
 
 
-def _cli_target_from_argv(argv):
-    """Return the ``--target`` value from *argv*, or None if not supplied.
+# Sentinel distinguishing "--cleanup given with no path" (read output_path
+# from config.json) from "--cleanup not given at all" (None). A bare string
+# default would collide with a legitimately empty operator-supplied value.
+_CLEANUP_NO_PATH = object()
 
-    Raises ValueError when the flag is present but its value is missing, so
-    ``--target --resume`` cannot silently consume the next flag as an address.
+
+def _build_arg_parser():
+    """Construct SpooNMAP's argument parser.
+
+    Split out of _parse_args() so the parser itself (help text, registered
+    flags) can be inspected directly in tests without going through
+    parse_args()/sys.exit().
     """
-    if '--target' not in argv:
+    parser = argparse.ArgumentParser(
+        prog='spoonmap',
+        description='SpooNMAP: orchestrates masscan port discovery followed by '
+                     'nmap service/script scanning for authorized penetration '
+                     'tests. Run with no arguments for the interactive prompts, '
+                     'or place a config.json alongside it to skip them.',
+    )
+    parser.add_argument(
+        '--version', '-v', '-V', action='store_true',
+        help='Print the installed SpooNMAP version and exit. Checked first: '
+             'if both --version and --check-update are given, --version wins.',
+    )
+    parser.add_argument(
+        '--check-update', action='store_true',
+        help='Check GitHub for a newer release and exit without scanning. '
+             'Ignored if --version is also given.',
+    )
+    parser.add_argument(
+        '--resume', action='store_true',
+        help='Resume a previous scan, reusing cached output that is still valid.',
+    )
+    parser.add_argument(
+        '--cleanup', nargs='?', const=_CLEANUP_NO_PATH, default=None,
+        metavar='DIR',
+        help='Remove prior scan output and exit. With no DIR, reads '
+             'output_path from config.json in the current directory.',
+    )
+    parser.add_argument(
+        '--target', metavar='SPEC',
+        help='Comma-separated target(s) to scan (IP, CIDR, A-B range, or '
+             '"address netmask") instead of prompting or using target_file.',
+    )
+    return parser
+
+
+def _parse_args(argv=None):
+    """Parse SpooNMAP's command line into a namespace.
+
+    Module-level (not inline in main()) so the reject paths stay under test:
+    main() is `# pragma: no cover`, and "an unrecognized flag stops the run
+    instead of falling through into a scan" -- along with a malformed
+    --cleanup/--target -- is exactly the behaviour that must not regress.
+    argparse itself handles --help (prints and exits 0) and any unknown
+    argument (prints usage to stderr and exits 2).
+    """
+    return _build_arg_parser().parse_args(argv)
+
+
+def _resolve_cli_target(value):
+    """Return validated ``--target`` tokens from *value*, or None if absent.
+
+    *value* is the parsed ``--target`` string (argparse's ``args.target``),
+    or None if the flag was not given -- argparse itself now rejects a missing
+    or option-like value (e.g. ``--target --resume``) before this is ever
+    called. Exits non-zero on a value that fails validation. Lives outside
+    main() so the reject path is testable: main() is an interactive entry
+    point excluded from coverage, and "bad --target aborts the run" is
+    exactly the behaviour that must not regress into a clean scan over an
+    empty target set.
+    """
+    if value is None:
         return None
-    idx = argv.index('--target')
-    if idx + 1 >= len(argv) or argv[idx + 1].startswith('-'):
-        raise ValueError('--target requires an address, e.g. --target 10.0.0.5')
-    return argv[idx + 1]
-
-
-def _resolve_cli_target(argv):
-    """Return validated ``--target`` tokens from *argv*, or None if absent.
-
-    Exits non-zero on a malformed value.  Lives outside main() so the reject
-    path is testable: main() is an interactive entry point excluded from
-    coverage, and "bad --target aborts the run" is exactly the behaviour that
-    must not regress into a clean scan over an empty target set.
-    """
     try:
-        value = _cli_target_from_argv(argv)
-        return _parse_target_arg(value) if value else None
+        return _parse_target_arg(value)
     except ValueError as exc:
         print(_COLOR_ERROR + f'ERROR: {exc}' + _COLOR_RESET)
         sys.exit(1)
@@ -5177,13 +5230,17 @@ def _read_config_file(path):
     return config_parser
 
 
-def _cleanup_cmd(dir_path):
-    """Handle --cleanup: remove prior scan output from output_path and exit."""
-    idx = sys.argv.index('--cleanup')
-    cleanup_path = None
-    if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith('-'):
-        cleanup_path = sys.argv[idx + 1]
-    else:
+def _cleanup_cmd(dir_path, cleanup_arg):
+    """Handle --cleanup: remove prior scan output from output_path and exit.
+
+    *cleanup_arg* is the already-normalised --cleanup value: None means the
+    flag was given with no path (so output_path is read from config.json in
+    dir_path instead), otherwise it's the operator-supplied path. The caller
+    (main()) is responsible for translating argparse's `_CLEANUP_NO_PATH`
+    sentinel to None before calling this.
+    """
+    cleanup_path = cleanup_arg
+    if not cleanup_path:
         cfg_file = os.path.join(dir_path, 'config.json')
         if os.path.exists(cfg_file):
             cfg = _read_config_file(cfg_file)
@@ -6003,9 +6060,18 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
     # giant test versus exercising each called function directly.
     global output_path
 
+    # The only place main() touches argv: everything downstream reads the
+    # parsed namespace. argparse itself handles --help (prints, exits 0) and
+    # any unrecognized argument (prints usage to stderr, exits 2) before
+    # returning here at all -- that rejection is the whole point of this
+    # change: a mistyped flag must stop the run, not fall through into a scan.
+    args = _parse_args()
+
     # Handled before the banner and before any terminal state is touched:
     # `spoonmap --version` should emit one parseable line and nothing else.
-    if '--version' in sys.argv:
+    # Precedence: --version is checked first, so `--version --check-update`
+    # together print the version and exit without ever checking for updates.
+    if args.version:
         print(_tool_version())
         sys.exit(0)
     # On-demand, regardless of config: asking whether an update exists should
@@ -6013,7 +6079,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
     # (unlike the launch-time call below) because an operator who explicitly
     # asked for a check must be told when it failed rather than seeing
     # silence indistinguishable from "you are up to date".
-    if '--check-update' in sys.argv:
+    if args.check_update:
         _check_for_updates(quiet=False)
         sys.exit(0)
 
@@ -6045,12 +6111,13 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         # Get options from configuration file if it exists
         dir_path = _operator_dir()
 
-        if '--cleanup' in sys.argv:
-            _cleanup_cmd(dir_path)  # prints result and exits
-        resume = '--resume' in sys.argv
+        if args.cleanup is not None:
+            cleanup_arg = None if args.cleanup is _CLEANUP_NO_PATH else args.cleanup
+            _cleanup_cmd(dir_path, cleanup_arg)  # prints result and exits
+        resume = args.resume
         # Validate --target up front: a bad address must abort before any
         # prompting or scanning, not after.
-        cli_target_tokens = _resolve_cli_target(sys.argv)
+        cli_target_tokens = _resolve_cli_target(args.target)
         config_loaded = False
         config_generated = False
         if os.path.exists(f'{dir_path}/config.json'):
