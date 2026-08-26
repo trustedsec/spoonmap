@@ -173,6 +173,10 @@ class TestToolVersion:
 
     def test_the_unknown_sentinel_is_not_mistakable_for_a_version(self):
         assert not spoonmap._UNKNOWN_VERSION[0].isdigit()
+        # The property that actually matters for update checking: an unknown
+        # version cannot be parsed as a comparable release, so running from
+        # a checkout never claims an update is available.
+        assert spoonmap._parse_release_tag(spoonmap._UNKNOWN_VERSION) is None
 
 
 class TestRaiseFdLimit:
@@ -12495,3 +12499,134 @@ class TestCoverageRecordIsSingleAndAtomic:
         assert (disc / 'portFull.xml.coverage').exists()
         spoonmap._delete_previous_results(str(tmp_path))
         assert not (tmp_path / 'discovery').exists()
+
+
+class TestUpdateCheckIsOptIn:
+    """The launch-time update check is off unless explicitly enabled.
+
+    SpooNMAP runs from jumpboxes inside client networks, where an unprompted
+    call to api.github.com is an outbound beacon from an engagement host that
+    nobody authorised. hate_crack defaults this to True; SpooNMAP inverts it,
+    and these tests are what keep it inverted.
+    """
+
+    def test_a_config_that_never_mentions_the_key_makes_no_network_call(self):
+        def explode(*args, **kwargs):
+            raise AssertionError(
+                'a default config performed a network call at launch'
+            )
+
+        with patch('spoonmap.urllib.request.urlopen', side_effect=explode):
+            spoonmap._maybe_check_for_updates(False)
+
+    def test_enabling_it_performs_the_check(self):
+        with patch('spoonmap._check_for_updates') as checked:
+            spoonmap._maybe_check_for_updates(True)
+        checked.assert_called_once()
+
+    def test_load_config_defaults_the_key_to_false(self):
+        cfg = _config_dict()
+        assert 'check_for_updates' not in cfg
+        assert _load_config(cfg, '/t')['check_for_updates'] is False
+
+    def test_load_config_honours_an_explicit_true(self):
+        cfg = _config_dict(check_for_updates=True)
+        assert _load_config(cfg, '/t')['check_for_updates'] is True
+
+    def test_load_config_accepts_the_legacy_quoted_spelling(self):
+        """_config_bool() accepts "True"/"False" indefinitely for hand-edited
+        configs; this key is no exception."""
+        cfg = _config_dict(check_for_updates='True')
+        assert _load_config(cfg, '/t')['check_for_updates'] is True
+
+
+class TestCheckForUpdates:
+    """The check itself: comparison, output, and total failure tolerance."""
+
+    def _response(self, tag):
+        body = json.dumps({'tag_name': tag}).encode()
+        resp = MagicMock()
+        resp.read.return_value = body
+        resp.__enter__.return_value = resp
+        return resp
+
+    def test_a_newer_release_is_reported(self, capsys):
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        return_value=self._response('v0.1.0')):
+            spoonmap._check_for_updates()
+        out = capsys.readouterr().out
+        assert '0.1.0' in out
+
+    def test_being_up_to_date_says_so_without_claiming_an_update(self, capsys):
+        with patch('spoonmap._tool_version', return_value='0.1.0'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        return_value=self._response('v0.1.0')):
+            spoonmap._check_for_updates()
+        assert 'Update available' not in capsys.readouterr().out
+
+    def test_an_older_release_is_not_an_update(self, capsys):
+        with patch('spoonmap._tool_version', return_value='0.2.0'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        return_value=self._response('v0.1.0')):
+            spoonmap._check_for_updates()
+        assert 'Update available' not in capsys.readouterr().out
+
+    def test_an_unknown_local_version_never_claims_an_update(self, capsys):
+        """Running from a checkout has no version to compare. Reporting the
+        latest release is fine; asserting the operator is behind is not --
+        it would nag everyone running from a clone, which is most of them."""
+        with patch('spoonmap._tool_version',
+                        return_value=spoonmap._UNKNOWN_VERSION), \
+             patch('spoonmap.urllib.request.urlopen',
+                        return_value=self._response('v0.1.0')):
+            spoonmap._check_for_updates()
+        out = capsys.readouterr().out
+        assert 'Update available' not in out
+        assert '0.1.0' in out
+
+    def test_a_network_failure_is_swallowed(self, capsys):
+        """A failed update check must never delay, prompt, or abort a scan."""
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        side_effect=OSError('no route to host')):
+            spoonmap._check_for_updates()  # must not raise
+        assert 'Update available' not in capsys.readouterr().out
+
+    def test_unparseable_json_is_swallowed(self, capsys):
+        resp = MagicMock()
+        resp.read.return_value = b'<html>404</html>'
+        resp.__enter__.return_value = resp
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen', return_value=resp):
+            spoonmap._check_for_updates()  # must not raise
+
+    def test_a_release_with_no_tag_name_is_swallowed(self, capsys):
+        resp = MagicMock()
+        resp.read.return_value = b'{}'
+        resp.__enter__.return_value = resp
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen', return_value=resp):
+            spoonmap._check_for_updates()  # must not raise
+
+
+class TestParseReleaseTag:
+    """Version comparison, without a packaging dependency."""
+
+    @pytest.mark.parametrize('text,expected', [
+        ('v0.1.0', (0, 1, 0)),
+        ('0.1.0', (0, 1, 0)),
+        ('v10.4.7', (10, 4, 7)),
+        # Not a comparable release: a candidate, a dev build, junk, and the
+        # running-from-source sentinel.
+        ('v0.1.0rc1', None),
+        ('0.0.1.post1.dev1', None),
+        ('nightly', None),
+        ('', None),
+    ])
+    def test_only_plain_releases_compare(self, text, expected):
+        assert spoonmap._parse_release_tag(text) == expected
+
+    def test_comparison_is_numeric_not_lexical(self):
+        assert (spoonmap._parse_release_tag('v0.10.0')
+                > spoonmap._parse_release_tag('v0.9.0'))

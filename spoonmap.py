@@ -24,6 +24,8 @@ import threading
 import time
 import queue
 from queue import Queue
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as etree
 from importlib import metadata
 
@@ -5393,6 +5395,13 @@ _CONFIG_DOCS = {
          'true, false (JSON booleans; legacy quoted "True"/"False" '
          'still accepted)'),
     ],
+    'check_for_updates': [
+        ('__check_for_updates_note__',
+         'Optional. When true, SpooNMAP contacts api.github.com at startup to see '
+         'whether a newer release exists. Default false, and absent means false: the '
+         'tool makes no network connection other than the scan itself unless you turn '
+         'this on. Use --check-update for a one-off check without enabling it here.'),
+    ],
     'target_scan': [
         ('__target_scan_choices__',
          'External, Internal (case-insensitive; any other value stops the run '
@@ -5419,7 +5428,7 @@ _CONFIG_DOCS = {
 # Canonical key order for a written config.json, matching config.json.sample.
 _CONFIG_FIELD_ORDER = (
     'scan_categories', 'dest_ports', 'masscan_batch_size', 'banner_scan',
-    'script_scan', 'host_discovery', 'resume', 'target_scan', 'max_rate',
+    'script_scan', 'host_discovery', 'resume', 'check_for_updates', 'target_scan', 'max_rate',
     'nmap_threads', 'nmap_threshold', 'target_file', 'output_path',
     'exclusions_file',
 )
@@ -5776,6 +5785,10 @@ def _load_config(config_parser, dir_path, resume=False):
         'host_discovery', config_parser.get('host_discovery'), True)
     # ORed, never overwritten: --resume can't be turned back off by the file.
     resume = resume or _config_bool('resume', config_parser.get('resume'), False)
+    # Absent means off, and absent is the normal case. This is the only way to
+    # enable a launch-time network call; see _check_for_updates().
+    check_for_updates = _config_bool(
+        'check_for_updates', config_parser.get('check_for_updates', False), False)
     config_generated = bool(config_parser.get(_CONFIG_GENERATED_KEY))
 
     # Resolve relative paths in config relative to the operator directory
@@ -5803,6 +5816,7 @@ def _load_config(config_parser, dir_path, resume=False):
         'script_scan': script_scan,
         'host_discovery': host_discovery,
         'resume': resume,
+        'check_for_updates': check_for_updates,
         'config_generated': config_generated,
     }
 
@@ -5845,6 +5859,87 @@ def _tool_version():
         return _UNKNOWN_VERSION
 
 
+# Latest *release* specifically: GitHub's /releases/latest excludes
+# pre-releases, so the vX.Y.ZrcN candidates cut on `nightly` are never
+# advertised to an operator as an available update.
+_RELEASE_API_URL = (
+    'https://api.github.com/repos/trustedsec/spoonmap/releases/latest'
+)
+_RELEASES_URL = 'https://github.com/trustedsec/spoonmap/releases'
+# Short: this runs before a scan, and a hung TCP connection to a network the
+# jumpbox cannot reach must not become a stalled engagement.
+_UPDATE_CHECK_TIMEOUT = 5
+
+_RELEASE_TAG_RE = re.compile(r'^v?(\d+)\.(\d+)\.(\d+)$')
+
+
+def _parse_release_tag(text):
+    """(major, minor, patch) for a plain release, else None.
+
+    Deliberately strict. A candidate (0.1.0rc1) or a dev build
+    (0.0.1.post1.dev1) is not comparable against a release without PEP 440
+    semantics, and spoonmap.py is stdlib-only by design -- there is no
+    `packaging` here to do it properly, so anything that is not an unambiguous
+    X.Y.Z is declined rather than guessed at.
+    """
+    match = _RELEASE_TAG_RE.match((text or '').strip())
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def _check_for_updates(timeout=_UPDATE_CHECK_TIMEOUT):
+    """Report whether a newer release exists. Never raises, never blocks long.
+
+    Every failure mode -- no route, DNS, TLS, rate limiting, an HTML error page
+    where JSON was expected, a release with no tag_name -- is swallowed. An
+    update check is a courtesy; a scan must never fail or stall because one did.
+    """
+    try:
+        with urllib.request.urlopen(_RELEASE_API_URL, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode('utf-8', 'replace'))
+        latest_text = payload.get('tag_name', '')
+    except Exception:
+        # Intentionally broad: see the docstring. There is no failure here
+        # worth interrupting an operator for, and the set of exceptions urllib
+        # and json can raise between them is not worth enumerating wrongly.
+        return
+
+    latest = _parse_release_tag(latest_text)
+    if latest is None:
+        return
+
+    current_text = _tool_version()
+    current = _parse_release_tag(current_text)
+    if current is None:
+        # Running from a checkout, or on a dev build. There is nothing to
+        # compare, so report the fact and make no claim about it -- telling
+        # every operator running from a clone that they are out of date would
+        # be wrong far more often than right.
+        print(f'Latest release: {latest_text} (local version unknown). '
+              f'See {_RELEASES_URL}')
+        return
+
+    if latest > current:
+        print(_COLOR_ERROR
+              + f'Update available: {latest_text} (current: {current_text}). '
+                f'See {_RELEASES_URL}'
+              + _COLOR_RESET)
+    else:
+        print(f'SpooNMAP {current_text} is up to date.')
+
+
+def _maybe_check_for_updates(enabled):
+    """Run the update check only if the operator turned it on.
+
+    Separate from _check_for_updates() so the gate itself is testable: main()
+    is under `pragma: no cover`, and "does a default config reach the network"
+    is exactly the question that must not go untested.
+    """
+    if enabled:
+        _check_for_updates()
+
+
 # The Main Guts
 def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
     # already-independently-tested functions behind input()-driven prompts,
@@ -5856,6 +5951,11 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
     # `spoonmap --version` should emit one parseable line and nothing else.
     if '--version' in sys.argv:
         print(_tool_version())
+        sys.exit(0)
+    # On-demand, regardless of config: asking whether an update exists should
+    # not require leaving the launch-time check switched on.
+    if '--check-update' in sys.argv:
+        _check_for_updates()
         sys.exit(0)
 
     # Save initial terminal state
@@ -5915,6 +6015,8 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             host_discovery     = cfg['host_discovery']
             resume             = cfg['resume']
             config_generated   = cfg['config_generated']
+
+            _maybe_check_for_updates(cfg['check_for_updates'])
 
         # A config this tool wrote is a saved answer sheet, not a hand-authored
         # one, so ask about pre-existing output *before* the prompts: [d]elete and
