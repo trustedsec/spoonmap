@@ -222,6 +222,22 @@ class TestMainVersionDispatch:
         mock_version.assert_not_called()
         mock_check.assert_not_called()
 
+    def test_version_takes_precedence_over_check_update(self, capsys):
+        """Documented precedence: if both flags are given, --version wins and
+        the update check -- a network call to api.github.com -- never runs.
+        A mutation that swapped the two `if` blocks in main() would leave
+        every other test in this class green while making
+        `--check-update --version` reach out to the network from a jumpbox,
+        which the README promises never happens unless explicitly asked."""
+        with patch('sys.argv', ['spoonmap.py', '--check-update', '--version']), \
+             patch('spoonmap._tool_version', return_value='1.2.3'), \
+             patch('spoonmap._check_for_updates') as mock_check, \
+             pytest.raises(SystemExit) as exc_info:
+            spoonmap.main()
+        assert exc_info.value.code == 0
+        assert capsys.readouterr().out.strip() == '1.2.3'
+        mock_check.assert_not_called()
+
 
 class TestRaiseFdLimit:
     def test_sets_soft_limit_to_hard_when_below_65535(self):
@@ -3906,6 +3922,59 @@ class TestCleanupCmd:
             _cleanup_cmd(str(tmp_path), str(tmp_path))
         assert not (tmp_path / 'findings.json').exists()
         assert not (tmp_path / 'spoonmap_output.json').exists()
+
+    def test_empty_string_cleanup_arg_is_not_treated_as_absent(self, tmp_path, capsys):
+        """An empty string is a real, distinct value from None -- it must
+        NOT fall into the "--cleanup given with no path" config.json
+        fallback. `if not cleanup_arg:` collapses '' and None together and
+        would resolve '' against config.json's output_path, silently
+        deleting whatever scan data lives there instead of erroring.
+        A shell mistake like `./spoonmap.py --cleanup "$OUTDIR"` with
+        OUTDIR unset passes '' this way -- it must be a hard, non-destructive
+        error, exactly like giving no --cleanup value at all used to require
+        an explicit path. Assert the data survives, not just the exit code:
+        the exit code alone would still pass even if cleanup deleted first.
+        """
+        out_dir = tmp_path / 'out'
+        out_dir.mkdir()
+        self._make_scan_data(out_dir)
+        cfg = tmp_path / 'config.json'
+        cfg.write_text(f'{{"output_path": "{out_dir}"}}')
+        with pytest.raises(SystemExit) as exc:
+            _cleanup_cmd(str(tmp_path), '')
+        assert exc.value.code != 0
+        assert (out_dir / 'nmap_results').exists()
+        assert (out_dir / 'findings.txt').exists()
+        assert (out_dir / 'all_live_hosts.txt').exists()
+
+
+class TestMainCleanupDispatch:
+    """main()'s --cleanup sentinel translation.
+
+    args.cleanup is one of three states from _parse_args(): None (absent),
+    the `_CLEANUP_NO_PATH` sentinel (given with no value), or a path string.
+    main() must translate the sentinel to None before calling _cleanup_cmd()
+    -- if that ternary were ever dropped or inverted, _cleanup_cmd() would
+    receive the truthy sentinel object itself and die inside
+    os.path.isdir() with a TypeError traceback instead of reading
+    config.json as documented.
+    """
+
+    def test_bare_cleanup_passes_none_not_the_sentinel(self, tmp_path):
+        with patch('sys.argv', ['spoonmap.py', '--cleanup']), \
+             patch('spoonmap._operator_dir', return_value=str(tmp_path)), \
+             patch('spoonmap._cleanup_cmd', side_effect=SystemExit(0)) as mock_cleanup, \
+             pytest.raises(SystemExit):
+            spoonmap.main()
+        mock_cleanup.assert_called_once_with(str(tmp_path), None)
+
+    def test_cleanup_with_path_passes_the_path(self, tmp_path):
+        with patch('sys.argv', ['spoonmap.py', '--cleanup', str(tmp_path)]), \
+             patch('spoonmap._operator_dir', return_value=str(tmp_path)), \
+             patch('spoonmap._cleanup_cmd', side_effect=SystemExit(0)) as mock_cleanup, \
+             pytest.raises(SystemExit):
+            spoonmap.main()
+        mock_cleanup.assert_called_once_with(str(tmp_path), str(tmp_path))
 
 
 class TestPathCompletion:
@@ -11092,6 +11161,17 @@ class TestParseArgs:
         assert exc.value.code != 0
         assert 'unrecognized' in capsys.readouterr().err
 
+    def test_abbreviated_flag_is_rejected(self, capsys):
+        """allow_abbrev=False: a half-typed flag is a usage error, not a
+        guess. Without this, '--re' would silently mean '--resume', '--targ'
+        would mean '--target', and '--clean' would mean '--cleanup' -- an
+        undocumented widening of the accepted surface for a tool that fires
+        packets at a client's network under a signed scope."""
+        with pytest.raises(SystemExit) as exc:
+            _parse_args(['--targ', '10.0.0.5'])
+        assert exc.value.code != 0
+        assert 'unrecognized' in capsys.readouterr().err
+
     def test_no_args_is_fine(self):
         """The documented no-flags invocation must still parse cleanly."""
         args = _parse_args([])
@@ -11153,7 +11233,9 @@ class TestParseArgs:
         assert absent is None
         assert bare is spoonmap._CLEANUP_NO_PATH
         assert with_path == '/tmp/out'
-        assert absent != bare != with_path
+        assert absent != bare
+        assert bare != with_path
+        assert absent != with_path
 
     # ── --target ────────────────────────────────────────────────────────────
 

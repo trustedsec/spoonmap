@@ -301,6 +301,12 @@ def _build_arg_parser():
                      'nmap service/script scanning for authorized penetration '
                      'tests. Run with no arguments for the interactive prompts, '
                      'or place a config.json alongside it to skip them.',
+        # A half-typed flag must be a usage error, not a guess: without this,
+        # argparse accepts any unambiguous prefix (--re for --resume, --targ
+        # for --target, --clean for --cleanup), which silently widens the
+        # accepted surface beyond what's documented for a tool that fires
+        # packets at a client's network under a signed scope.
+        allow_abbrev=False,
     )
     parser.add_argument(
         '--version', '-v', '-V', action='store_true',
@@ -5240,7 +5246,7 @@ def _cleanup_cmd(dir_path, cleanup_arg):
     sentinel to None before calling this.
     """
     cleanup_path = cleanup_arg
-    if not cleanup_path:
+    if cleanup_arg is None:
         cfg_file = os.path.join(dir_path, 'config.json')
         if os.path.exists(cfg_file):
             cfg = _read_config_file(cfg_file)

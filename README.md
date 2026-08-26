@@ -167,6 +167,8 @@ The value accepts anything a target file line accepts — bare IP, CIDR, `A-B` r
 
 `--target` takes precedence over both `config.json`'s `target_file` and the interactive prompt, so it also works in otherwise fully non-interactive runs. The addresses are written to `cli_targets.txt` in `output_path`; **`ranges.txt` is never modified**, so your engagement scope file stays intact and there is a record on disk of what each run actually targeted.
 
+`--target=10.0.0.5` (an `=` between flag and value) now works too, same as `--target 10.0.0.5` — as does `--cleanup=/path/to/output`. Before this tool moved to `argparse`, the `--flag=value` form matched none of the hand-rolled `'--flag' in sys.argv` checks, so `--target=10.0.0.5` was silently ignored entirely and the scan ran against `ranges.txt` instead of the address you actually asked for — the one case where the old bug didn't just ignore a flag, it silently changed scope.
+
 To resume an interrupted scan without any prompts, use the `--resume` flag:
 
 ```
@@ -229,7 +231,10 @@ The command line is parsed with Python's `argparse`, so an unrecognized flag
 a usage message and a non-zero exit rather than being silently ignored — a
 mistyped flag must stop the run, not fall through into a scan. If both
 `--version` and `--check-update` are given together, `--version` takes
-precedence and the update check is not performed.
+precedence and the update check is not performed. Abbreviated flags (e.g.
+`--targ` for `--target`, `--re` for `--resume`) are **not** accepted — a
+half-typed flag is a usage error, not a guess, so every flag must be spelled
+out in full.
 
 ## Where Files Live
 
