@@ -25,6 +25,7 @@ import time
 import queue
 from queue import Queue
 import xml.etree.ElementTree as etree
+from importlib import metadata
 
 _COLOR_INFO     = '\x1b[38;5;51m'    # electric cyan   — "currently doing X"
 _COLOR_PROGRESS = '\x1b[38;5;118m'   # neon lime green — completion status / results
@@ -5820,12 +5821,42 @@ def _operator_dir():
     return os.getcwd()
 
 
+# What _tool_version() reports when there is no distribution metadata to read.
+# Deliberately not a number: it flows into the update check, where anything
+# parseable as a version would be compared against the latest release and
+# produce a confident wrong answer.
+_UNKNOWN_VERSION = 'unknown (running from source)'
+
+
+def _tool_version():
+    """The installed SpooNMAP version, or _UNKNOWN_VERSION.
+
+    Read from distribution metadata rather than a string in this file, because
+    the version is derived from git tags at build time (see pyproject.toml's
+    [tool.hatch.version]) and a literal here would be a second, drifting copy.
+
+    The documented invocation `./spoonmap.py` from a clone installs nothing, so
+    PackageNotFoundError is the *normal* case for a developer or an operator
+    running from a checkout -- not an error worth a warning.
+    """
+    try:
+        return metadata.version('spoonmap')
+    except metadata.PackageNotFoundError:
+        return _UNKNOWN_VERSION
+
+
 # The Main Guts
 def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
     # already-independently-tested functions behind input()-driven prompts,
     # so there's little signal in mocking every prompt/subprocess in one
     # giant test versus exercising each called function directly.
     global output_path
+
+    # Handled before the banner and before any terminal state is touched:
+    # `spoonmap --version` should emit one parseable line and nothing else.
+    if '--version' in sys.argv:
+        print(_tool_version())
+        sys.exit(0)
 
     # Save initial terminal state
     initial_term_state = save_terminal_state()

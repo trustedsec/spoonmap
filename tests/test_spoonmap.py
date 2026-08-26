@@ -156,6 +156,25 @@ class TestVerifyPythonVersion:
             verify_python_version()  # must not raise
 
 
+class TestToolVersion:
+    """_tool_version() reports the installed version, or says it cannot."""
+
+    def test_reports_the_installed_distribution_version(self):
+        with patch('spoonmap.metadata.version', return_value='1.2.3'):
+            assert spoonmap._tool_version() == '1.2.3'
+
+    def test_running_from_a_checkout_is_not_a_version(self):
+        """No distribution metadata exists when spoonmap.py is run as a plain
+        script from a clone, which is the documented invocation. That must read
+        as 'unknown', never as a version number that could be compared."""
+        with patch('spoonmap.metadata.version',
+                   side_effect=spoonmap.metadata.PackageNotFoundError):
+            assert spoonmap._tool_version() == spoonmap._UNKNOWN_VERSION
+
+    def test_the_unknown_sentinel_is_not_mistakable_for_a_version(self):
+        assert not spoonmap._UNKNOWN_VERSION[0].isdigit()
+
+
 class TestRaiseFdLimit:
     def test_sets_soft_limit_to_hard_when_below_65535(self):
         with patch('spoonmap.resource.getrlimit', return_value=(1024, 4096)), \
