@@ -9,6 +9,7 @@ import readline
 import subprocess
 import textwrap
 import threading
+import urllib.error
 from pathlib import Path
 from queue import Empty, Queue
 from unittest.mock import MagicMock, patch
@@ -154,6 +155,71 @@ class TestVerifyPythonVersion:
     def test_python_3_6_plus_is_ok(self):
         with patch('sys.version_info', (3, 10, 0, 'final', 0)):
             verify_python_version()  # must not raise
+
+
+class TestToolVersion:
+    """_tool_version() reports the installed version, or says it cannot."""
+
+    def test_reports_the_installed_distribution_version(self):
+        with patch('spoonmap.metadata.version', return_value='1.2.3'):
+            assert spoonmap._tool_version() == '1.2.3'
+
+    def test_running_from_a_checkout_is_not_a_version(self):
+        """No distribution metadata exists when spoonmap.py is run as a plain
+        script from a clone, which is the documented invocation. That must read
+        as 'unknown', never as a version number that could be compared."""
+        with patch('spoonmap.metadata.version',
+                   side_effect=spoonmap.metadata.PackageNotFoundError):
+            assert spoonmap._tool_version() == spoonmap._UNKNOWN_VERSION
+
+    def test_the_unknown_sentinel_is_not_mistakable_for_a_version(self):
+        assert not spoonmap._UNKNOWN_VERSION[0].isdigit()
+        # The property that actually matters for update checking: an unknown
+        # version cannot be parsed as a comparable release, so running from
+        # a checkout never claims an update is available.
+        assert spoonmap._parse_release_tag(spoonmap._UNKNOWN_VERSION) is None
+
+
+class TestMainVersionDispatch:
+    """main()'s `--version`/`--check-update` argv handling.
+
+    main() is `# pragma: no cover` for its interactive body, but the
+    --version/--check-update branch is handled before any prompting or
+    terminal-state work, so it can be exercised directly: patch sys.argv,
+    call main(), and confirm it exits 0 having called the right underlying
+    function. Without this, mutating either branch to `print('x')` left the
+    full suite green -- _tool_version() and _check_for_updates() were only
+    ever covered in isolation, never through main()'s own wiring.
+    """
+
+    def test_version_flag_prints_tool_version_and_exits(self, capsys):
+        with patch('sys.argv', ['spoonmap.py', '--version']), \
+             patch('spoonmap._tool_version', return_value='1.2.3'), \
+             pytest.raises(SystemExit) as exc_info:
+            spoonmap.main()
+        assert exc_info.value.code == 0
+        assert capsys.readouterr().out.strip() == '1.2.3'
+
+    def test_check_update_flag_calls_check_for_updates_non_quiet_and_exits(self):
+        with patch('sys.argv', ['spoonmap.py', '--check-update']), \
+             patch('spoonmap._check_for_updates') as mock_check, \
+             pytest.raises(SystemExit) as exc_info:
+            spoonmap.main()
+        assert exc_info.value.code == 0
+        mock_check.assert_called_once_with(quiet=False)
+
+    def test_neither_flag_does_not_short_circuit(self):
+        """A sanity check that this dispatch only fires for its own flags --
+        without it, a mutation that made the --version branch unconditional
+        would not be caught by the two tests above."""
+        with patch('sys.argv', ['spoonmap.py']), \
+             patch('spoonmap._tool_version') as mock_version, \
+             patch('spoonmap._check_for_updates') as mock_check, \
+             patch('spoonmap.save_terminal_state', side_effect=RuntimeError('stop')):
+            with pytest.raises(RuntimeError, match='stop'):
+                spoonmap.main()
+        mock_version.assert_not_called()
+        mock_check.assert_not_called()
 
 
 class TestRaiseFdLimit:
@@ -2846,6 +2912,35 @@ class TestBuildInteractiveConfig:
         assert reloaded['host_discovery'] is False
         assert reloaded['resume'] is False
 
+    def test_check_for_updates_true_survives_a_regeneration_round_trip(self, tmp_path):
+        """An operator who set check_for_updates: true must not silently lose
+        it when SpooNMAP rewrites config.json (e.g. the [d]elete/[a]ppend
+        re-prompt flow). Exercises the actual write -> disk -> reload path,
+        not just the in-memory dict, since a key present in the dict but
+        dropped by json.dump, or never read back by _load_config, would pass
+        a weaker check."""
+        cfg = _build_interactive_config(
+            'All', [], 'All', True, False, 'Internal', '2000',
+            '/t/r', '/t/o', None, 5, 5, 5_000_000, True,
+            check_for_updates=True)
+        assert cfg['check_for_updates'] is True
+        path = tmp_path / 'config.json'
+        assert _write_interactive_config(str(path), cfg) is True
+        reloaded = _load_config(json.loads(path.read_text()), '/t')
+        assert reloaded['check_for_updates'] is True
+
+    def test_check_for_updates_false_also_writes_explicitly(self):
+        """False must be written as an explicit key too, not merely omitted
+        -- an omitted key would happen to default to False on reload, which
+        would make this test pass for the wrong reason if the field were
+        dropped from `values` entirely."""
+        cfg = _build_interactive_config(
+            'All', [], 'All', True, False, 'Internal', '2000',
+            'r', 'o', None, 5, 5, 5_000_000, True,
+            check_for_updates=False)
+        assert 'check_for_updates' in cfg
+        assert cfg['check_for_updates'] is False
+
     def test_exclusions_none_becomes_empty_string(self):
         cfg = _build_interactive_config(
             'All', [], 'All', True, False, 'Internal', '2000',
@@ -2954,6 +3049,12 @@ class TestConfigDocs:
 
     def test_sample_has_no_generated_marker(self):
         assert _CONFIG_GENERATED_KEY not in self._sample()
+
+    def test_check_for_updates_defaults_to_false_in_sample(self):
+        """The security model requires this key to default false. Flipping it
+        in the sample is the most likely route to it being enabled by accident.
+        This test pins the value permanently."""
+        assert self._sample()['check_for_updates'] is False
 
     def test_scan_categories_choices_track_service_categories(self):
         choices = dict(_CONFIG_DOCS['scan_categories'])['__scan_categories_choices__']
@@ -12476,3 +12577,266 @@ class TestCoverageRecordIsSingleAndAtomic:
         assert (disc / 'portFull.xml.coverage').exists()
         spoonmap._delete_previous_results(str(tmp_path))
         assert not (tmp_path / 'discovery').exists()
+
+
+class TestUpdateCheckIsOptIn:
+    """The launch-time update check is off unless explicitly enabled.
+
+    SpooNMAP runs from jumpboxes inside client networks, where an unprompted
+    call to api.github.com is an outbound beacon from an engagement host that
+    nobody authorised. hate_crack defaults this to True; SpooNMAP inverts it,
+    and these tests are what keep it inverted.
+    """
+
+    def test_a_config_that_never_mentions_the_key_makes_no_network_call(self):
+        with patch('spoonmap._check_for_updates') as checked:
+            spoonmap._maybe_check_for_updates(False)
+        assert not checked.called, 'a default config performed a network call at launch'
+
+    def test_enabling_it_performs_the_check(self):
+        with patch('spoonmap._check_for_updates') as checked:
+            spoonmap._maybe_check_for_updates(True)
+        checked.assert_called_once()
+
+    def test_load_config_defaults_the_key_to_false(self):
+        cfg = _config_dict()
+        assert 'check_for_updates' not in cfg
+        assert _load_config(cfg, '/t')['check_for_updates'] is False
+
+    def test_load_config_honours_an_explicit_true(self):
+        cfg = _config_dict(check_for_updates=True)
+        assert _load_config(cfg, '/t')['check_for_updates'] is True
+
+    def test_load_config_accepts_the_legacy_quoted_spelling(self):
+        """_config_bool() accepts "True"/"False" indefinitely for hand-edited
+        configs; this key is no exception."""
+        cfg = _config_dict(check_for_updates='True')
+        assert _load_config(cfg, '/t')['check_for_updates'] is True
+
+
+class TestCheckForUpdates:
+    """The check itself: comparison, output, and total failure tolerance."""
+
+    def _response(self, tag):
+        body = json.dumps({'tag_name': tag}).encode()
+        resp = MagicMock()
+        resp.read.return_value = body
+        resp.__enter__.return_value = resp
+        return resp
+
+    def test_a_newer_release_is_reported(self, capsys):
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        return_value=self._response('v0.1.0')):
+            spoonmap._check_for_updates()
+        out = capsys.readouterr().out
+        assert 'Update available' in out
+        assert '0.1.0' in out
+
+    def test_being_up_to_date_says_so_without_claiming_an_update(self, capsys):
+        with patch('spoonmap._tool_version', return_value='0.1.0'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        return_value=self._response('v0.1.0')):
+            spoonmap._check_for_updates()
+        out = capsys.readouterr().out
+        assert 'Update available' not in out
+        assert 'is up to date' in out
+
+    def test_an_older_release_is_not_an_update(self, capsys):
+        with patch('spoonmap._tool_version', return_value='0.2.0'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        return_value=self._response('v0.1.0')):
+            spoonmap._check_for_updates()
+        assert 'Update available' not in capsys.readouterr().out
+
+    def test_an_unknown_local_version_never_claims_an_update(self, capsys):
+        """Running from a checkout has no version to compare. Reporting the
+        latest release is fine; asserting the operator is behind is not --
+        it would nag everyone running from a clone, which is most of them."""
+        with patch('spoonmap._tool_version',
+                        return_value=spoonmap._UNKNOWN_VERSION), \
+             patch('spoonmap.urllib.request.urlopen',
+                        return_value=self._response('v0.1.0')):
+            spoonmap._check_for_updates()
+        out = capsys.readouterr().out
+        assert 'Update available' not in out
+        assert '0.1.0' in out
+
+    def test_a_network_failure_is_swallowed(self, capsys):
+        """A failed update check must never delay, prompt, or abort a scan."""
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        side_effect=OSError('no route to host')):
+            spoonmap._check_for_updates()  # must not raise
+        assert 'Update available' not in capsys.readouterr().out
+
+    def test_unparseable_json_is_swallowed(self, capsys):
+        resp = MagicMock()
+        resp.read.return_value = b'<html>404</html>'
+        resp.__enter__.return_value = resp
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen', return_value=resp):
+            spoonmap._check_for_updates()  # must not raise
+        assert 'Update available' not in capsys.readouterr().out
+
+    def test_a_release_with_no_tag_name_is_swallowed(self, capsys):
+        resp = MagicMock()
+        resp.read.return_value = b'{}'
+        resp.__enter__.return_value = resp
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen', return_value=resp):
+            spoonmap._check_for_updates()  # must not raise
+
+    def test_non_string_tag_name_is_coerced(self, capsys):
+        """A proxy or captive portal might return well-formed JSON with
+        unexpected field types. Non-string tag_name must not crash."""
+        for tag_value in (123, {'nested': 'dict'}):
+            body = json.dumps({'tag_name': tag_value}).encode()
+            resp = MagicMock()
+            resp.read.return_value = body
+            resp.__enter__.return_value = resp
+            with patch('spoonmap._tool_version', return_value='0.0.1'), \
+                 patch('spoonmap.urllib.request.urlopen', return_value=resp):
+                spoonmap._check_for_updates()  # must not raise
+            assert 'Update available' not in capsys.readouterr().out
+
+    def test_json_body_that_is_not_a_dict_is_swallowed(self, capsys):
+        """A proxy or captive portal might return valid JSON that is not an
+        object — a list, or a bare string. These are common error page
+        responses and must not crash."""
+        for body_bytes in (b'[]', b'"nope"'):
+            resp = MagicMock()
+            resp.read.return_value = body_bytes
+            resp.__enter__.return_value = resp
+            with patch('spoonmap._tool_version', return_value='0.0.1'), \
+                 patch('spoonmap.urllib.request.urlopen', return_value=resp):
+                spoonmap._check_for_updates()  # must not raise
+            assert 'Update available' not in capsys.readouterr().out
+
+    def test_a_non_exact_local_version_says_not_comparable_not_unknown(self, capsys):
+        """An rc-tag or .postN.devN install has a real, precise version --
+        --version prints it -- so calling it "unknown" here would contradict
+        --version's own output. It must say the local version is not
+        comparable to a release, and still make no claim about being
+        behind."""
+        with patch('spoonmap._tool_version', return_value='0.1.0rc1'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        return_value=self._response('v0.1.0')):
+            spoonmap._check_for_updates()
+        out = capsys.readouterr().out
+        assert 'Update available' not in out
+        assert 'unknown' not in out
+        assert '0.1.0rc1' in out
+        assert 'not comparable' in out
+
+    # --- quiet vs. on-demand failure reporting (default quiet=True is the
+    # launch-time contract; --check-update passes quiet=False) --------------
+
+    def test_launch_time_failure_is_silent_by_default(self, capsys):
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        side_effect=OSError('no route to host')):
+            spoonmap._check_for_updates()  # quiet=True by default
+        assert capsys.readouterr().out == ''
+
+    def test_on_demand_failure_is_reported(self, capsys):
+        """--check-update passes quiet=False. Silence here is indistinguishable
+        from "you are up to date", and is what api.github.com's 404 (no
+        releases published yet) produces on every single invocation today."""
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        side_effect=OSError('no route to host')):
+            spoonmap._check_for_updates(quiet=False)
+        out = capsys.readouterr().out
+        assert out.strip() != ''
+        assert 'Update check failed' in out
+
+    def test_on_demand_http_error_names_the_status_code(self, capsys):
+        error = urllib.error.HTTPError(
+            spoonmap._RELEASE_API_URL, 404, 'Not Found', {}, None)
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen', side_effect=error):
+            spoonmap._check_for_updates(quiet=False)
+        assert '404' in capsys.readouterr().out
+
+    def test_on_demand_url_error_names_the_reason(self, capsys):
+        error = urllib.error.URLError('no route to host')
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen', side_effect=error):
+            spoonmap._check_for_updates(quiet=False)
+        assert 'no route to host' in capsys.readouterr().out
+
+    def test_on_demand_non_dict_payload_is_reported(self, capsys):
+        resp = MagicMock()
+        resp.read.return_value = b'[]'
+        resp.__enter__.return_value = resp
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen', return_value=resp):
+            spoonmap._check_for_updates(quiet=False)
+        assert 'Update check failed' in capsys.readouterr().out
+
+    def test_on_demand_unparseable_tag_is_reported(self, capsys):
+        resp = self._response('not-a-version')
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen', return_value=resp):
+            spoonmap._check_for_updates(quiet=False)
+        out = capsys.readouterr().out
+        assert 'Update check failed' in out
+        assert 'not-a-version' in out
+
+    # --- network-safety properties that must have real assertions behind
+    # them, not just comments (item 9) ---------------------------------------
+
+    def test_urlopen_is_called_with_a_timeout(self):
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        return_value=self._response('v0.1.0')) as mock_urlopen:
+            spoonmap._check_for_updates()
+        _, kwargs = mock_urlopen.call_args
+        assert 'timeout' in kwargs, 'urlopen must be called with an explicit timeout'
+        assert kwargs['timeout'] == spoonmap._UPDATE_CHECK_TIMEOUT
+
+    def test_the_timeout_constant_is_small(self):
+        """A courtesy check that runs before every scan must not become a
+        stalled engagement. Sane upper bound, not the exact value, so the
+        constant can still be tuned without this test becoming brittle."""
+        assert 0 < spoonmap._UPDATE_CHECK_TIMEOUT <= 30
+
+    def test_the_url_requests_the_latest_release_specifically(self):
+        """/releases (plural, no /latest) would include pre-releases, which
+        would advertise a nightly rc candidate as an available update to
+        every operator -- exactly what _RELEASE_API_URL's own comment says
+        must not happen."""
+        assert spoonmap._RELEASE_API_URL.rstrip('/').endswith('/releases/latest')
+
+        # Pinning the constant alone doesn't prove _check_for_updates() ever
+        # uses it -- a mutation that inlined a different literal URL at the
+        # urlopen() call site would leave the assertion above passing. Assert
+        # the actual call used the constant.
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        return_value=self._response('v0.1.0')) as mock_urlopen:
+            spoonmap._check_for_updates()
+        assert mock_urlopen.call_args[0][0] == spoonmap._RELEASE_API_URL
+
+
+class TestParseReleaseTag:
+    """Version comparison, without a packaging dependency."""
+
+    @pytest.mark.parametrize('text,expected', [
+        ('v0.1.0', (0, 1, 0)),
+        ('0.1.0', (0, 1, 0)),
+        ('v10.4.7', (10, 4, 7)),
+        # Not a comparable release: a candidate, a dev build, junk, and the
+        # running-from-source sentinel.
+        ('v0.1.0rc1', None),
+        ('0.0.1.post1.dev1', None),
+        ('nightly', None),
+        ('', None),
+    ])
+    def test_only_plain_releases_compare(self, text, expected):
+        assert spoonmap._parse_release_tag(text) == expected
+
+    def test_comparison_is_numeric_not_lexical(self):
+        assert (spoonmap._parse_release_tag('v0.10.0')
+                > spoonmap._parse_release_tag('v0.9.0'))

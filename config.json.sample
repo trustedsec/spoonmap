@@ -16,6 +16,8 @@
     "host_discovery" : true,
     "__resume_choices__" : "true, false (JSON booleans; legacy quoted \"True\"/\"False\" still accepted)",
     "resume" : false,
+    "__check_for_updates_note__": "Optional. When true, SpooNMAP contacts api.github.com at startup to see whether a newer release exists. Default false, and absent means false: the tool makes no network connection other than the scan itself unless you turn this on. Use --check-update for a one-off check without enabling it here.",
+    "check_for_updates": false,
     "__target_scan_choices__" : "External, Internal (case-insensitive; any other value stops the run rather than scanning with the Internal-only checks silently skipped)",
     "target_scan" : "Internal",
     "__max_rate_external_recommendation__" : "Default = 20000 (full port scan capped at 10000)",

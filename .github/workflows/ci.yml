@@ -3,7 +3,11 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    # `nightly` is here because the `tag` job below runs inside this workflow
+    # and is gated on `needs: [...]` plus this push trigger for main/nightly.
+    # Without it, pushes to nightly run no CI at all and the tag job silently
+    # never fires.
+    branches: [main, nightly]
 
 # A new push to the same PR supersedes the previous run. Scoped to pull_request
 # only: on `main`, cancelling the previous commit's in-progress run because a
@@ -119,7 +123,7 @@ jobs:
       - name: Run tests
         run: >
           uv run --isolated --no-project --python ${{ matrix.python-version }}
-          --with pytest --with pytest-cov
+          --with pytest --with pytest-cov --with pyyaml --with packaging
           pytest tests/ -v -rs
 
   # Separate job, not a step on `test`: a lint failure and a test failure are
@@ -148,7 +152,7 @@ jobs:
         run: uv lock --check
 
       - name: Ruff
-        run: uv run --frozen ruff check spoonmap.py tests/
+        run: uv run --frozen ruff check spoonmap.py tests/ tools/
 
   # SAST against a committed baseline: spoonmap shells out to masscan/nmap and
   # parses their XML, so a bare run reports 32 reviewed findings (subprocess
@@ -363,6 +367,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
+          # hatch-vcs derives the version from git describe. Under the default
+          # depth-1 clone this does not fail -- it silently produces a version
+          # computed from no tag at all (0.0.post1.dev1 where the answer is
+          # 0.0.1.post1.dev1), so every artifact this job inspects would carry
+          # a version no release ever had.
+          fetch-depth: 0
 
       - name: Install uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
@@ -372,6 +382,32 @@ jobs:
 
       - name: Build sdist and wheel
         run: uv build
+
+      - name: Assert artifacts carry a VCS-derived version
+        run: |
+          python3 - <<'PYEOF'
+          import glob
+          import os
+          import sys
+
+          # A depth-1 clone yields 0.0.post1.dev1 -- a version derived from no
+          # tag. Once a tag exists, anything starting 0.0.post means the
+          # checkout could not see it. This is the assertion that would have
+          # caught a fetch-depth regression.
+          names = [os.path.basename(p) for p in glob.glob('dist/*')]
+          if not names:
+              sys.exit('no artifacts were built')
+          import subprocess
+          tags = subprocess.run(
+              ['git', 'tag'], capture_output=True, text=True, check=True
+          ).stdout.split()
+          if tags and any(n.startswith('spoonmap-0.0.post') for n in names):
+              sys.exit(
+                  'artifacts were versioned from no tag despite tags existing '
+                  '(shallow checkout?): ' + ', '.join(names)
+              )
+          print('artifact versions: ' + ', '.join(names))
+          PYEOF
 
       - name: Assert sdist excludes local scratch
         run: |
@@ -442,7 +478,7 @@ jobs:
           # today, but is intentionally a separate, hand-maintained list — see
           # the step comment for why it must not be read from that same file.
           required = (
-              'spoonmap.py', 'nse/', 'tests/', 'README.md', 'CLAUDE.md',
+              'spoonmap.py', 'nse/', 'tests/', 'tools/', 'README.md', 'CLAUDE.md',
               'config.json.sample', 'exclusions.txt', 'pyproject.toml',
               'uv.lock', '.bandit-baseline.json', '.github/workflows/',
           )
@@ -480,9 +516,28 @@ jobs:
                   'sdist nse/ does not match git-tracked nse/ exactly '
                   f'— missing: {nse_missing}, extra: {nse_extra}'
               )
+
+          tracked_tools = subprocess.run(
+              ['git', 'ls-files', 'tools/'],
+              capture_output=True, text=True, check=True,
+          ).stdout.splitlines()
+          tracked_tools_set = {t[len('tools/'):] for t in tracked_tools}
+          sdist_tools = {
+              s[len('tools/'):] for s in stripped
+              if s.startswith('tools/') and not s.endswith('/')
+          }
+          tools_missing = sorted(tracked_tools_set - sdist_tools)
+          tools_extra = sorted(sdist_tools - tracked_tools_set)
+          if tools_missing or tools_extra:
+              sys.exit(
+                  'sdist tools/ does not match git-tracked tools/ exactly '
+                  f'— missing: {tools_missing}, extra: {tools_extra}'
+              )
+
           print(
               f'sdist has all {len(required)} required entries; '
-              f'nse/ matches git-tracked files exactly ({len(tracked_nse)} files)'
+              f'nse/ matches git-tracked files exactly ({len(tracked_nse)} files); '
+              f'tools/ matches git-tracked files exactly ({len(tracked_tools_set)} files)'
           )
           PYEOF
 
@@ -579,3 +634,169 @@ jobs:
               )
           print(f'installed wheel: {len(paths)} NSE paths all resolve on disk')
           PYEOF
+
+      # main()'s `--version`/`--check-update` dispatch sits inside
+      # `# pragma: no cover`, so mutating either to `print('x')` leaves the
+      # whole pytest suite green -- _tool_version() and _check_for_updates()
+      # are unit-tested in isolation, but nothing exercises main()'s own
+      # argv handling. This step is that missing end-to-end guard, run
+      # against the installed wheel from the step above (not `./spoonmap.py`
+      # from the checkout): only an actual install has real distribution
+      # metadata, so this is also the one place that can assert the output
+      # is NOT _UNKNOWN_VERSION -- a checkout run would legitimately print
+      # that sentinel and any assertion here would be checking the wrong
+      # thing.
+      - name: Verify installed `spoonmap --version` prints a real version
+        run: |
+          wheel=$(ls dist/*.whl)
+          venv_dir=$(mktemp -d)
+          uv venv "$venv_dir/venv"
+          uv pip install --python "$venv_dir/venv/bin/python" "$wheel"
+          cd "$venv_dir"
+          version=$("$venv_dir/venv/bin/spoonmap" --version)
+          echo "spoonmap --version printed: $version"
+          if [ -z "$version" ]; then
+            echo "spoonmap --version printed nothing" >&2
+            exit 1
+          fi
+          if [ "$version" = "unknown (running from source)" ]; then
+            echo "spoonmap --version printed the running-from-source sentinel despite being installed from a wheel" >&2
+            exit 1
+          fi
+          # PEP 440-tolerant, not a strict X.Y.Z match: this repo has no tags
+          # yet, so an untagged tree's own wheel legitimately versions as
+          # hatch-vcs's no-guess-dev scheme (e.g. 0.0.post1.dev285), not a
+          # plain release tag. A strict X.Y.Z-only pattern fails on exactly
+          # that legitimate, common case -- and since `tag` needs `build`,
+          # that failure would deadlock tagging until someone hand-pushed a
+          # tag. This still rejects empty output and the from-source
+          # sentinel (both checked above), and still catches a mutation that
+          # prints an arbitrary non-version string.
+          echo "$version" | grep -Eq '^[0-9]+(\.[0-9]+)+' || {
+            echo "spoonmap --version did not print something starting with a parseable version: $version" >&2
+            exit 1
+          }
+
+  # Cuts release tags from the commits themselves, once every other job in this
+  # run has passed. `nightly` cuts release candidates for whichever version the
+  # batch is heading toward (v0.1.0rc1, v0.1.0rc2, ...) and `main` promotes that
+  # same target to its final release, so they order correctly at both ends:
+  #
+  #     0.0.0  <  0.1.0rc1  <  0.1.0rc2  <  0.1.0  <  0.2.0rc1  <  0.2.0
+  #
+  # This lives inside ci.yml, gated on `needs`, rather than in a separate
+  # workflow triggered by `workflow_run`. That was the original design and it
+  # was rejected: zizmor rates `workflow_run` an error-level dangerous trigger
+  # (it is the standard privilege-escalation vector, since the triggered
+  # workflow runs with write permissions against a ref the triggering run
+  # chose), and silencing that with an ignore comment is not something this
+  # repo does. Being a `needs` dependent of the jobs that validate the commit
+  # gets the same "only tag what passed CI" guarantee without the trigger, and
+  # without needing to check out an explicitly-passed head SHA.
+  #
+  # Nothing here parses or increments a version number. The whole policy --
+  # which component moves, and to what -- lives in tools/next_version.py, where
+  # it is unit-tested in tests/test_next_version.py. Do not add version
+  # arithmetic to this job; add it to the module, where it can be tested.
+  tag:
+    name: tag release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Every job that validates this commit. A tag must never appear on a commit
+    # that failed anything: `needs` treats a skipped or failed dependency as
+    # not-success, so this job simply does not run.
+    needs: [test, test-legacy, lint, bandit, nse-root, workflow-lint, build]
+    # Pushes only, and only to the two release branches. ci.yml also runs on
+    # pull_request, where tagging would be actively wrong.
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/nightly')
+    # This workflow declares contents: read at the top level. This job alone
+    # needs write, to push a tag and create a release.
+    permissions:
+      contents: write
+    # Two pushes landing back-to-back would otherwise both compute the same tag
+    # and the second push would fail. Serialize per branch instead of
+    # cancelling: a third push superseding a still-queued second run's tag job
+    # is coalescing, not lost work, because the baseline this job computes
+    # from is the highest tag already in the repo, not a cursor advanced by
+    # each run — the coalesced run still sees every commit since that tag and
+    # cuts the version that reflects all of them.
+    concurrency:
+      group: tag-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The baseline is the highest final tag in the repository. Under the
+          # default depth-1 clone there are none, so this would compute from
+          # 0.0.0 and hand out a version that already shipped.
+          fetch-depth: 0
+          # Deliberate exception to this repo's persist-credentials: false
+          # convention: this job pushes a tag and needs the token to do it.
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Compute tag
+        id: bump
+        run: |
+          set -euo pipefail
+          # main cuts the final release; nightly cuts a candidate for the same
+          # target. tools/next_version.py owns the decision entirely.
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            channel=stable
+          else
+            channel=nightly
+          fi
+          new_tag=$(python3 tools/next_version.py --channel "$channel")
+          echo "Channel: $channel; tag: ${new_tag:-<nothing to tag>}"
+          echo "new_tag=$new_tag" >> "$GITHUB_OUTPUT"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag
+        env:
+          NEW_TAG: ${{ steps.bump.outputs.new_tag }}
+        run: |
+          set -euo pipefail
+          # Empty means no commits since the last release -- a re-run on an
+          # already-tagged commit. Nothing to do, and not an error; `git tag ""`
+          # would fail with a message about nothing in particular.
+          #
+          # This is NOT a "no feat/fix commits, skip" early exit: a docs- or
+          # chore-only batch is still a release, it just cuts a patch rather
+          # than a minor. Only a genuinely empty batch is skipped.
+          if [ -z "$NEW_TAG" ]; then
+            echo "No commits since the last release; nothing to tag"
+            exit 0
+          fi
+          # Idempotent: a re-run of this workflow must not fail the job.
+          if git rev-parse -q --verify "refs/tags/$NEW_TAG" >/dev/null; then
+            echo "Tag $NEW_TAG already exists, nothing to push"
+          else
+            git tag "$NEW_TAG"
+            git push origin "refs/tags/$NEW_TAG"
+          fi
+
+      # Only main publishes. Nightly candidate tags exist to make builds
+      # addressable and to give hatch-vcs a version; they are deliberately not
+      # releases, so nothing ranking releases ever sees a nightly as latest.
+      - name: Create GitHub release
+        if: steps.bump.outputs.channel == 'stable'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEW_TAG: ${{ steps.bump.outputs.new_tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "$NEW_TAG" ]; then
+            echo "No tag was created; no release to publish"
+            exit 0
+          fi
+          if gh release view "$NEW_TAG" >/dev/null 2>&1; then
+            echo "Release $NEW_TAG already exists, nothing to do"
+            exit 0
+          fi
+          gh release create "$NEW_TAG" --generate-notes

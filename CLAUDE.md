@@ -152,6 +152,108 @@ README.md for the end-user walkthrough), so a change here must keep
 `config.json.sample` and every bundled `nse/` script landing in the wheel —
 the `build` CI job asserts this.
 
+## Release Versioning
+
+Versions are tags, not a string in a file. `pyproject.toml` has no `version`;
+hatch-vcs derives it from `git describe`, so `importlib.metadata.version('spoonmap')`
+— what `--version` prints — is whatever tag the artifact was built from.
+
+Tags are cut by CI, from the commits themselves. `tools/next_version.py` owns the
+entire policy: any `feat:` commit (or a `!` subject, or a `BREAKING CHANGE:`
+footer) since the last final tag takes the batch to `X.(Y+1).0`; a batch of only
+fixes, docs and chores takes it to `X.Y.(Z+1)`. **The major is never bumped
+automatically** — a breaking marker counts as a feature, because an automatic
+major is an irreversible published mistake waiting for one mistyped subject
+line. Push a major by hand and `release.yml` will publish it.
+
+`nightly` cuts candidates for the version the batch is heading toward
+(`v0.1.0rc1`, `v0.1.0rc2`, …) and `main` promotes that same target to its final
+release. Aiming candidates one version *forward* is what makes them sort
+correctly: `0.0.0 < 0.1.0rc1 < 0.1.0 < 0.2.0rc1 < 0.2.0`. This makes conventional
+commit subjects load-bearing — a `feat:` typo'd as `fix:` ships as a patch.
+
+The tagging lives in a `tag` job **inside `ci.yml`**, gated on
+`needs: [test, test-legacy, lint, bandit, nse-root, workflow-lint, build]` and
+on `github.event_name == 'push'` for `main`/`nightly` only. It is deliberately
+not a separate `workflow_run`-triggered workflow, which is how this was first
+built: zizmor — a required job in this same file — rates `workflow_run` an
+error-level dangerous trigger and exits 14, because it is the standard
+privilege-escalation vector, and this repo does not silence findings with ignore
+comments. Being a `needs` dependent buys the same "only tag what passed CI"
+guarantee without the trigger, and without checking out an explicitly-passed
+head SHA. Do not reintroduce `workflow_run` here.
+
+Things that fail silently rather than loudly, all guarded by
+`tests/test_release_versioning.py`:
+
+- **`ci.yml` must run on pushes to `nightly`.** Otherwise the tag job never runs
+  there and no candidate is ever cut, with no error anywhere.
+- **The `tag` job must keep every validating job in `needs`.** Drop one and a
+  tag can land on a commit that failed it.
+- **`fetch-depth: 0` on both the `tag` and `build` jobs.** The baseline is the
+  highest final tag; a shallow clone sees none and computes from 0.0.0, handing
+  out a version that already shipped. Verified: a depth-1 clone does not fail —
+  it silently versions from no tag at all.
+- **The `tag` job sets `persist-credentials: true`**, against this repo's
+  convention everywhere else, because it pushes a tag. It is also the only job
+  with `contents: write`. That exception is commented at the site and pinned by
+  a test; do not "fix" it.
+
+Version arithmetic belongs in `tools/next_version.py`, where it is unit-tested,
+never in a workflow step. hate_crack carried ~70 lines of `cut -d.` duplicated
+across two YAML files before extracting this module; do not reintroduce it here.
+
+**`main` must contain `nightly`'s commits as ancestors — merge or fast-forward
+`nightly` into `main`, never squash.** `tools/next_version.py` computes
+`git log <last-tag>..HEAD` from whichever branch is tagging. A squash merge
+collapses `nightly`'s already-released commits into one commit unreachable
+from any prior tag, so that range re-lists them on `main` on every subsequent
+push, forever. This fails quietly, not loudly: versions stay monotonic (the
+squash commit itself is still "since the last release"), so nothing errors —
+the computed target is just wrong from then on.
+
+## Update Checking
+
+`check_for_updates` in `config.json` defaults to **false**, and an absent key
+means false. It is the only thing that can cause a network connection at startup.
+hate_crack's equivalent defaults to true; that is deliberately inverted here,
+because SpooNMAP runs from jumpboxes inside client networks where an unprompted
+call to `api.github.com` is an unauthorised outbound beacon from an engagement
+host. `--check-update` is the on-demand path and ignores the config.
+
+The gate lives in `_maybe_check_for_updates()` rather than inline in `main()`
+specifically so it can be tested — `main()` is under `pragma: no cover`, and
+"does a default config reach the network" is the one question here that must not
+go untested. Its test patches `_check_for_updates()` itself and asserts it is
+never called when the check is disabled. Patching `urllib.request.urlopen` to
+raise instead does NOT work and was removed: `_check_for_updates()` catches
+broadly, so it swallows the test's own tripwire and the test passes even with the
+gate gone. `_check_for_updates()` swallows every failure: a courtesy check must
+never delay, prompt, or abort a scan. A local version that is not an exact
+release tag (running from a checkout, an rc build, a `.postN.devN` build) reports
+the latest release but says the local version is not comparable to one, and
+never claims an update is available.
+
+`_check_for_updates(quiet=True)` is the default and is what
+`_maybe_check_for_updates()` uses for the launch-time path — silence on failure
+is correct there. `--check-update` passes `quiet=False`: the on-demand path must
+say when the check itself failed, naming the failure cheaply (HTTP status,
+`URLError` reason, or exception class) when it can. Without this, an operator who
+explicitly ran `--check-update` saw the same nothing-printed, exit-0 outcome for
+"the network is unreachable" as for "you are up to date" — and this repo has cut
+no releases yet, so `/releases/latest` 404s and the on-demand path fails on every
+invocation until the first release ships. The broad `except Exception:` inside
+`_check_for_updates()` stays broad either way; `quiet` only controls whether the
+failure branch prints.
+
+`check_for_updates` round-trips through a regenerated `config.json`:
+`_build_interactive_config()` takes it as a parameter and writes it explicitly
+like every other field in `_CONFIG_FIELD_ORDER`, rather than relying on
+`_write_interactive_config()`'s merge-with-existing-file fallback to carry it
+forward — that fallback only works when a config.json happens to still be on
+disk with the key already set, and silently drops it on a first-ever
+regeneration.
+
 ## Architecture
 
 ### Host Discovery (Internal)

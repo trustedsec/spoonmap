@@ -189,6 +189,32 @@ uv run spoonmap.py --cleanup
 ./spoonmap.py --cleanup /path/to/output
 ```
 
+To print the installed version:
+
+```bash
+spoonmap --version
+```
+
+The version comes from the installed package's metadata, which is derived from
+the repository's git tags at build time. Running `./spoonmap.py` directly from a
+clone installs nothing, so that prints `unknown (running from source)` — which
+is expected, not an error.
+
+To check whether a newer release exists:
+
+```bash
+./spoonmap.py --check-update
+```
+
+**SpooNMAP never checks for updates on its own.** It makes no network connection
+other than the scan itself unless you explicitly opt in, because it is routinely
+run from jumpboxes inside client networks where an unprompted call out to
+`api.github.com` is unwanted traffic from an engagement host. `--check-update`
+performs a single check on demand. To enable the check at every startup, set
+`"check_for_updates": true` in `config.json`; the key defaults to `false` and
+omitting it entirely means `false`. Only stable releases are reported —
+nightly release candidates are never advertised as updates.
+
 ## Where Files Live
 
 Every operator-facing path resolves against the directory you run the command
@@ -259,6 +285,7 @@ git update-index --no-skip-worktree ranges.txt
 | `masscan_batch_size` | Integer | Ports per masscan invocation (default: 5); prompted under "Tune advanced settings" |
 | `nmap_threshold` | Integer | Work-unit threshold for tool selection (default: 5,000,000 — see below); prompted under "Tune advanced settings" |
 | `resume` | `"True"` / `"False"` | Skip completed port discovery on restart (default: False) |
+| `check_for_updates` | `"True"` / `"False"` | Contact api.github.com at startup to check for a newer release. Off unless set; see `--check-update` for a one-off check (default: False) |
 | `__generated_by_prompts__` | String | Present only in a config the prompts wrote. While it is present, **[d]elete**/**[a]ppend** re-ask the options using this file's values as defaults; remove it to keep them fixed |
 
 Keys beginning and ending with `__` are documentation and are ignored by the loader, so you can annotate the file freely — a re-prompted run preserves them.
