@@ -1,0 +1,33 @@
+name: Release
+
+# The path for tags a human pushes by hand. The automatic policy never bumps the
+# major component -- a breaking marker counts as a feature, because an automatic
+# major is an irreversible published mistake waiting for one mistyped subject
+# line -- so a major release is `git tag v1.0.0 && git push`, and this is what
+# turns that into a release.
+#
+# Tags pushed by auto-tag.yml do NOT reach here: GitHub does not dispatch
+# workflow events for refs pushed with GITHUB_TOKEN. That job creates its own
+# release.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Read-only: this job creates a release from a tag that already
+          # exists, so unlike the two tagging workflows it needs no credentials.
+          persist-credentials: false
+
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
+        with:
+          generate_release_notes: true

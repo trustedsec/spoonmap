@@ -3,7 +3,10 @@ name: CI
 on:
   pull_request:
   push:
-    branches: [main]
+    # `nightly` is here because nightly-tag.yml triggers on a completed CI run
+    # for that branch. Without it, pushes to nightly run no CI at all and the
+    # tagging workflow silently never fires.
+    branches: [main, nightly]
 
 # A new push to the same PR supersedes the previous run. Scoped to pull_request
 # only: on `main`, cancelling the previous commit's in-progress run because a

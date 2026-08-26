@@ -1,0 +1,103 @@
+name: Nightly Tag
+
+# Tags `nightly` after CI passes, as a RELEASE CANDIDATE for whichever version
+# the batch is heading toward: v0.0.1rc1, v0.0.1rc2, ... for a fix-only cycle,
+# v0.1.0rc1 for one containing a feature. Merging down to main then promotes
+# that same target to its final release.
+#
+# These are real PEP 440 pre-releases, so they order correctly at both ends:
+#
+#     0.0.0  <  0.0.1rc1  <  0.0.1rc2  <  0.0.1  <  0.1.0rc1  <  0.1.0
+#
+# Aiming one version forward is what makes that true. A candidate named for the
+# *current* version would sort below the release it is heading for.
+#
+# The target can change mid-cycle: the first `feat` to land moves it from
+# X.Y.(Z+1) to X.(Y+1).0 and candidate numbering restarts. That is intended --
+# the number always names what the batch would ship as today.
+#
+# The policy lives in tools/next_version.py, shared with auto-tag.yml and
+# unit-tested in tests/test_next_version.py. Nothing here parses or increments a
+# version number. Do not add that here -- add to the module, where it is tested.
+#
+# No GitHub release is created; see the end of this file.
+#
+# This file MUST live on the default branch (main). GitHub only dispatches
+# workflow_run for workflows present on the default branch, so a copy existing
+# solely on `nightly` never fires.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+    branches:
+      - nightly
+
+permissions:
+  contents: write
+
+# Two pushes landing back-to-back would otherwise both compute the same tag and
+# the second push would fail. Serialize instead of cancelling so no push is
+# skipped.
+concurrency:
+  group: nightly-tag
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # workflow_run defaults to the tip of the default branch, which is not
+          # the commit CI validated.
+          ref: ${{ github.event.workflow_run.head_sha }}
+          # The baseline is read from tags. Under a shallow clone the project
+          # version reads as 0.0.0 and this would tag nonsense.
+          fetch-depth: 0
+          # Deliberate exception to this repo's persist-credentials: false
+          # convention: this job pushes a tag and needs the token to do it.
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Compute nightly tag
+        id: bump
+        run: |
+          set -euo pipefail
+          # tools/next_version.py owns the decision; see the header. This step
+          # deliberately contains no version logic of its own.
+          new_tag=$(python3 tools/next_version.py --channel nightly)
+          echo "Nightly tag: ${new_tag:-<nothing to tag>}"
+          echo "new_tag=$new_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag
+        env:
+          NEW_TAG: ${{ steps.bump.outputs.new_tag }}
+        run: |
+          set -euo pipefail
+          # Empty means no commits since the last release: nothing to build a
+          # candidate from. Not an error -- a workflow re-run lands here, and
+          # `git tag ""` fails with a message about nothing in particular.
+          if [ -z "$NEW_TAG" ]; then
+            echo "No commits since the last release; nothing to tag"
+            exit 0
+          fi
+          # Idempotent: a re-run of this workflow must not fail the job.
+          if git rev-parse -q --verify "refs/tags/$NEW_TAG" >/dev/null; then
+            echo "Tag $NEW_TAG already exists, nothing to push"
+          else
+            git tag "$NEW_TAG"
+            git push origin "refs/tags/$NEW_TAG"
+          fi
+
+      # No GitHub release is created. These tags exist to make nightly builds
+      # addressable and to give hatch-vcs a version; releases are cut on main by
+      # auto-tag.yml.
