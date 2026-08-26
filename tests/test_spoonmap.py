@@ -126,6 +126,18 @@ from spoonmap import (
 )
 
 
+def _write_target_stamp(output_file, target_file):
+    """Write the resume-gate target sidecar for *output_file*.
+
+    Delegates to production rather than recomputing the format: this is used by
+    fixtures across the file whose subject is resume behaviour, not the stamp
+    format, and a second implementation here turned an intentional format change
+    into a dozen failures with an opaque "cache was rejected" symptom.  The
+    format and its normalisation are pinned directly by TestTargetEntries.
+    """
+    spoonmap._stamp_target_coverage(str(output_file), str(target_file))
+
+
 # ── small platform/utility helpers ─────────────────────────────────────────────
 
 class TestVerifyPythonVersion:
@@ -2172,13 +2184,17 @@ class TestFullPortScan:
         disc = tmp_path / 'discovery'
         (disc / 'masscan_results').mkdir(parents=True)
         (disc / 'live_hosts').mkdir(parents=True)
-        (disc / 'masscan_results' / 'portFull.xml').write_text('<nmaprun/>')
+        targets = disc / 'resolved_targets.txt'
+        targets.write_text('10.0.0.0/24\n')
+        cached = disc / 'masscan_results' / 'portFull.xml'
+        cached.write_text('<nmaprun/>')
+        _write_target_stamp(cached, targets)
         (disc / 'live_hosts' / 'port22.txt').write_text('10.0.0.1\n10.0.0.2\n')
         (disc / 'live_hosts' / 'port22_hostnames.txt').write_text('host.example\n')
 
         with patch('spoonmap._run_masscan_batch') as mock_batch:
             result = mass_scan('Full', ['1-65535'], '53', '10000',
-                               '/fake/targets.txt', '', resume=True)
+                               str(targets), '', resume=True)
 
         assert not mock_batch.called
         assert 'Hosts Found on Port 22: 2' in result
@@ -2210,14 +2226,18 @@ class TestFullPortScan:
         (disc / 'masscan_results').mkdir(parents=True)
         live_dir = disc / 'live_hosts'
         live_dir.mkdir(parents=True)
-        (disc / 'masscan_results' / 'portFull.xml').write_text('<nmaprun/>')
+        targets = disc / 'resolved_targets.txt'
+        targets.write_text('10.0.0.0/24\n')
+        cached = disc / 'masscan_results' / 'portFull.xml'
+        cached.write_text('<nmaprun/>')
+        _write_target_stamp(cached, targets)
         for p in range(15):
             (live_dir / f'port{p}.txt').write_text('10.0.0.9\n')
 
         with patch('spoonmap._run_masscan_batch') as mock_batch, \
              patch('spoonmap.HONEYPOT_OPEN_PORT_FRACTION', 0.0001):
             mass_scan('Full', ['1-65535'], '53', '10000',
-                      '/fake/targets.txt', '', resume=True)
+                      str(targets), '', resume=True)
 
         assert not mock_batch.called
         tarpit_file = disc / 'suspected_tarpits.txt'
@@ -2237,7 +2257,11 @@ class TestFullPortScan:
         (disc / 'masscan_results').mkdir(parents=True)
         live_dir = disc / 'live_hosts'
         live_dir.mkdir(parents=True)
-        (disc / 'masscan_results' / 'portFull.xml').write_text('<nmaprun/>')
+        targets = disc / 'resolved_targets.txt'
+        targets.write_text('10.0.0.0/24\n')
+        cached = disc / 'masscan_results' / 'portFull.xml'
+        cached.write_text('<nmaprun/>')
+        _write_target_stamp(cached, targets)
         for p in range(9):
             (live_dir / f'port{p}.txt').write_text('10.0.0.9\n')
         (live_dir / 'portU_53.txt').write_text('10.0.0.9\n')
@@ -2245,7 +2269,7 @@ class TestFullPortScan:
         with patch('spoonmap._run_masscan_batch') as mock_batch, \
              patch('spoonmap.HONEYPOT_OPEN_PORT_FRACTION', 0.0001):
             result = mass_scan('Full', ['1-65535'], '53', '10000',
-                               '/fake/targets.txt', '', resume=True)
+                               str(targets), '', resume=True)
 
         assert not mock_batch.called
         assert 'Hosts Found on Port U:53: 1' in result
@@ -2262,6 +2286,7 @@ class TestFullPortScan:
         cached = disc / 'masscan_results' / 'portFull.xml'
         cached.write_text(xml_text)
         (disc / 'live_hosts' / 'port22.txt').write_text('10.0.0.1\n10.0.0.2\n')
+        _write_target_stamp(cached, targets)
         os.utime(str(targets), (1000, 1000))
         os.utime(str(cached), (2000, 2000))  # fresh mtime
         return disc, targets
@@ -3110,43 +3135,43 @@ class TestSafeSize:
 
 class TestResumeCacheUsable:
     def test_missing_output_is_not_usable(self, tmp_path):
-        assert _resume_cache_usable(str(tmp_path / 'none.xml'), 0, 'thing') is False
+        assert _resume_cache_usable(str(tmp_path / 'none.xml'), 0, 'thing', None) is False
 
     def test_fresh_parseable_xml_is_usable(self, tmp_path):
         p = tmp_path / 'out.xml'
         p.write_text('<nmaprun/>')
         os.utime(str(p), (2000, 2000))
-        assert _resume_cache_usable(str(p), 1000, 'thing') is True
+        assert _resume_cache_usable(str(p), 1000, 'thing', None) is True
 
     def test_stale_xml_is_not_usable(self, tmp_path, capsys):
         p = tmp_path / 'out.xml'
         p.write_text('<nmaprun/>')
         os.utime(str(p), (1000, 1000))
-        assert _resume_cache_usable(str(p), 2000, 'thing') is False
+        assert _resume_cache_usable(str(p), 2000, 'thing', None) is False
         # Staleness is not an "unusable content" condition — no content warning.
         assert 'cached result was empty' not in capsys.readouterr().out
 
     def test_zero_length_xml_is_not_usable(self, tmp_path, capsys):
         p = tmp_path / 'out.xml'
         p.write_text('')
-        assert _resume_cache_usable(str(p), 0, 'port 445 discovery') is False
+        assert _resume_cache_usable(str(p), 0, 'port 445 discovery', None) is False
         assert 're-running port 445 discovery' in capsys.readouterr().out
 
     def test_unparseable_xml_is_not_usable(self, tmp_path, capsys):
         p = tmp_path / 'out.xml'
         p.write_text('<nmaprun><host>')  # unclosed tags
-        assert _resume_cache_usable(str(p), 0, 'port 445 discovery') is False
+        assert _resume_cache_usable(str(p), 0, 'port 445 discovery', None) is False
         assert 'cached result was empty' in capsys.readouterr().out
 
     def test_nonempty_text_output_is_usable(self, tmp_path):
         p = tmp_path / 'hosts.txt'
         p.write_text('10.0.0.1\n')
-        assert _resume_cache_usable(str(p), 0, 'thing', is_xml=False) is True
+        assert _resume_cache_usable(str(p), 0, 'thing', None, is_xml=False) is True
 
     def test_empty_text_output_is_not_usable(self, tmp_path, capsys):
         p = tmp_path / 'hosts.txt'
         p.write_text('')
-        assert _resume_cache_usable(str(p), 0, 'host discovery', is_xml=False) is False
+        assert _resume_cache_usable(str(p), 0, 'host discovery', None, is_xml=False) is False
         assert 're-running host discovery' in capsys.readouterr().out
 
     def test_text_predicate_not_applied_as_xml(self, tmp_path):
@@ -3155,7 +3180,7 @@ class TestResumeCacheUsable:
         p = tmp_path / 'hosts.txt'
         p.write_text('10.0.0.1\n')
         assert _parse_result_xml(str(p)) is None
-        assert _resume_cache_usable(str(p), 0, 'thing', is_xml=False) is True
+        assert _resume_cache_usable(str(p), 0, 'thing', None, is_xml=False) is True
 
 
 class TestWriteIfChanged:
@@ -3380,6 +3405,7 @@ class TestNmapUdpDiscoveryResumeFreshness:
         xml.write_text('<nmaprun/>')
         live = disc / 'live_hosts' / 'portU_53.txt'
         live.write_text('10.0.0.5\n')
+        _write_target_stamp(xml, target)
         return target, xml, live
 
     def test_fresh_cache_reused_without_scanning(self, tmp_path):
@@ -5014,12 +5040,13 @@ class TestMassScanResume:
         # Make batch XML newer than targets file
         import os
         import time as _time
+        _write_target_stamp(batch_xml, targets_file)
         os.utime(str(targets_file), (0, 0))
         os.utime(str(batch_xml), (_time.time(), _time.time()))
 
         with patch('spoonmap._run_masscan_batch', return_value={}) as mock_b:
             mass_scan('All', ['80', '443'], '53', '10000',
-                      '/fake/targets.txt', '', batch_size=10, resume=True)
+                      str(targets_file), '', batch_size=10, resume=True)
 
         # Only probe calls should fire; the one main batch must be skipped
         main_calls = [
@@ -5065,15 +5092,22 @@ class TestMassScanResume:
         targets_file = tmp_path / 'discovery' / 'resolved_targets.txt'
         targets_file.parent.mkdir(parents=True, exist_ok=True)
         targets_file.write_text('10.0.0.1\n')
+        _write_target_stamp(batch_xml, targets_file)
         import os
         import time as _time
         os.utime(str(targets_file), (0, 0))
         os.utime(str(batch_xml), (_time.time(), _time.time()))
 
-        with patch('spoonmap._run_masscan_batch', return_value={}):
+        with patch('spoonmap._run_masscan_batch', return_value={}) as mock_b:
             result = mass_scan('All', ['80'], '53', '10000',
-                               '/fake/targets.txt', '', batch_size=10, resume=True)
+                               str(targets_file), '', batch_size=10, resume=True)
 
+        # Assert the batch was actually skipped, not just that the count is
+        # right: a re-run batch merges the same leftover file and produces an
+        # identical summary, so the count alone does not exercise this path.
+        main_calls = [c for c in mock_b.call_args_list
+                      if 'probe_fast' not in c[0][2] and 'probe_slow' not in c[0][2]]
+        assert main_calls == []
         # The summary should reflect the 2 pre-existing hosts on port 80
         assert 'Hosts Found on Port 80: 2' in result
 
@@ -5091,6 +5125,7 @@ class TestMassScanResume:
         targets_file.write_text('10.0.0.1\n')
         import os
         import time as _time
+        _write_target_stamp(batch0_xml, targets_file)
         os.utime(str(targets_file), (0, 0))
         os.utime(str(batch0_xml), (_time.time(), _time.time()))
 
@@ -5100,7 +5135,7 @@ class TestMassScanResume:
         dest_ports = ['443', '80', '8080', '8443']
         with patch('spoonmap._run_masscan_batch', return_value={}) as mock_b:
             mass_scan('All', dest_ports, '53', '10000',
-                      '/fake/targets.txt', '', batch_size=2, resume=True)
+                      str(targets_file), '', batch_size=2, resume=True)
 
         main_calls = [
             c for c in mock_b.call_args_list
@@ -5146,6 +5181,7 @@ class TestMassScanResume:
         batch_xml.write_text(xml_text)
         targets_file = tmp_path / 'discovery' / 'resolved_targets.txt'
         targets_file.write_text('10.0.0.1\n')
+        _write_target_stamp(batch_xml, targets_file)
         os.utime(str(targets_file), (1000, 1000))
         os.utime(str(batch_xml), (2000, 2000))  # fresh mtime
         return batch_xml, targets_file
@@ -5180,11 +5216,12 @@ class TestMassScanResume:
 
     def test_batch_still_skipped_when_cached_xml_is_valid_and_fresh(self, tmp_path, capsys):
         """Load-bearing direction: a genuinely completed batch stays skipped."""
-        self._setup_batch_cache(tmp_path, '<?xml version="1.0"?><nmaprun></nmaprun>')
+        _batch_xml, targets_file = self._setup_batch_cache(
+            tmp_path, '<?xml version="1.0"?><nmaprun></nmaprun>')
 
         with patch('spoonmap._run_masscan_batch', return_value={}) as mock_b:
             mass_scan('All', ['80', '443'], '53', '10000',
-                      '/fake/targets.txt', '', batch_size=10, resume=True)
+                      str(targets_file), '', batch_size=10, resume=True)
 
         assert self._main_batch_calls(mock_b) == []
         assert 'skipping completed batch' in capsys.readouterr().out
@@ -6337,14 +6374,14 @@ class TestQuarantineFailedOutput:
         # gate accepted it and the port was never re-scanned.
         out = tmp_path / 'port80.xml'
         out.write_text('<nmaprun/>')
-        assert _resume_cache_usable(str(out), 0, 'port 80 banner scan') is True
+        assert _resume_cache_usable(str(out), 0, 'port 80 banner scan', None) is True
 
         failed = _quarantine_failed_output(str(out))
 
         assert failed == str(out) + '.failed'
         assert not out.exists()
         assert (tmp_path / 'port80.xml.failed').read_text() == '<nmaprun/>'
-        assert _resume_cache_usable(str(out), 0, 'port 80 banner scan') is False
+        assert _resume_cache_usable(str(out), 0, 'port 80 banner scan', None) is False
 
     def test_quarantined_name_is_invisible_to_result_parsing(self, tmp_path):
         # The suffix must not end in .xml, or aggregation would pick the failed
@@ -6710,7 +6747,7 @@ class TestNmapWorker:
         banner_xml = f'{tmp_path}/nmap_results/port80.xml'
         assert not os.path.exists(banner_xml)
         assert Path(banner_xml + '.failed').read_text() == '<nmaprun/>'
-        assert _resume_cache_usable(banner_xml, 0, 'port 80 banner scan') is False
+        assert _resume_cache_usable(banner_xml, 0, 'port 80 banner scan', None) is False
         out = capsys.readouterr().out
         assert 'WILL be re-scanned on resume' in out
         assert 'port80.xml.failed' in out
@@ -8586,7 +8623,7 @@ class TestRunMasscanBatchBehavior:
         assert results == {}
         # Still reads as "no results" downstream, but now as usable output.
         assert _parse_result_xml(str(output_xml)).findall('host') == []
-        assert _resume_cache_usable(str(output_xml), 0, 'batch 1/1 (445)') is True
+        assert _resume_cache_usable(str(output_xml), 0, 'batch 1/1 (445)', None) is True
 
     def test_placeholder_write_leaves_no_temp_file(self, tmp_path):
         """The placeholder goes through _atomic_write, so no .tmp is left behind."""
@@ -8620,7 +8657,7 @@ class TestRunMasscanBatchBehavior:
                                    '/fake/targets.txt', None, None)
 
         assert output_xml.read_text() == ''
-        assert _resume_cache_usable(str(output_xml), 0, 'batch 1/1 (445)') is False
+        assert _resume_cache_usable(str(output_xml), 0, 'batch 1/1 (445)', None) is False
 
     def test_interrupt_leaves_empty_output_empty(self, tmp_path):
         """Same for a Ctrl-C: the batch did not complete, so no placeholder."""
@@ -8933,13 +8970,16 @@ class TestNmapUdpDiscovery:
         """resume=True + existing live_hosts file → no subprocess call."""
         (tmp_path / 'discovery' / 'masscan_results').mkdir(parents=True)
         (tmp_path / 'discovery' / 'live_hosts').mkdir(parents=True)
+        targets = tmp_path / 'targets.txt'
+        targets.write_text('192.168.1.0/24\n')
         xml_path = tmp_path / 'discovery' / 'masscan_results' / 'portU_500.xml'
         xml_path.write_text('<nmaprun/>')
+        _write_target_stamp(xml_path, targets)
         live_path = tmp_path / 'discovery' / 'live_hosts' / 'portU_500.txt'
         live_path.write_text('192.168.1.1\n')
         spoonmap.output_path = str(tmp_path)
         with patch('spoonmap.subprocess.Popen') as mock_popen:
-            result = _nmap_udp_discovery('U:500', '/targets.txt', str(tmp_path),
+            result = _nmap_udp_discovery('U:500', str(targets), str(tmp_path),
                                          '53', '', resume=True)
         mock_popen.assert_not_called()
         assert '192.168.1.1' in result
@@ -8967,11 +9007,14 @@ class TestNmapUdpDiscovery:
     def test_resume_with_missing_live_file_returns_empty_set(self, tmp_path):
         """Fresh cached masscan_results XML but no live_hosts file → empty set, no rescan."""
         (tmp_path / 'discovery' / 'masscan_results').mkdir(parents=True)
+        targets = tmp_path / 'targets.txt'
+        targets.write_text('192.168.1.0/24\n')
         xml_path = tmp_path / 'discovery' / 'masscan_results' / 'portU_500.xml'
         xml_path.write_text('<nmaprun/>')
+        _write_target_stamp(xml_path, targets)
         spoonmap.output_path = str(tmp_path)
         with patch('spoonmap.subprocess.Popen') as mock_popen:
-            result = _nmap_udp_discovery('U:500', '/targets.txt', str(tmp_path),
+            result = _nmap_udp_discovery('U:500', str(targets), str(tmp_path),
                                          '53', '', resume=True)
         mock_popen.assert_not_called()
         assert result == set()
@@ -9118,7 +9161,9 @@ class TestNmapPortDiscovery:
         disc = tmp_path / 'discovery'
         (disc / 'masscan_results').mkdir(parents=True)
         (disc / 'live_hosts').mkdir(parents=True)
-        (disc / 'masscan_results' / 'portDirect.xml').write_text('<nmaprun/>')
+        cached = disc / 'masscan_results' / 'portDirect.xml'
+        cached.write_text('<nmaprun/>')
+        _write_target_stamp(cached, target)
         (disc / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n10.0.0.2\n')
         spoonmap.output_path = str(tmp_path)
 
@@ -9138,7 +9183,9 @@ class TestNmapPortDiscovery:
         disc = tmp_path / 'discovery'
         (disc / 'masscan_results').mkdir(parents=True)
         (disc / 'live_hosts').mkdir(parents=True)
-        (disc / 'masscan_results' / 'portDirect.xml').write_text('<nmaprun/>')
+        cached = disc / 'masscan_results' / 'portDirect.xml'
+        cached.write_text('<nmaprun/>')
+        _write_target_stamp(cached, target)
         (disc / 'live_hosts' / 'port80_hostnames.txt').write_text('example.com\n')
         spoonmap.output_path = str(tmp_path)
 
@@ -9158,6 +9205,7 @@ class TestNmapPortDiscovery:
         cached = disc / 'masscan_results' / 'portDirect.xml'
         cached.write_text(xml_text)
         (disc / 'live_hosts' / 'port80.txt').write_text('10.0.0.1\n10.0.0.2\n')
+        _write_target_stamp(cached, target)
         os.utime(str(target), (1000, 1000))
         os.utime(str(cached), (2000, 2000))  # fresh mtime
         spoonmap.output_path = str(tmp_path)
@@ -11271,3 +11319,477 @@ class TestOperatorDirResolution:
         # mechanism.
         monkeypatch.chdir(tmp_path)
         assert _operator_dir() != spoonmap._DIR
+
+
+class TestTargetEntries:
+    """_target_entries() normalisation: what it notices and what it does not."""
+
+    def test_ignores_order_blank_lines_and_comments(self, tmp_path):
+        # live_hosts_combined.txt is rebuilt from a set every run, so a stamp
+        # sensitive to layout would reject on every resume.
+        a = tmp_path / 'a.txt'
+        b = tmp_path / 'b.txt'
+        a.write_text('10.0.0.1\n10.0.0.2\n')
+        b.write_text('# scope\n\n  10.0.0.2  \n10.0.0.1\n\n')
+        assert spoonmap._target_entries(a) == spoonmap._target_entries(b)
+        assert spoonmap._target_entries(a) == {'10.0.0.1', '10.0.0.2'}
+
+    def test_cidr_and_expanded_list_are_not_equated(self, tmp_path):
+        # Documented limitation: this compares line sets, not address sets. The
+        # consequence is a redundant re-scan, never a skipped one.
+        cidr = tmp_path / 'cidr.txt'
+        expanded = tmp_path / 'expanded.txt'
+        cidr.write_text('10.0.0.0/30\n')
+        expanded.write_text('10.0.0.1\n10.0.0.2\n')
+        assert spoonmap._target_entries(cidr) != spoonmap._target_entries(expanded)
+
+    def test_unreadable_target_file_is_none(self, tmp_path):
+        assert spoonmap._target_entries(tmp_path / 'absent.txt') is None
+
+    def test_directory_as_target_file_is_none(self, tmp_path):
+        # IsADirectoryError is an OSError, so it must read as unreadable rather
+        # than raising out of a resume gate.
+        assert spoonmap._target_entries(tmp_path) is None
+
+    def test_undecodable_byte_does_not_raise(self, tmp_path):
+        # A gate must not abort the run on a target file masscan would itself
+        # reject later.
+        target = tmp_path / 'targets.txt'
+        target.write_bytes(b'10.0.0.1\n\xff\xfe\n')
+        assert '10.0.0.1' in spoonmap._target_entries(target)
+
+
+class TestResumeTargetStamp:
+    """The resume gate must reject a cache that did not cover this run's targets."""
+
+    def _cached(self, tmp_path, target_text='10.0.0.1\n'):
+        target = tmp_path / 'targets.txt'
+        target.write_text(target_text)
+        output = tmp_path / 'out.xml'
+        output.write_text('<nmaprun/>')
+        return target, output
+
+    def test_identical_target_accepts_cache(self, tmp_path):
+        target, output = self._cached(tmp_path)
+        spoonmap._stamp_target_coverage(str(output), str(target))
+        assert spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
+
+    def test_cache_covering_a_superset_is_accepted(self, tmp_path, capsys):
+        """The load-bearing case: equality here made --resume thrash.
+
+        The batch phase's target is rebuilt every run from a probe that is not
+        resume-gated, and the iterative probe stops at the first port that finds
+        hosts, so a later run can legitimately scan fewer hosts than the cache
+        covered.  Re-scanning then discards a wider cached result for a narrower
+        one, which is the opposite of what --resume is for.
+        """
+        target, output = self._cached(tmp_path, '10.0.0.1\n10.0.0.2\n10.0.0.3\n')
+        spoonmap._stamp_target_coverage(str(output), str(target))
+        target.write_text('10.0.0.2\n')
+        assert spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
+        assert 're-running' not in capsys.readouterr().out
+
+    def test_a_single_uncovered_target_rejects_cache(self, tmp_path, capsys):
+        target, output = self._cached(tmp_path, '10.0.0.1\n')
+        spoonmap._stamp_target_coverage(str(output), str(target))
+        target.write_text('10.0.0.1\n10.0.0.9\n')   # scope widened
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
+        out = capsys.readouterr().out
+        assert '1 target(s) in this run were not covered' in out
+        assert '10.0.0.9' in out, 'the message must name what forced the re-scan'
+
+    def test_missing_stamp_rejects_cache(self, tmp_path, capsys):
+        # Output from before stamping existed: one redundant re-scan is the safe
+        # direction, a silently narrow result is not.
+        target, output = self._cached(tmp_path)
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
+        assert 'does not record which targets' in capsys.readouterr().out
+
+    def test_unreadable_current_target_rejects_with_its_own_reason(self, tmp_path, capsys):
+        target, output = self._cached(tmp_path)
+        spoonmap._stamp_target_coverage(str(output), str(target))
+        target.unlink()
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
+        # Distinct from a coverage mismatch: the cache may well be fine.
+        assert 'could not be read' in capsys.readouterr().out
+
+    def test_reordered_target_file_still_accepts_cache(self, tmp_path):
+        target, output = self._cached(tmp_path, '10.0.0.1\n10.0.0.2\n')
+        spoonmap._stamp_target_coverage(str(output), str(target))
+        target.write_text('10.0.0.2\n10.0.0.1\n')
+        assert spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
+
+    def test_gate_with_target_none_skips_the_coverage_check(self, tmp_path):
+        # _host_discovery() and nmap_scan()'s gates pass None deliberately.
+        _target, output = self._cached(tmp_path)
+        assert spoonmap._resume_cache_usable(str(output), 0, 'phase', None)
+
+    def test_unreadable_target_warns_instead_of_stamping(self, tmp_path, capsys):
+        _target, output = self._cached(tmp_path)
+        spoonmap._stamp_target_coverage(str(output), str(tmp_path / 'absent.txt'))
+        assert not os.path.exists(str(output) + '.target')
+        assert 'could not read' in capsys.readouterr().out
+
+    def test_stamp_write_failure_warns_instead_of_raising(self, tmp_path, capsys):
+        # The scan already succeeded; raising here would discard real results.
+        target, output = self._cached(tmp_path)
+        with patch('spoonmap._atomic_write', side_effect=OSError('ENOSPC')):
+            spoonmap._stamp_target_coverage(str(output), str(target))
+        assert 'could not record the target set' in capsys.readouterr().out
+
+    def test_orphaned_stamp_without_its_output_is_harmless(self, tmp_path):
+        target, output = self._cached(tmp_path)
+        spoonmap._stamp_target_coverage(str(output), str(target))
+        output.unlink()
+        assert not spoonmap._resume_cache_usable(str(output), 0, 'phase', str(target))
+
+    def test_cleanup_removes_the_stamp_sidecars(self, tmp_path):
+        # They live under discovery/, which _delete_previous_results() rmtrees;
+        # pin that rather than rediscovering it the next time the layout moves.
+        disc = tmp_path / 'discovery' / 'masscan_results'
+        disc.mkdir(parents=True)
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
+        output = disc / 'portFull.xml'
+        output.write_text('<nmaprun/>')
+        spoonmap._stamp_target_coverage(str(output), str(target))
+        assert (disc / 'portFull.xml.target').exists()
+        spoonmap._delete_previous_results(str(tmp_path))
+        assert not (tmp_path / 'discovery').exists()
+
+    def test_stamp_sidecar_is_invisible_to_result_aggregation(self, tmp_path):
+        # masscan_results/ is aggregated by listing the directory, so a sidecar
+        # that parsed as a result file would corrupt spoonmap_output.*.
+        result_dir = tmp_path / 'masscan_results'
+        result_dir.mkdir()
+        xml = result_dir / 'portFull.xml'
+        xml.write_text(
+            '<?xml version="1.0"?><nmaprun><host>'
+            '<address addr="10.0.0.1" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="80">'
+            '<state state="open"/></port></ports>'
+            '</host></nmaprun>'
+        )
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
+        spoonmap._stamp_target_coverage(str(xml), str(target))
+        assert (result_dir / 'portFull.xml.target').exists()
+        hosts_json, xml_hosts = spoonmap._aggregate_result_dir(str(result_dir) + '/', {})
+        assert [h['ip'] for h in hosts_json] == ['10.0.0.1']
+        assert set(xml_hosts) == {'10.0.0.1'}
+
+
+class TestResumeTargetStampIntegration:
+    """The two under-scans issue #46 describes, at the mass_scan() level."""
+
+    def _completed_full_run(self, tmp_path, discovery_ips):
+        """Run a Full scan against *discovery_ips*, leaving a stamped cache."""
+        spoonmap.output_path = str(tmp_path)
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        targets = disc / 'resolved_targets.txt'
+        targets.write_text('10.0.0.0/24\n')
+        discovery_file = disc / 'live_hosts_discovery.txt'
+        discovery_file.write_text(''.join(ip + '\n' for ip in discovery_ips))
+
+        def fake_batch(batch, rate, output_file, target_file, *a, **kw):
+            Path(output_file).write_text('<nmaprun/>')
+            spoonmap._stamp_target_coverage(output_file, target_file)
+            return {'22': {'10.0.0.1'}}
+
+        with patch('spoonmap._run_masscan_batch', side_effect=fake_batch):
+            mass_scan('Full', ['1-65535'], '88', '2000', str(targets), '',
+                      discovery_file=str(discovery_file))
+        return targets, discovery_file
+
+    def test_disabling_host_discovery_forces_a_full_rescan(self, tmp_path, capsys):
+        """Scenario A: the target widens to the whole range with no mtime change.
+
+        Nothing rewrites resolved_targets.txt, so before the fingerprint the
+        cached narrow sweep satisfied its gate and was reported as a completed
+        full-range scan.
+        """
+        targets, _discovery = self._completed_full_run(tmp_path, ['10.0.0.1'])
+        with patch('spoonmap._run_masscan_batch',
+                   return_value={'22': {'10.0.0.1'}}) as mock_batch:
+            mass_scan('Full', ['1-65535'], '88', '2000', str(targets), '',
+                      resume=True, discovery_file=None)
+        assert mock_batch.called, 'a widened target must re-scan, not resume'
+        assert mock_batch.call_args[0][3] == str(targets)
+        assert 'were not covered by the cached result' in capsys.readouterr().out
+
+    def test_unchanged_discovery_still_resumes(self, tmp_path, capsys):
+        """The load-bearing direction: an identical target set must still skip."""
+        targets, discovery = self._completed_full_run(tmp_path, ['10.0.0.1'])
+        with patch('spoonmap._run_masscan_batch') as mock_batch:
+            mass_scan('Full', ['1-65535'], '88', '2000', str(targets), '',
+                      resume=True, discovery_file=str(discovery))
+        assert not mock_batch.called
+        assert 'skipping completed Full port scan' in capsys.readouterr().out
+
+    def test_a_grown_discovery_set_forces_a_full_rescan(self, tmp_path):
+        """A host discovery found on the second run must not be left unscanned."""
+        targets, discovery = self._completed_full_run(tmp_path, ['10.0.0.1'])
+        discovery.write_text('10.0.0.1\n10.0.0.2\n')
+        with patch('spoonmap._run_masscan_batch',
+                   return_value={'22': {'10.0.0.1'}}) as mock_batch:
+            mass_scan('Full', ['1-65535'], '88', '2000', str(targets), '',
+                      resume=True, discovery_file=str(discovery))
+        assert mock_batch.called
+
+    def test_killed_masscan_leaves_no_stamp(self, tmp_path):
+        """A stamp on an interrupted batch would assert coverage that never ran."""
+        spoonmap.output_path = str(tmp_path)
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        targets = disc / 'resolved_targets.txt'
+        targets.write_text('10.0.0.1\n')
+        output_file = str(disc / 'masscan_results' / 'portFull.xml')
+        with patch('spoonmap.subprocess.Popen', side_effect=KeyboardInterrupt), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            with pytest.raises(KeyboardInterrupt):
+                spoonmap._run_masscan_batch(['80'], '1000', output_file,
+                                            str(targets), '', '')
+        assert not os.path.exists(output_file + '.target')
+
+    def test_failed_masscan_exit_leaves_no_stamp(self, tmp_path):
+        """Same for a non-zero exit, which sys.exit()s before the stamp."""
+        spoonmap.output_path = str(tmp_path)
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        targets = disc / 'resolved_targets.txt'
+        targets.write_text('10.0.0.1\n')
+        output_file = str(disc / 'masscan_results' / 'portFull.xml')
+        proc = MagicMock()
+        proc.wait.return_value = 0
+        proc.returncode = 1
+        proc.pid = 4242
+        # Finite stderr: a bare MagicMock returns truthy bytes forever and hangs
+        # the progress reader's join.
+        proc.stderr = io.BytesIO(b'Error: permission denied')
+        with patch('spoonmap.subprocess.Popen', return_value=proc), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            with pytest.raises(SystemExit):
+                spoonmap._run_masscan_batch(['80'], '1000', output_file,
+                                            str(targets), '', '')
+        assert not os.path.exists(output_file + '.target')
+
+    def test_successful_masscan_stamps_the_target_it_scanned(self, tmp_path):
+        """The positive counterpart: a clean exit records its target set."""
+        spoonmap.output_path = str(tmp_path)
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        targets = disc / 'resolved_targets.txt'
+        targets.write_text('10.0.0.1\n')
+        output_file = str(disc / 'masscan_results' / 'portFull.xml')
+        proc = MagicMock()
+        proc.wait.return_value = 0
+        proc.returncode = 0
+        proc.pid = 4243
+        proc.stderr = io.BytesIO(b'')
+        with patch('spoonmap.subprocess.Popen', return_value=proc), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            spoonmap._run_masscan_batch(['80'], '1000', output_file,
+                                        str(targets), '', '')
+        stamp = Path(output_file + '.target')
+        assert set(stamp.read_text().split()) == spoonmap._target_entries(str(targets))
+
+
+class TestResumeTargetStampBatchPhase:
+    """Issue #46 scenario B: the batch phase, reachable with no config change.
+
+    live_hosts_combined.txt is rebuilt every run from a probe that is
+    deliberately not resume-gated, so its content moves with packet loss. A host
+    run 2's probe finds but run 1's missed must not end up in live_hosts/ and
+    all_live_hosts.txt while the already-cached batches skip it.
+    """
+
+    def _run(self, tmp_path, probe_hits, resume):
+        """Drive mass_scan()'s batch path with a controllable probe result."""
+        spoonmap.output_path = str(tmp_path)
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True, exist_ok=True)
+        targets = disc / 'resolved_targets.txt'
+        if not targets.exists():
+            # Written once: rewriting it would bump the mtime baseline and reject
+            # every cache for that reason instead of the coverage check under test.
+            targets.write_text('10.0.0.0/24\n')
+        batch_calls = []
+
+        def fake_batch(batch, rate, output_file, target_file, *a, **kw):
+            Path(output_file).write_text('<nmaprun/>')
+            spoonmap._stamp_target_coverage(output_file, target_file)
+            if 'probe_fast' in output_file:
+                return {'80': set(probe_hits)}
+            if 'probe_slow' in output_file:
+                return {}
+            batch_calls.append(list(batch))
+            return {}
+
+        with patch('spoonmap._run_masscan_batch', side_effect=fake_batch):
+            mass_scan('All', ['80', '443'], '53', '10000', str(targets), '',
+                      batch_size=10, resume=resume)
+        return batch_calls, targets
+
+    def test_a_probe_that_finds_a_new_host_rescans_cached_batches(self, tmp_path, capsys):
+        first, _ = self._run(tmp_path, {'10.0.0.7'}, resume=False)
+        assert first == [['443']], 'setup: port 443 must reach a main batch'
+        capsys.readouterr()
+
+        second, _ = self._run(tmp_path, {'10.0.0.7', '10.0.0.9'}, resume=True)
+        out = capsys.readouterr().out
+        assert second == [['443']], (
+            'the cached batch must be re-scanned now that 10.0.0.9 is a target'
+        )
+        assert 'were not covered by the cached result' in out
+        assert '10.0.0.9' in out
+
+    def test_an_unchanged_probe_still_skips_cached_batches(self, tmp_path, capsys):
+        first, _ = self._run(tmp_path, {'10.0.0.7'}, resume=False)
+        assert first == [['443']]
+        capsys.readouterr()
+
+        second, _ = self._run(tmp_path, {'10.0.0.7'}, resume=True)
+        assert second == [], 'an unchanged target set must still resume'
+        assert 'skipping completed batch' in capsys.readouterr().out
+
+    def test_a_probe_that_finds_fewer_hosts_still_skips_cached_batches(self, tmp_path, capsys):
+        """Exact equality here made --resume thrash on ordinary probe variance.
+
+        The cache covered a superset of what this run would scan, so there is
+        nothing left to do — re-scanning would discard a wider completed result
+        for a narrower one.
+        """
+        first, _ = self._run(tmp_path, {'10.0.0.7', '10.0.0.9'}, resume=False)
+        assert first == [['443']]
+        capsys.readouterr()
+
+        second, _ = self._run(tmp_path, {'10.0.0.7'}, resume=True)
+        assert second == [], 'a narrower target set must not force a re-scan'
+        assert 'skipping completed batch' in capsys.readouterr().out
+
+
+class TestResumeTargetStampNmapDiscovery:
+    """The two nmap discovery phases: stamp on success, reject on a wider target."""
+
+    def _proc(self, returncode=0):
+        proc = MagicMock()
+        proc.wait.return_value = 0
+        proc.returncode = returncode
+        proc.pid = 999
+        proc.stdout = io.StringIO('')
+        proc.stderr = io.StringIO('')
+        return proc
+
+    def _udp_xml(self, ip='10.0.0.5'):
+        return (
+            '<?xml version="1.0"?><nmaprun><host>'
+            f'<address addr="{ip}" addrtype="ipv4"/>'
+            '<ports><port protocol="udp" portid="53">'
+            '<state state="open"/></port></ports>'
+            '</host></nmaprun>'
+        )
+
+    def test_udp_discovery_stamps_on_success_then_resumes(self, tmp_path):
+        (tmp_path / 'discovery' / 'masscan_results').mkdir(parents=True)
+        (tmp_path / 'discovery' / 'live_hosts').mkdir(parents=True)
+        spoonmap.output_path = str(tmp_path)
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.5\n')
+        xml = tmp_path / 'discovery' / 'masscan_results' / 'portU_53.xml'
+
+        def fake_popen(cmd, **kwargs):
+            Path(cmd[cmd.index('-oX') + 1]).write_text(self._udp_xml())
+            return self._proc()
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            spoonmap._nmap_udp_discovery('U:53', str(target), str(tmp_path), '', None)
+        assert Path(str(xml) + '.target').read_text().split() == ['10.0.0.5']
+
+        # Same target → resume; widened target → re-scan.
+        with patch('spoonmap.subprocess.Popen') as mock_popen:
+            spoonmap._nmap_udp_discovery('U:53', str(target), str(tmp_path), '',
+                                         None, resume=True)
+        assert not mock_popen.called
+
+        # Widen the target but hold its mtime *behind* the cached XML, so the
+        # mtime baseline still accepts the cache and the coverage check is the
+        # only thing that can reject it.
+        target.write_text('10.0.0.5\n10.0.0.6\n')
+        os.utime(str(target), (1000, 1000))
+        os.utime(str(xml), (2000, 2000))
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen) as mock_popen, \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            spoonmap._nmap_udp_discovery('U:53', str(target), str(tmp_path), '',
+                                         None, resume=True)
+        assert mock_popen.called, 'a target added since the cache must re-scan'
+
+    def test_udp_discovery_does_not_stamp_after_a_failed_nmap(self, tmp_path):
+        """A non-zero exit can still leave parseable partial XML.
+
+        This function does not treat that as fatal, so without the returncode
+        guard the stamp would claim full target coverage for a partial result.
+        """
+        (tmp_path / 'discovery' / 'masscan_results').mkdir(parents=True)
+        spoonmap.output_path = str(tmp_path)
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.5\n')
+        xml = tmp_path / 'discovery' / 'masscan_results' / 'portU_53.xml'
+
+        def fake_popen(cmd, **kwargs):
+            Path(cmd[cmd.index('-oX') + 1]).write_text(self._udp_xml())
+            return self._proc(returncode=1)
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            spoonmap._nmap_udp_discovery('U:53', str(target), str(tmp_path), '', None)
+        assert xml.exists(), 'the partial result stays readable on disk'
+        assert not Path(str(xml) + '.target').exists()
+
+    def test_port_discovery_stamps_on_success_then_resumes(self, tmp_path):
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        (disc / 'live_hosts').mkdir(parents=True)
+        spoonmap.output_path = str(tmp_path)
+        target = tmp_path / 'targets.txt'
+        target.write_text('10.0.0.1\n')
+        xml = disc / 'masscan_results' / 'portDirect.xml'
+
+        def fake_popen(cmd, **kwargs):
+            Path(cmd[cmd.index('-oX') + 1]).write_text(
+                '<?xml version="1.0"?><nmaprun><host>'
+                '<address addr="10.0.0.1" addrtype="ipv4"/>'
+                '<ports><port protocol="tcp" portid="80">'
+                '<state state="open"/></port></ports>'
+                '</host></nmaprun>'
+            )
+            return self._proc()
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            spoonmap._nmap_port_discovery(['80'], str(target), '', None)
+        assert Path(str(xml) + '.target').read_text().split() == ['10.0.0.1']
+
+        with patch('spoonmap.subprocess.Popen') as mock_popen, \
+             patch('spoonmap.restore_terminal_state'):
+            spoonmap._nmap_port_discovery(['80'], str(target), '', None, resume=True)
+        assert not mock_popen.called
+
+        # Widen the target but hold its mtime behind the cached XML, so only the
+        # coverage check can reject the cache (see the UDP counterpart).
+        target.write_text('10.0.0.1\n10.0.0.2\n')
+        os.utime(str(target), (1000, 1000))
+        os.utime(str(xml), (2000, 2000))
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen) as mock_popen, \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            spoonmap._nmap_port_discovery(['80'], str(target), '', None, resume=True)
+        assert mock_popen.called, 'a target added since the cache must re-scan'
