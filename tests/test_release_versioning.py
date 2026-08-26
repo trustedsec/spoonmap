@@ -265,16 +265,36 @@ def test_compute_tag_step_assigns_correct_channel(branch, expected_channel, tmp_
     assert parsed['channel'] == expected_channel, \
         f'Expected channel={expected_channel}, got channel={parsed["channel"]}'
 
-    # Assert new_tag key exists and is non-empty in this environment.
-    # Empty is only legitimate when HEAD sits exactly on a tag (no new commits),
-    # which is not the case in this test repo. The key must exist and have a value
-    # to catch mutations that write then blank it. Do NOT use `if new_tag:` guards
-    # that would skip validation of a blanked value.
+    # Assert both keys are present unconditionally. This catches key renames
+    # (e.g., echo "new_tag=$new_tag" renamed to echo "tagname=$new_tag").
     assert 'new_tag' in parsed, f'new_tag key not in GITHUB_OUTPUT: {parsed}'
+    assert 'channel' in parsed, f'channel key not in GITHUB_OUTPUT (checked twice): {parsed}'
+
+    # Validate new_tag value shape without guarding. Empty is legitimate when HEAD
+    # sits exactly on a tag (no new commits). Non-empty must match the channel's
+    # tag format: stable uses v0.1.0, nightly uses v0.1.0rc1.
     new_tag = parsed['new_tag']
-    assert new_tag, f'new_tag must not be empty in this environment, got: {new_tag!r}'
-    assert re.match(r'^v\d+\.\d+\.\d+', new_tag), \
-        f'new_tag has unexpected format: {new_tag}'
+    if expected_channel == 'stable':
+        tag_pattern = r'^v\d+\.\d+\.\d+$'
+    else:  # nightly
+        tag_pattern = r'^v\d+\.\d+\.\d+rc\d+$'
+
+    # Assert value is either empty or matches the channel-appropriate format.
+    # No if guards — validation always runs unconditionally.
+    is_empty = new_tag == ''
+    matches_pattern = re.match(tag_pattern, new_tag) is not None
+    assert is_empty or matches_pattern, \
+        f'new_tag must be empty or match {tag_pattern}, got: {new_tag!r}'
+
+    # Count key occurrences in raw file. Mutations that write then blank create a
+    # duplicate key line (echo "new_tag=" appended after the real write). This
+    # catches the mutation even when the value is legitimately empty.
+    new_tag_count = output_contents.count('new_tag=')
+    channel_count = output_contents.count('channel=')
+    assert new_tag_count == 1, \
+        f'new_tag key appears {new_tag_count} times (expected 1): {output_contents!r}'
+    assert channel_count == 1, \
+        f'channel key appears {channel_count} times (expected 1): {output_contents!r}'
 
 
 def test_the_pushed_tag_is_the_one_the_policy_computed():
