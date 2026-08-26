@@ -663,8 +663,17 @@ jobs:
             echo "spoonmap --version printed the running-from-source sentinel despite being installed from a wheel" >&2
             exit 1
           fi
-          echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+' || {
-            echo "spoonmap --version did not print something starting with a parseable X.Y.Z: $version" >&2
+          # PEP 440-tolerant, not a strict X.Y.Z match: this repo has no tags
+          # yet, so an untagged tree's own wheel legitimately versions as
+          # hatch-vcs's no-guess-dev scheme (e.g. 0.0.post1.dev285), not a
+          # plain release tag. A strict X.Y.Z-only pattern fails on exactly
+          # that legitimate, common case -- and since `tag` needs `build`,
+          # that failure would deadlock tagging until someone hand-pushed a
+          # tag. This still rejects empty output and the from-source
+          # sentinel (both checked above), and still catches a mutation that
+          # prints an arbitrary non-version string.
+          echo "$version" | grep -Eq '^[0-9]+(\.[0-9]+)+' || {
+            echo "spoonmap --version did not print something starting with a parseable version: $version" >&2
             exit 1
           }
 

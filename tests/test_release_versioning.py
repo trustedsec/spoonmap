@@ -195,15 +195,23 @@ def test_every_other_checkout_drops_its_credentials():
     release create`) and is the other place a checkout could quietly gain a
     push-capable token. `tag` (in ci.yml) is the single documented exception:
     it is the only job anywhere that pushes a tag."""
+    seen_files = set()
     for filename in os.listdir(WORKFLOWS):
         if not filename.endswith(('.yml', '.yaml')):
             continue
+        seen_files.add(filename)
         workflow = _load(filename)
         for job_id, job in workflow['jobs'].items():
             if filename == 'ci.yml' and job_id == 'tag':
                 continue
             persist = _checkout(job)['with']['persist-credentials']
             assert str(persist).lower() == 'false', f'{filename}:{job_id}'
+
+    # A floor: the loop above passes vacuously if os.listdir() ever returned
+    # only one workflow file (e.g. a filesystem glitch, or a future rename
+    # that no longer matches .yml/.yaml). Assert both files this test exists
+    # to cover were actually visited.
+    assert {'ci.yml', 'release.yml'} <= seen_files, seen_files
 
 
 # --- the policy module is the only thing that produces a version -------------

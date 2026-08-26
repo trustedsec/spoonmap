@@ -2912,6 +2912,35 @@ class TestBuildInteractiveConfig:
         assert reloaded['host_discovery'] is False
         assert reloaded['resume'] is False
 
+    def test_check_for_updates_true_survives_a_regeneration_round_trip(self, tmp_path):
+        """An operator who set check_for_updates: true must not silently lose
+        it when SpooNMAP rewrites config.json (e.g. the [d]elete/[a]ppend
+        re-prompt flow). Exercises the actual write -> disk -> reload path,
+        not just the in-memory dict, since a key present in the dict but
+        dropped by json.dump, or never read back by _load_config, would pass
+        a weaker check."""
+        cfg = _build_interactive_config(
+            'All', [], 'All', True, False, 'Internal', '2000',
+            '/t/r', '/t/o', None, 5, 5, 5_000_000, True,
+            check_for_updates=True)
+        assert cfg['check_for_updates'] is True
+        path = tmp_path / 'config.json'
+        assert _write_interactive_config(str(path), cfg) is True
+        reloaded = _load_config(json.loads(path.read_text()), '/t')
+        assert reloaded['check_for_updates'] is True
+
+    def test_check_for_updates_false_also_writes_explicitly(self):
+        """False must be written as an explicit key too, not merely omitted
+        -- an omitted key would happen to default to False on reload, which
+        would make this test pass for the wrong reason if the field were
+        dropped from `values` entirely."""
+        cfg = _build_interactive_config(
+            'All', [], 'All', True, False, 'Internal', '2000',
+            'r', 'o', None, 5, 5, 5_000_000, True,
+            check_for_updates=False)
+        assert 'check_for_updates' in cfg
+        assert cfg['check_for_updates'] is False
+
     def test_exclusions_none_becomes_empty_string(self):
         cfg = _build_interactive_config(
             'All', [], 'All', True, False, 'Internal', '2000',
@@ -12755,13 +12784,6 @@ class TestCheckForUpdates:
         assert 'Update check failed' in out
         assert 'not-a-version' in out
 
-    def test_check_update_dispatch_uses_quiet_false(self):
-        """main()'s --check-update branch must pass quiet=False -- this is
-        what item 1 actually fixes; TestMainVersionDispatch covers the wiring
-        directly, this pins the same fact at the _check_for_updates() call
-        site's default."""
-        assert inspect.signature(spoonmap._check_for_updates).parameters['quiet'].default is True
-
     # --- network-safety properties that must have real assertions behind
     # them, not just comments (item 9) ---------------------------------------
 
@@ -12786,6 +12808,16 @@ class TestCheckForUpdates:
         every operator -- exactly what _RELEASE_API_URL's own comment says
         must not happen."""
         assert spoonmap._RELEASE_API_URL.rstrip('/').endswith('/releases/latest')
+
+        # Pinning the constant alone doesn't prove _check_for_updates() ever
+        # uses it -- a mutation that inlined a different literal URL at the
+        # urlopen() call site would leave the assertion above passing. Assert
+        # the actual call used the constant.
+        with patch('spoonmap._tool_version', return_value='0.0.1'), \
+             patch('spoonmap.urllib.request.urlopen',
+                        return_value=self._response('v0.1.0')) as mock_urlopen:
+            spoonmap._check_for_updates()
+        assert mock_urlopen.call_args[0][0] == spoonmap._RELEASE_API_URL
 
 
 class TestParseReleaseTag:
