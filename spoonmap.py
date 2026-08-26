@@ -1619,11 +1619,12 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
     if wait_secs > 0 and target_host_count is not None:
         print(_COLOR_INFO + f'Inter-scan wait: {wait_secs}s (target ~{target_host_count:,} hosts)' + _COLOR_RESET)
 
-    # Probe and subsequent batches target discovered hosts when available,
-    # falling back to the full target file if discovery was skipped.
-    probe_target = (discovery_file
-                    if (discovery_file and os.path.exists(discovery_file))
-                    else target_file)
+    # The probe, the port batches, and the Full 1-65535 sweep all narrow to the
+    # discovered hosts when host discovery produced any, falling back to the full
+    # target file when it was skipped.
+    discovered_target = (discovery_file
+                         if (discovery_file and os.path.exists(discovery_file))
+                         else target_file)
 
     # The operator's current authorised scope, parsed once per call: used both to
     # decide which cached hosts may be folded into the batch target and to
@@ -1680,18 +1681,46 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                     'full requested rate.'
                   + _COLOR_RESET)
         print(_COLOR_INFO + 'Full port scan: running masscan 1-65535 (no probe)...' + _COLOR_RESET)
+        # 65535 ports against every address in the range rather than the
+        # discovered live hosts is the same scan multiplied by the range's dead
+        # space, and full_scan_rate is capped, so the operator cannot rate their
+        # way out of it: discovery narrowing a /16 to a few hundred hosts is the
+        # difference between hours and weeks.  Unlike the cached-host fold below
+        # this needs no _ip_in_ranges() scope filter — discovery_file is
+        # mtime-gated against resolved_targets.txt (here and in
+        # _host_discovery()'s own resume gate), so a narrowed scope invalidates
+        # it rather than leaving it to carry a host from a wider one.
         full_results = _run_masscan_batch(['1-65535'], full_scan_rate, output_file,
-                                          target_file, source_port, exclusions_file,
+                                          discovered_target, source_port, exclusions_file,
                                           wait_secs=wait_secs)
         os.makedirs(f'{disc}/live_hosts', exist_ok=True)
         for port_key, ips in full_results.items():
-            _atomic_write(f'{disc}/live_hosts/port{_port_fname(port_key)}.txt',
-                          ''.join(f'{ip}\n' for ip in sorted(ips)))
-            host_count = len(ips)
+            # Union with the cached per-port file instead of replacing it, exactly
+            # as the probe and batch phases below do.  This sweep covers
+            # discovered_target, not the whole range, so it can legitimately find
+            # fewer hosts on a port than an earlier, wider run recorded — and
+            # writing only this run's hits would delete the difference out of
+            # live_hosts/portN.txt, and so out of all_live_hosts.txt, the nmap
+            # banner phase's input, and spoonmap_output.*.  Reachable without
+            # --resume: two Full runs into one output_path, answering [k]eep at
+            # the prior-results prompt, which leaves live_hosts/ in place.
+            live_host_file = f'{disc}/live_hosts/port{_port_fname(port_key)}.txt'
+            combined = set(ips)
+            if os.path.exists(live_host_file):
+                with open(live_host_file, 'r') as file:
+                    combined.update(line.strip() for line in file if line.strip())
+            full_results[port_key] = combined
+            _atomic_write(live_host_file,
+                          ''.join(f'{ip}\n' for ip in sorted(combined)))
+            host_count = len(combined)
             status_update = f'\nHosts Found on Port {port_key}: {host_count}'
             status_summary += status_update
             print(_COLOR_PROGRESS + status_update + _COLOR_RESET)
         _report_suspected_tarpits(_flag_suspected_tarpits(full_results, 65535), disc)
+        # Retaining cached hosts means this path can now carry a host from a
+        # previous, wider engagement scope, exactly as the resume path can, so it
+        # owes the operator the same disclosure.
+        _report_out_of_scope_retained(full_results, scope_ranges, target_file)
         return status_summary
 
     probe_priority = EXTERNAL_PROBE_PORT_PRIORITY if scan_type == 'External' else PROBE_PORT_PRIORITY
@@ -1712,7 +1741,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                 print(_COLOR_INFO + f'Probe: scanning port {port} at {max_rate} pps...' + _COLOR_RESET)
                 port_fast = _run_masscan_batch([port], max_rate,
                     f'{disc}/masscan_results/probe_fast_{pb_idx}.xml',
-                    probe_target, source_port, exclusions_file, wait_secs=wait_secs)
+                    discovered_target, source_port, exclusions_file, wait_secs=wait_secs)
                 for k, v in port_fast.items():
                     fast_results.setdefault(k, set()).update(v)
                 fast_ips = {ip for s in port_fast.values() for ip in s}
@@ -1722,7 +1751,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                 print(_COLOR_INFO + f'Probe found 0 hosts at {max_rate} pps — checking {half_rate} pps...' + _COLOR_RESET)
                 port_slow = _run_masscan_batch([port], half_rate,
                     f'{disc}/masscan_results/probe_slow_{pb_idx}.xml',
-                    probe_target, source_port, exclusions_file, wait_secs=wait_secs)
+                    discovered_target, source_port, exclusions_file, wait_secs=wait_secs)
                 for k, v in port_slow.items():
                     slow_results.setdefault(k, set()).update(v)
                 slow_ips = {ip for s in port_slow.values() for ip in s}
@@ -1739,10 +1768,10 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             probe_label = ', '.join(probe_ports)
             print(_COLOR_INFO + f'Probe: scanning {probe_label} at {max_rate} pps then {half_rate} pps to check for packet loss...' + _COLOR_RESET)
             fast_results = _run_masscan_batch(probe_ports, max_rate,
-                f'{disc}/masscan_results/probe_fast.xml', probe_target, source_port, exclusions_file,
+                f'{disc}/masscan_results/probe_fast.xml', discovered_target, source_port, exclusions_file,
                 wait_secs=wait_secs)
             slow_results = _run_masscan_batch(probe_ports, half_rate,
-                f'{disc}/masscan_results/probe_slow.xml', probe_target, source_port, exclusions_file,
+                f'{disc}/masscan_results/probe_slow.xml', discovered_target, source_port, exclusions_file,
                 wait_secs=wait_secs)
             fast_ips = {ip for s in fast_results.values() for ip in s}
             slow_ips = {ip for s in slow_results.values() for ip in s}
@@ -1762,7 +1791,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             # Union with the cached per-port file instead of replacing it, exactly
             # as the batch phase below does ("loading existing data for resume").
             # The probe has no resume gate, so a resumed run always re-probes —
-            # and it probes probe_target, a narrower set than the batch target,
+            # and it probes discovered_target, a narrower set than the batch target,
             # at a rate whose packet loss varies run to run.  Writing only this
             # probe's hits therefore deleted every host an earlier run had already
             # confirmed on this port: out of live_hosts/portN.txt, and so out of
@@ -1795,7 +1824,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                 ports_to_batch = ports_to_batch + _probe_missed
 
         # SLOW_PORTS from the probe are always re-queued for a dedicated solo scan.
-        # The probe runs against probe_target (a narrower set); main batches use the
+        # The probe runs against discovered_target (a narrower set); main batches use the
         # combined batch_target, so a probe hit alone may miss hosts that only appear
         # in the combined target.
         _slow_in_probe = [p for p in probe_ports_used if p in SLOW_PORTS]
@@ -1884,7 +1913,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
     else:
         # No probe ran — use discovery file if available, else full target
         ports_to_batch = tcp_ports
-        batch_target = discovery_file if (discovery_file and os.path.exists(discovery_file)) else target_file
+        batch_target = discovered_target
 
     batch_wait_secs = 0 if discovery_file else wait_secs
 
@@ -5938,7 +5967,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                       + _COLOR_RESET)
             status_summary = mass_scan(
                 scan_type, dest_ports, source_port, max_rate,
-                masscan_target_file,                   # always full range for probe
+                masscan_target_file,                   # full range; mass_scan() narrows to discovery_file
                 exclusions_file, masscan_batch_size,
                 resume=resume, discovery_file=discovery_file,
                 target_scan=target_scan,

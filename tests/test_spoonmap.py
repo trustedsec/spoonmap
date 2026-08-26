@@ -2059,6 +2059,61 @@ class TestFullPortScan:
             wait_secs=2,
         )
 
+    def test_full_scan_targets_discovered_hosts_not_full_range(self, tmp_path):
+        """A Full sweep must scan the discovery file, not the whole range.
+
+        65535 ports against every address in the range instead of the
+        discovered live hosts multiplies the scan by the range's dead space,
+        and full_scan_rate is capped, so the operator cannot compensate.
+        """
+        spoonmap.output_path = str(tmp_path)
+        discovery_file = tmp_path / 'discovery' / 'live_hosts_discovery.txt'
+        discovery_file.parent.mkdir(parents=True)
+        discovery_file.write_text('10.0.0.1\n10.0.0.2\n10.0.0.3\n')
+        with patch('spoonmap._run_masscan_batch', return_value={'22': {'10.0.0.1'}}) as mock_batch:
+            mass_scan('Full', ['1-65535'], '88', '2000', '/fake/targets.txt', '',
+                      discovery_file=str(discovery_file))
+        # Full tuple, not just the target: wait_secs=0 also pins that --wait is
+        # derived from the discovered host count rather than the whole range.
+        mock_batch.assert_called_once_with(
+            ['1-65535'], '1000',
+            str(tmp_path) + '/discovery/masscan_results/portFull.xml',
+            str(discovery_file), '88', '',
+            wait_secs=0,
+        )
+
+    def test_full_scan_falls_back_when_discovery_file_missing(self, tmp_path):
+        """A discovery path that was never written must not become the -iL target."""
+        spoonmap.output_path = str(tmp_path)
+        with patch('spoonmap._run_masscan_batch', return_value={'22': {'10.0.0.1'}}) as mock_batch:
+            mass_scan('Full', ['1-65535'], '88', '2000', '/fake/targets.txt', '',
+                      discovery_file=str(tmp_path / 'discovery' / 'absent.txt'))
+        assert mock_batch.call_args[0][3] == '/fake/targets.txt'
+
+    def test_full_scan_unions_live_hosts_with_prior_run(self, tmp_path, capsys):
+        """A narrowed Full sweep must not delete hosts an earlier wider run found.
+
+        The sweep now covers only the discovered hosts, so finding fewer hosts
+        on a port than a previous run recorded is legitimate — dropping the
+        difference would lose it from live_hosts/, all_live_hosts.txt, the nmap
+        banner input, and spoonmap_output.*.
+        """
+        spoonmap.output_path = str(tmp_path)
+        disc = tmp_path / 'discovery'
+        (disc / 'live_hosts').mkdir(parents=True)
+        (disc / 'live_hosts' / 'port22.txt').write_text('10.0.0.1\n10.0.0.7\n')
+        discovery_file = disc / 'live_hosts_discovery.txt'
+        discovery_file.write_text('10.0.0.1\n')
+        with patch('spoonmap._run_masscan_batch', return_value={'22': {'10.0.0.1'}}):
+            result = mass_scan('Full', ['1-65535'], '88', '2000',
+                               '/fake/targets.txt', '',
+                               discovery_file=str(discovery_file))
+        kept = (disc / 'live_hosts' / 'port22.txt').read_text().split()
+        assert kept == ['10.0.0.1', '10.0.0.7']
+        # The retained host is reflected in the reported count, as on the resume
+        # path, not silently present on disk only.
+        assert 'Hosts Found on Port 22: 2' in result
+
     def test_full_scan_warns_when_rate_is_capped(self, tmp_path, capsys):
         """A clamped rate is disclosed — the run summary shows the requested rate."""
         spoonmap.output_path = str(tmp_path)
