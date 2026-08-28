@@ -6004,6 +6004,15 @@ _CONFIG_DOCS = {
          'tool makes no network connection other than the scan itself unless you turn '
          'this on. Use --check-update for a one-off check without enabling it here.'),
     ],
+    'honeypot_active_confirm': [
+        ('__honeypot_active_confirm_note__',
+         'Optional. When true, SpooNMAP attempts a small number of raw TCP connects '
+         'against unscanned high ports on any host flagged as a suspected honeypot, '
+         'to confirm it. Default false, and absent means false: the tool sends no '
+         'traffic beyond the scan itself unless you turn this on. A confirmed host '
+         'answered a port that was never part of this scan, which is a strong tell '
+         'that it accepts every connection rather than running a real service.'),
+    ],
     'target_scan': [
         ('__target_scan_choices__',
          'External, Internal (case-insensitive; any other value stops the run '
@@ -6044,7 +6053,8 @@ _CONFIG_DOCS = {
 # Canonical key order for a written config.json, matching config.json.sample.
 _CONFIG_FIELD_ORDER = (
     'scan_categories', 'dest_ports', 'masscan_batch_size', 'banner_scan',
-    'script_scan', 'host_discovery', 'resume', 'check_for_updates', 'target_scan', 'max_rate',
+    'script_scan', 'host_discovery', 'resume', 'check_for_updates',
+    'honeypot_active_confirm', 'target_scan', 'max_rate',
     'nmap_threads', 'nmap_threshold', 'target_file', 'output_path',
     'exclusions_file', 'scanner_profile',
 )
@@ -6054,7 +6064,8 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
                               script_scan, target_scan, max_rate, target_file,
                               output_path, exclusions_file, nmap_threads,
                               masscan_batch_size, nmap_threshold, host_discovery,
-                              check_for_updates=False, scanner_profile=None):
+                              check_for_updates=False, scanner_profile=None,
+                              honeypot_active_confirm=False):
     """Build a config.json-compatible dict from interactively collected options.
 
     The result round-trips through main()'s config loader: reloading it
@@ -6099,6 +6110,7 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
         'host_discovery': bool(host_discovery),
         'resume': False,
         'check_for_updates': bool(check_for_updates),
+        'honeypot_active_confirm': bool(honeypot_active_confirm),
         'target_scan': target_scan,
         'max_rate': str(max_rate),
         'nmap_threads': int(nmap_threads),
@@ -7056,6 +7068,10 @@ def _load_config(config_parser, dir_path, resume=False):
     # Token generation itself happens in main(), not here, so this stays
     # deterministic for testing.
     scanner_profile = _config_scanner_profile(config_parser.get('scanner_profile'))
+    # Same posture as check_for_updates: absent means off, and this is the
+    # only way to enable the active probe. See _maybe_confirm_honeypot().
+    honeypot_active_confirm = _config_bool(
+        'honeypot_active_confirm', config_parser.get('honeypot_active_confirm', False), False)
     config_generated = bool(config_parser.get(_CONFIG_GENERATED_KEY))
 
     # Resolve relative paths in config relative to the operator directory
@@ -7085,6 +7101,7 @@ def _load_config(config_parser, dir_path, resume=False):
         'resume': resume,
         'check_for_updates': check_for_updates,
         'scanner_profile': scanner_profile,
+        'honeypot_active_confirm': honeypot_active_confirm,
         'config_generated': config_generated,
     }
 
@@ -7307,6 +7324,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         host_discovery = None   # None = prompt user; True/False = set from config
         check_for_updates = False  # no interactive prompt; only set via config.json
         scanner_profile = None  # no interactive prompt; only set via config.json
+        honeypot_active_confirm = False  # no interactive prompt; only set via config.json
 
 
         # Get options from configuration file if it exists
@@ -7345,6 +7363,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             config_generated   = cfg['config_generated']
             check_for_updates  = cfg['check_for_updates']
             scanner_profile    = cfg['scanner_profile']
+            honeypot_active_confirm = cfg['honeypot_active_confirm']
 
             _maybe_check_for_updates(check_for_updates)
 
@@ -7655,7 +7674,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 scan_categories, dest_ports, scan_type, banner_scan, script_scan,
                 target_scan, max_rate, target_file, output_path, exclusions_file,
                 nmap_threads, masscan_batch_size, nmap_threshold, host_discovery,
-                check_for_updates, scanner_profile,
+                check_for_updates, scanner_profile, honeypot_active_confirm,
             )
             config_json_path = f'{dir_path}/config.json'
             if _write_interactive_config(config_json_path, interactive_config):
@@ -7822,6 +7841,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 exclusions_file, masscan_batch_size,
                 resume=resume, discovery_file=discovery_file,
                 target_scan=target_scan,
+                honeypot_active_confirm=honeypot_active_confirm,
             )
 
         # If service banners requested, send to nmap
