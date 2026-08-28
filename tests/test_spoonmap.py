@@ -1953,6 +1953,31 @@ class TestCountSilentOpenPorts:
         (nmap_results / 'port9999.xml').write_text(xml)
         assert _count_silent_open_ports(str(tmp_path)) == {}
 
+    def test_name_only_not_silent(self, tmp_path):
+        # Exactly one of the three attributes present alone must clear the
+        # "silent" bar on its own -- otherwise a single clause in the
+        # `not name and not product and not servicefp` check is never the
+        # deciding factor.
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.7', '9999', service_attrs={'name': 'ssh'})
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_product_only_not_silent(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.8', '9999', service_attrs={'product': 'OpenSSH'})
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_servicefp_only_not_silent(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.9', '9999', service_attrs={'servicefp': 'SF-Port9999-TCP:...'})
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
     def test_closed_port_not_counted(self, tmp_path):
         nmap_results = tmp_path / 'nmap_results'
         nmap_results.mkdir()
