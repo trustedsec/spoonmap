@@ -89,6 +89,7 @@ from spoonmap import (
     _report_suspected_honeypots,
     _report_suspected_tarpits,
     _stream_masscan_progress,
+    _vnc_heralding_match,
     preprocess_targets,
     _discovery_wait,
     _internal_host_discovery,
@@ -2087,6 +2088,58 @@ class TestNamedHoneypotMatches:
         xml2 = self._xml('10.0.0.4', '80', product='OpenSSH', version='9.6p1')
         (nmap_results / 'port80.xml').write_text(xml2)
         assert _named_honeypot_matches(str(tmp_path)) == {'10.0.0.4': product}
+
+
+class TestVncHeraldingMatch:
+    """Unit tests for _vnc_heralding_match()."""
+
+    def _xml(self, ip, port, vnc_info_output):
+        return (
+            '<?xml version="1.0"?><nmaprun>'
+            f'<host><address addr="{ip}" addrtype="ipv4"/>'
+            f'<ports><port protocol="tcp" portid="{port}">'
+            '<state state="open"/>'
+            f'<script id="vnc-info" output="{vnc_info_output}"/>'
+            '</port></ports></host></nmaprun>'
+        )
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+    def test_heralding_shape_matches(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = self._xml('10.0.0.1', '5900', 'Protocol version: 3.7')
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {'10.0.0.1': 'Heralding VNC Honeypot'}
+
+    def test_real_37_server_with_security_types_no_match(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = self._xml('10.0.0.2', '5900',
+                         'Protocol version: 3.7&#10;Security types: &#10;  VNC Authentication (2)')
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+    def test_38_server_no_match(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = self._xml('10.0.0.3', '5900', 'Protocol version: 3.8')
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+    def test_no_vnc_info_script_no_match(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.4" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="5900">'
+            '<state state="open"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {}
 
 
 class TestGenerateFindingsHoneypot:

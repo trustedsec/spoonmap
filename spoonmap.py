@@ -3724,6 +3724,40 @@ def _named_honeypot_matches(output_path):
     return matches
 
 
+def _vnc_heralding_match(output_path):
+    """Return {ip: 'Heralding VNC Honeypot'} for hosts whose vnc-info output
+    matches Heralding's VNC capability: it hardcodes RFB protocol version 3.7
+    and closes the connection before ever sending a security-type list,
+    unlike any real RFB implementation (which always completes that
+    exchange, even on legacy 3.7 servers). Verified against upstream source
+    (johnnykv/heralding, heralding/capabilities/vnc.py)."""
+    matches = {}
+    nse_dir = f'{output_path}/nse_results'
+    if not os.path.exists(nse_dir):
+        return matches
+    for fname in sorted(os.listdir(nse_dir)):
+        if not fname.endswith('.xml') or fname.startswith('portU_'):
+            continue
+        try:
+            root = etree.parse(f'{nse_dir}/{fname}')
+        except etree.ParseError:
+            continue
+        for host in root.findall('host'):
+            addr_elem = host.find("address[@addrtype='ipv4']")
+            ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
+            if not ip or ip in matches:
+                continue
+            for port_elem in host.findall('.//port'):
+                script_elem = port_elem.find("script[@id='vnc-info']")
+                if script_elem is None:
+                    continue
+                out = script_elem.attrib.get('output', '')
+                if '3.7' in out and 'Security types' not in out:
+                    matches[ip] = 'Heralding VNC Honeypot'
+                break
+    return matches
+
+
 def generate_findings(output_path, target_scan, snmp_any_validated=None):
     """Parse nmap script output and write findings.txt and findings.md."""
     nmap_dir = f'{output_path}/nse_results'
