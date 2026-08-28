@@ -2036,6 +2036,27 @@ def _report_suspected_honeypots(flagged, disc):
     _atomic_write(honeypot_file, ''.join(lines))
 
 
+def _expand_scanned_ports(scanned_ports):
+    """Expand a dest_ports-style list (individual port strings and/or
+    'N-M' range strings) into the set of integer ports it covers.
+
+    dest_ports can hold range specs like '1-65535' (Full scan) or
+    '49152-65535' (a custom scan covering the ephemeral range) alongside
+    plain port numbers. Comparing those range strings against candidate
+    ports as strings (e.g. '64835' not in {'1-65535'}) is always True since
+    the range is never expanded — this expands it into real integers so
+    membership tests are correct.
+    """
+    expanded = set()
+    for p in scanned_ports:
+        if '-' in p:
+            start, end = p.split('-', 1)
+            expanded.update(range(int(start), int(end) + 1))
+        else:
+            expanded.add(int(p))
+    return expanded
+
+
 def _select_confirm_probe_ports(ip, scanned_ports, count=3):
     """Return `count` deterministic high ports, seeded from ip, that were
     never part of this run's scanned port set.
@@ -2046,10 +2067,15 @@ def _select_confirm_probe_ports(ip, scanned_ports, count=3):
     legitimate host is unlikely to run a fixed service there, so an answer
     is a strong tell rather than a false positive from a real service the
     scan happened not to cover.
+
+    random.Random(ip) is deliberate, not a bandit B311 concern despite the
+    rule flagging it: this seeds decorrelated-but-reproducible probe port
+    selection per target IP, not a security or cryptographic use of
+    randomness — see .bandit-baseline.json.
     """
-    scanned = {p for p in scanned_ports if not p.startswith('U:')}
+    scanned = _expand_scanned_ports(p for p in scanned_ports if not p.startswith('U:'))
     rng = random.Random(ip)
-    candidates = [p for p in range(49152, 65536) if str(p) not in scanned]
+    candidates = [p for p in range(49152, 65536) if p not in scanned]
     return [str(p) for p in rng.sample(candidates, min(count, len(candidates)))]
 
 
@@ -2098,15 +2124,21 @@ def _report_confirmed_honeypots(confirmed_ips, disc):
     _atomic_write(confirmed_file, ''.join(lines))
 
 
-def _confirm_flagged_honeypots(flagged, enabled, dest_ports, disc):
+def _confirm_flagged_honeypots(flagged, enabled, dest_ports, disc, connector=None):
     """Run the active probe (if enabled) against every host
-    _flag_honeypot_signals() flagged, and persist whichever ones answer."""
+    _flag_honeypot_signals() flagged, and persist whichever ones answer.
+
+    connector is threaded through to _maybe_confirm_honeypot() /
+    _active_confirm_probe() and is injectable for testing, so the
+    enabled=True path can be exercised with a fake connector instead of a
+    real socket connection or internals-patching.
+    """
     if not flagged:
         return
     confirmed = set()
     for ip in flagged:
         probe_ports = _select_confirm_probe_ports(ip, dest_ports)
-        if _maybe_confirm_honeypot(enabled, ip, probe_ports):
+        if _maybe_confirm_honeypot(enabled, ip, probe_ports, connector=connector):
             confirmed.add(ip)
     _report_confirmed_honeypots(confirmed, disc)
 

@@ -83,6 +83,8 @@ from spoonmap import (
     _discover_internal_masscan,
     _external_host_discovery,
     _active_confirm_probe,
+    _confirm_flagged_honeypots,
+    _expand_scanned_ports,
     _flag_honeypot_signals,
     _flag_suspected_tarpits,
     _honeypot_signature_match,
@@ -2889,6 +2891,72 @@ class TestMassScanHoneypotFlag:
             mass_scan('All', tcp_ports, '88', '1000',
                       '/fake/targets.txt', '', batch_size=len(tcp_ports))
         assert not (tmp_path / 'discovery' / 'suspected_honeypots.txt').exists()
+
+
+class TestConfirmFlaggedHoneypotsWiring:
+    """mass_scan()'s three call sites must actually invoke
+    _confirm_flagged_honeypots() with honeypot_active_confirm threaded
+    through, for both True and False. Deleting any of the three calls, or
+    hardcoding False in place of the parameter, previously left the full
+    suite passing — nothing referenced _confirm_flagged_honeypots or
+    honeypot_active_confirm by name."""
+
+    def test_full_scan_batched_path_calls_confirm_with_flag(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        fake_results = {'22': {'10.0.0.1'}}
+        with patch('spoonmap._run_masscan_batch', return_value=fake_results), \
+             patch('spoonmap._confirm_flagged_honeypots') as mock_confirm:
+            mass_scan('Full', ['1-65535'], '88', '2000', '/fake/targets.txt', '',
+                      honeypot_active_confirm=True)
+        mock_confirm.assert_called_once()
+        args = mock_confirm.call_args[0]
+        assert args[1] is True  # honeypot_active_confirm threaded through
+        assert args[2] == ['1-65535']  # dest_ports
+
+    def test_full_scan_batched_path_passes_false_by_default(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        fake_results = {'22': {'10.0.0.1'}}
+        with patch('spoonmap._run_masscan_batch', return_value=fake_results), \
+             patch('spoonmap._confirm_flagged_honeypots') as mock_confirm:
+            mass_scan('Full', ['1-65535'], '88', '2000', '/fake/targets.txt', '')
+        mock_confirm.assert_called_once()
+        assert mock_confirm.call_args[0][1] is False
+
+    def test_full_scan_resume_path_calls_confirm_with_flag(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        (disc / 'live_hosts').mkdir(parents=True)
+        targets = disc / 'resolved_targets.txt'
+        targets.write_text('10.0.0.0/24\n')
+        cached = disc / 'masscan_results' / 'portFull.xml'
+        cached.write_text('<nmaprun/>')
+        _write_target_stamp(cached, targets)
+        (disc / 'live_hosts' / 'port22.txt').write_text('10.0.0.1\n')
+
+        with patch('spoonmap._run_masscan_batch') as mock_batch, \
+             patch('spoonmap._confirm_flagged_honeypots') as mock_confirm:
+            mass_scan('Full', ['1-65535'], '53', '10000', str(targets), '',
+                      resume=True, honeypot_active_confirm=True)
+
+        assert not mock_batch.called
+        mock_confirm.assert_called_once()
+        args = mock_confirm.call_args[0]
+        assert args[1] is True
+        assert args[2] == ['1-65535']
+
+    def test_batch_loop_path_calls_confirm_with_flag(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        tcp_ports = ['9001', '9002', '9003']
+        fast_response = {p: {'10.0.0.9'} for p in tcp_ports}
+        with patch('spoonmap._run_masscan_batch', side_effect=[fast_response, {}]), \
+             patch('spoonmap._confirm_flagged_honeypots') as mock_confirm:
+            mass_scan('All', tcp_ports, '88', '1000', '/fake/targets.txt', '',
+                      batch_size=len(tcp_ports), honeypot_active_confirm=True)
+        mock_confirm.assert_called_once()
+        args = mock_confirm.call_args[0]
+        assert args[1] is True
+        assert args[2] == tcp_ports
 
 
 # ── _load_config ──────────────────────────────────────────────────────────────
@@ -9665,6 +9733,24 @@ class TestReportSuspectedHoneypots:
         assert not (tmp_path / 'suspected_honeypots.txt').exists()
 
 
+class TestExpandScannedPorts:
+    """Unit tests for _expand_scanned_ports()."""
+
+    def test_individual_ports_become_ints(self):
+        assert _expand_scanned_ports(['80', '443']) == {80, 443}
+
+    def test_range_expands_to_every_covered_int(self):
+        assert _expand_scanned_ports(['49152-49155']) == {49152, 49153, 49154, 49155}
+
+    def test_full_scan_range_covers_entire_ephemeral_range(self):
+        expanded = _expand_scanned_ports(['1-65535'])
+        assert set(range(49152, 65536)) <= expanded
+
+    def test_mixed_individual_and_range_entries(self):
+        expanded = _expand_scanned_ports(['80', '49152-49153'])
+        assert expanded == {80, 49152, 49153}
+
+
 class TestSelectConfirmProbePorts:
     """Unit tests for _select_confirm_probe_ports()."""
 
@@ -9693,9 +9779,39 @@ class TestSelectConfirmProbePorts:
 
     def test_udp_scanned_ports_do_not_shrink_candidate_pool(self):
         # 'U:49200'-style keys must not be compared against bare int ports.
+        # This also guards against a crash: _expand_scanned_ports() calls
+        # int() on anything without a '-', so a leaked 'U:NNNN' key reaching
+        # it unfiltered raises ValueError instead of merely miscounting.
         scanned = [f'U:{p}' for p in range(49152, 49200)]
         ports = _select_confirm_probe_ports('10.0.0.1', scanned, count=3)
         assert len(ports) == 3
+
+    def test_full_scan_range_spec_excludes_entire_ephemeral_range(self):
+        # dest_ports=['1-65535'] (a Full scan) scanned every port, including
+        # all of 49152-65535 — a literal string comparison ('64835' not in
+        # {'1-65535'}) would never exclude any of them, so this must find
+        # zero candidates rather than treating the range as unscanned.
+        ports = _select_confirm_probe_ports('10.0.0.1', ['1-65535'], count=3)
+        assert ports == []
+
+    def test_custom_ephemeral_range_spec_excludes_only_that_range(self):
+        ports = _select_confirm_probe_ports('10.0.0.1', ['49152-65535'], count=3)
+        assert ports == []
+
+    def test_partial_range_spec_still_leaves_candidates(self):
+        # Only part of the ephemeral range was scanned; candidates should
+        # still be found outside it.
+        ports = _select_confirm_probe_ports('10.0.0.1', ['49152-60000'], count=3)
+        assert len(ports) == 3
+        assert all(60000 < int(p) <= 65535 for p in ports)
+
+    def test_individual_port_dest_ports_list_unaffected_by_range_fix(self):
+        # Regression guard: a normal (non-range) dest_ports list must behave
+        # exactly as before the range-expansion fix.
+        scanned = ['80', '443', '8080']
+        ports = _select_confirm_probe_ports('10.0.0.1', scanned, count=3)
+        assert len(ports) == 3
+        assert not (set(ports) & set(scanned))
 
 
 class TestActiveConfirmProbe:
@@ -9713,10 +9829,16 @@ class TestActiveConfirmProbe:
             raise OSError('refused')
         assert _active_confirm_probe('10.0.0.1', ['50000', '50001'], connector=connector) is False
 
-    def test_empty_probe_ports_returns_false(self):
+    def test_no_candidates_available_is_a_no_probe_no_confirm(self):
+        # What a Full scan actually produces end to end: _select_confirm_probe_ports()
+        # returns [] (nothing to probe), and _active_confirm_probe() on an empty
+        # list returns False without invoking the connector — the natural
+        # behaviour of an empty for-loop, not a guarded early-exit.
         def connector(addr, timeout):
-            raise AssertionError('must not be called with no ports')
-        assert _active_confirm_probe('10.0.0.1', [], connector=connector) is False
+            raise AssertionError('must not be called with no candidates')
+        probe_ports = _select_confirm_probe_ports('10.0.0.1', ['1-65535'], count=3)
+        assert probe_ports == []
+        assert _active_confirm_probe('10.0.0.1', probe_ports, connector=connector) is False
 
 
 class TestMaybeConfirmHoneypot:
@@ -9752,6 +9874,43 @@ class TestReportConfirmedHoneypots:
         _report_confirmed_honeypots({'10.0.0.10', '10.0.0.2'}, str(tmp_path))
         content = (tmp_path / 'confirmed_honeypots.txt').read_text()
         assert content.splitlines() == ['10.0.0.2', '10.0.0.10']
+
+
+class TestConfirmFlaggedHoneypots:
+    """Unit tests for _confirm_flagged_honeypots()."""
+
+    def test_empty_flagged_does_not_write_file(self, tmp_path):
+        # With flagged={}, the for loop over an empty dict is itself a no-op
+        # regardless of the leading `if not flagged: return` guard, so this
+        # does not make the guard load-bearing — it documents the guard is
+        # defensive rather than asserting a behaviour only the guard produces.
+        _confirm_flagged_honeypots({}, True, ['80'], str(tmp_path))
+        assert not (tmp_path / 'confirmed_honeypots.txt').exists()
+
+    def test_disabled_writes_nothing_even_when_flagged(self, tmp_path):
+        _confirm_flagged_honeypots({'10.0.0.9'}, False, ['80'], str(tmp_path))
+        assert not (tmp_path / 'confirmed_honeypots.txt').exists()
+
+    def test_enabled_with_injected_connector_confirms_and_persists(self, tmp_path):
+        # Exercises the enabled=True orchestrator path end to end with a fake
+        # connector instead of a real socket connection: select probe ports,
+        # probe, collect the confirmed IP, and persist it.
+        def connector(addr, timeout):
+            if addr[0] == '10.0.0.9':
+                return contextlib.nullcontext()
+            raise OSError('refused')
+        _confirm_flagged_honeypots({'10.0.0.9', '10.0.0.10'}, True, ['80'],
+                                    str(tmp_path), connector=connector)
+        content = (tmp_path / 'confirmed_honeypots.txt').read_text()
+        assert '10.0.0.9' in content
+        assert '10.0.0.10' not in content
+
+    def test_enabled_with_no_confirming_connector_writes_nothing(self, tmp_path):
+        def connector(addr, timeout):
+            raise OSError('refused')
+        _confirm_flagged_honeypots({'10.0.0.9'}, True, ['80'],
+                                    str(tmp_path), connector=connector)
+        assert not (tmp_path / 'confirmed_honeypots.txt').exists()
 
 
 # ── TestSMBCoupling ────────────────────────────────────────────────────────────
