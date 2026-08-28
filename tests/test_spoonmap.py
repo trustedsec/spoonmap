@@ -2473,11 +2473,29 @@ class TestFullPortScan:
         spoonmap.output_path = str(tmp_path)
         canary_ports = list(HONEYPOT_PORT_PROFILES['Thinkst Canary'])
         fake_results = {p: {'10.0.0.9'} for p in canary_ports}
+        # Also seed a two-TTL-value XML in discovery/masscan_results/ so this
+        # test exercises the masscan_dir path passed to _flag_honeypot_signals
+        # at this call site, not just the in-memory port_profile signal.
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        ttl_xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4" addr="10.0.0.9"/>'
+            '<ports>'
+            '<port protocol="tcp" portid="22">'
+            '<state state="open" reason="syn-ack" reason_ttl="64"/></port>'
+            '<port protocol="tcp" portid="80">'
+            '<state state="open" reason="syn-ack" reason_ttl="128"/></port>'
+            '</ports></host></nmaprun>'
+        )
+        (disc / 'masscan_results' / 'port_probe.xml').write_text(ttl_xml)
         with patch('spoonmap._run_masscan_batch', return_value=fake_results):
             mass_scan('Full', ['1-65535'], '53', '10000', '/fake/targets.txt', '')
         honeypot_file = tmp_path / 'discovery' / 'suspected_honeypots.txt'
         assert honeypot_file.exists()
-        assert '10.0.0.9,port_profile,Thinkst Canary' in honeypot_file.read_text()
+        contents = honeypot_file.read_text()
+        assert '10.0.0.9,port_profile,Thinkst Canary' in contents
+        assert '10.0.0.9,ttl_spread,64|128' in contents
 
     def test_full_scan_resume_flags_suspected_honeypot_ttl_spread(self, tmp_path):
         spoonmap.output_path = str(tmp_path)
@@ -2616,6 +2634,22 @@ class TestMassScanHoneypotFlag:
         spoonmap.output_path = str(tmp_path)
         canary_ports = list(HONEYPOT_PORT_PROFILES['Thinkst Canary'])
         fast_response = {p: {'10.0.0.9'} for p in canary_ports}
+        # Also seed a two-TTL-value XML in discovery/masscan_results/ so this
+        # test exercises the masscan_dir path passed to _flag_honeypot_signals
+        # at this call site, not just the in-memory port_profile signal.
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        ttl_xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4" addr="10.0.0.9"/>'
+            '<ports>'
+            '<port protocol="tcp" portid="22">'
+            '<state state="open" reason="syn-ack" reason_ttl="64"/></port>'
+            '<port protocol="tcp" portid="80">'
+            '<state state="open" reason="syn-ack" reason_ttl="128"/></port>'
+            '</ports></host></nmaprun>'
+        )
+        (disc / 'masscan_results' / 'port_probe.xml').write_text(ttl_xml)
         # 445 is a member of the Canary profile and is in SLOW_PORTS (always
         # solo-scanned), which adds calls beyond a fixed fast/slow probe pair
         # — return_value covers every call regardless of count.
@@ -2624,7 +2658,9 @@ class TestMassScanHoneypotFlag:
                       '/fake/targets.txt', '', batch_size=len(canary_ports))
         honeypot_file = tmp_path / 'discovery' / 'suspected_honeypots.txt'
         assert honeypot_file.exists()
-        assert '10.0.0.9,port_profile,Thinkst Canary' in honeypot_file.read_text()
+        contents = honeypot_file.read_text()
+        assert '10.0.0.9,port_profile,Thinkst Canary' in contents
+        assert '10.0.0.9,ttl_spread,64|128' in contents
 
     def test_batch_scan_no_honeypot_flag_for_unrelated_ports(self, tmp_path):
         spoonmap.output_path = str(tmp_path)
