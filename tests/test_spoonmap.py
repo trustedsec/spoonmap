@@ -1588,6 +1588,55 @@ class TestGenerateFindings:
         generate_findings(str(nmap_dir), 'External')
         assert 'Expired TLS Certificate' not in (nmap_dir / 'findings.txt').read_text()
 
+    def test_ssl_cert_hostnames_flagged_on_external(self, nmap_dir):
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': (
+                            'Subject: commonName=example.corp\n'
+                            'Subject Alternative Name: DNS:example.corp, DNS:www.example.corp\n'
+                        )})
+        (nmap_dir / 'nse_results' / 'port443.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        txt = (nmap_dir / 'findings.txt').read_text()
+        assert 'TLS Certificate Hostname(s) Identified' in txt
+        assert 'example.corp' in txt
+        assert 'www.example.corp' in txt
+
+    def test_ssl_cert_hostnames_includes_wildcard_in_detail(self, nmap_dir):
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': (
+                            'Subject: commonName=example.corp\n'
+                            'Subject Alternative Name: DNS:example.corp, DNS:*.example.corp\n'
+                        )})
+        (nmap_dir / 'nse_results' / 'port443.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        txt = (nmap_dir / 'findings.txt').read_text()
+        assert '*.example.corp' in txt
+
+    def test_ssl_cert_hostnames_not_flagged_on_internal(self, nmap_dir):
+        xml = _nmap_xml('10.0.0.2', 'tcp', '443',
+                        scripts={'ssl-cert': 'Subject: commonName=internal.corp\n'})
+        (nmap_dir / 'nse_results' / 'port443.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        assert 'TLS Certificate Hostname(s) Identified' not in (nmap_dir / 'findings.txt').read_text()
+
+    def test_ssl_cert_no_parseable_names_no_finding(self, nmap_dir):
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': 'Not valid after:  2099-01-01T00:00:00\n'})
+        (nmap_dir / 'nse_results' / 'port443.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        assert 'TLS Certificate Hostname(s) Identified' not in (nmap_dir / 'findings.txt').read_text()
+
+    def test_ssl_cert_hostname_finding_is_low_severity(self, nmap_dir):
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': 'Subject: commonName=example.corp\n'})
+        (nmap_dir / 'nse_results' / 'port443.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        import json as _json
+        records = _json.loads((nmap_dir / 'findings.json').read_text())
+        matches = [r for r in records if r['title'] == 'TLS Certificate Hostname(s) Identified']
+        assert len(matches) == 1
+        assert matches[0]['severity'] == 'LOW'
+
     # ── known-bad service detection ───────────────────────────────────────────
 
     def test_dameware_detected(self, nmap_dir):

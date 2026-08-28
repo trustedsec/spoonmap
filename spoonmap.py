@@ -3936,6 +3936,13 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                             add('MEDIUM', ip, port_str, 'Expired TLS Certificate',
                                 f'Certificate expired on {expiry}.')
 
+                # ── ssl-cert — hostnames from CN/SAN (External only) ─────
+                if 'ssl-cert' in scripts and target_scan == 'External':
+                    cert_hostnames = _extract_ssl_cert_hostnames(scripts['ssl-cert'])
+                    if cert_hostnames:
+                        add('LOW', ip, port_str, 'TLS Certificate Hostname(s) Identified',
+                            f'Certificate presents: {", ".join(cert_hostnames)}.')
+
                 # ── ldap-signing-check (ports 389 / 3268) ────────────────────
                 if 'ldap-signing-check' in scripts and target_scan == 'Internal':
                     if 'NOT REQUIRED' in scripts['ldap-signing-check'].upper():
@@ -4565,6 +4572,15 @@ _FINDING_REPRO = {
             '|_Not valid after:  2022-01-01T00:00:00'
         ),
     },
+    'TLS Certificate Hostname(s) Identified': {
+        'flags': '--script ssl-cert',
+        'sample': (
+            'PORT    STATE SERVICE\n'
+            '443/tcp open  https\n'
+            '| ssl-cert: Subject: commonName=example.corp\n'
+            '|_Subject Alternative Name: DNS:example.corp, DNS:www.example.corp'
+        ),
+    },
     'SQL Server Instance Discovered': {
         'flags': '--script ms-sql-info',
         'sample': (
@@ -4884,6 +4900,7 @@ def _write_artifact(path, content):
 _PER_HOST_DETAIL_TITLES = frozenset({
     'Service Exposed Externally',
     'VNC Desktop Name Disclosed',
+    'TLS Certificate Hostname(s) Identified',
 })
 
 
