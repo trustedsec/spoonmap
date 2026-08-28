@@ -1010,7 +1010,7 @@ def _merge_ssl_cert_hostnames(output_path, ip_to_hostname):
                     continue
 
                 for port_elem in host.iter('port'):
-                    scripts = {s.attrib['id']: s.attrib.get('output', '')
+                    scripts = {s.attrib.get('id'): s.attrib.get('output', '')
                                for s in port_elem.findall('script') if s.attrib.get('id')}
                     ssl_out = scripts.get('ssl-cert')
                     if not ssl_out:
@@ -1027,6 +1027,7 @@ def _merge_ssl_cert_hostnames(output_path, ip_to_hostname):
     _write_if_changed(mapping_file, json.dumps(merged, indent=2))
 
     return merged
+
 
 def _get_scripts_for_port(dest_port, target_scan):
     """Return comma-separated NSE script list for dest_port, or None.

@@ -1284,6 +1284,22 @@ class TestMergeSslCertHostnames:
 
         assert result == {}
 
+    def test_finds_cn_on_second_port_when_first_is_wildcard_only(self, tmp_path):
+        """Exercise the port-scanning loop: wildcard on first port, CN on second."""
+        (tmp_path / 'nse_results').mkdir()
+        # First port (8443) has wildcard-only cert
+        xml1 = _nmap_xml('1.2.3.4', 'tcp', '8443',
+                         scripts={'ssl-cert': 'Subject Alternative Name: DNS:*.example.corp\n'})
+        # Second port (443) has usable CN
+        xml2 = _nmap_xml('1.2.3.4', 'tcp', '443',
+                         scripts={'ssl-cert': 'Subject: commonName=api.example.corp\n'})
+        (tmp_path / 'nse_results' / 'port8443.xml').write_text(xml1)
+        (tmp_path / 'nse_results' / 'port443.xml').write_text(xml2)
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        assert result == {'1.2.3.4': 'api.example.corp'}
+
 
 class TestGenerateFindings:
     # ── anonymous FTP ────────────────────────────────────────────────────────
