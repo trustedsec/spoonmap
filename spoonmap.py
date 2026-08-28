@@ -580,6 +580,39 @@ def resolve_hostname(hostname):
         print(_COLOR_ERROR + f'Warning: Could not resolve hostname {hostname}: {e}' + _COLOR_RESET)
         return None
 
+def _extract_ssl_cert_hostnames(ssl_cert_output):
+    """Extract hostnames from ssl-cert NSE script output (CN + SAN).
+
+    Returns a deduped, order-preserved list: the certificate's commonName
+    first, then each Subject Alternative Name DNS: entry in the order nmap
+    printed them.  Wildcard names (e.g. '*.example.com') are returned like
+    any other name -- callers that feed a scan target must filter those out
+    themselves.  Anchored to the 'Subject:' line specifically (not
+    'Issuer:'), since ssl-cert output carries a commonName for both and only
+    the subject's identifies the host being scanned.
+    """
+    hostnames = []
+    seen = set()
+
+    cn_match = re.search(r'^Subject:.*?commonName=([^\s/,]+)', ssl_cert_output, re.MULTILINE)
+    if cn_match:
+        cn = cn_match.group(1).strip()
+        if cn and cn not in seen:
+            hostnames.append(cn)
+            seen.add(cn)
+
+    san_match = re.search(r'^Subject Alternative Name:\s*(.+)$', ssl_cert_output, re.MULTILINE)
+    if san_match:
+        for entry in san_match.group(1).split(','):
+            entry = entry.strip()
+            if entry.startswith('DNS:'):
+                name = entry[len('DNS:'):].strip()
+                if name and name not in seen:
+                    hostnames.append(name)
+                    seen.add(name)
+
+    return hostnames
+
 def _write_if_changed(path, content):
     """Write *content* to *path* only if it differs from the current contents.
 

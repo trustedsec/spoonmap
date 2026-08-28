@@ -41,6 +41,7 @@ from spoonmap import (
     _count_hosts_in_file,
     _count_unmatched_service_ports,
     _external_exposure_scripts,
+    _extract_ssl_cert_hostnames,
     _format_eta,
     _raise_fd_limit,
     _sql_version_year,
@@ -328,6 +329,59 @@ class TestResolveHostname:
         with patch('spoonmap.socket.gethostbyname', side_effect=OSError('nope')):
             assert resolve_hostname('bad.example.com') is None
         assert 'Could not resolve hostname' in capsys.readouterr().out
+
+
+class TestExtractSslCertHostnames:
+    def test_cn_only(self):
+        out = (
+            'Subject: commonName=example.corp\n'
+            'Issuer: commonName=Example CA\n'
+            'Not valid before: 2021-01-01T00:00:00\n'
+            'Not valid after:  2099-01-01T00:00:00\n'
+        )
+        assert _extract_ssl_cert_hostnames(out) == ['example.corp']
+
+    def test_cn_plus_san(self):
+        out = (
+            'Subject: commonName=example.corp\n'
+            'Subject Alternative Name: DNS:example.corp, DNS:www.example.corp\n'
+            'Issuer: commonName=Example CA\n'
+        )
+        assert _extract_ssl_cert_hostnames(out) == ['example.corp', 'www.example.corp']
+
+    def test_san_only_no_cn(self):
+        out = 'Subject Alternative Name: DNS:api.example.corp, DNS:cdn.example.corp\n'
+        assert _extract_ssl_cert_hostnames(out) == ['api.example.corp', 'cdn.example.corp']
+
+    def test_wildcard_included_in_result(self):
+        out = (
+            'Subject: commonName=example.corp\n'
+            'Subject Alternative Name: DNS:example.corp, DNS:*.example.corp\n'
+        )
+        assert _extract_ssl_cert_hostnames(out) == ['example.corp', '*.example.corp']
+
+    def test_does_not_pick_up_issuer_common_name(self):
+        # Issuer's commonName must never be mistaken for the subject's hostname.
+        out = (
+            'Subject: commonName=example.corp\n'
+            'Issuer: commonName=DigiCert TLS RSA SHA256 2020 CA1\n'
+        )
+        assert _extract_ssl_cert_hostnames(out) == ['example.corp']
+
+    def test_duplicate_name_in_cn_and_san_not_repeated(self):
+        out = (
+            'Subject: commonName=example.corp\n'
+            'Subject Alternative Name: DNS:example.corp, DNS:www.example.corp\n'
+        )
+        result = _extract_ssl_cert_hostnames(out)
+        assert result == ['example.corp', 'www.example.corp']
+        assert result.count('example.corp') == 1
+
+    def test_malformed_output_returns_empty_list(self):
+        assert _extract_ssl_cert_hostnames('garbage, no useful fields here') == []
+
+    def test_empty_string_returns_empty_list(self):
+        assert _extract_ssl_cert_hostnames('') == []
 
 
 class TestCountHostsInFile:
