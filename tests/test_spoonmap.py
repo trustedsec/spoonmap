@@ -87,6 +87,7 @@ from spoonmap import (
     _expand_scanned_ports,
     _flag_honeypot_signals,
     _flag_suspected_tarpits,
+    _honeypot_severity,
     _honeypot_signature_match,
     _maybe_confirm_honeypot,
     _named_honeypot_matches,
@@ -2233,6 +2234,34 @@ class TestVncHeraldingMatch:
         assert _vnc_heralding_match(str(tmp_path)) == {}
 
 
+class TestHoneypotSeverity:
+    """Unit tests for _honeypot_severity()."""
+
+    def test_no_signals_no_match_no_confirm_returns_none(self):
+        assert _honeypot_severity(set()) is None
+
+    def test_single_heuristic_signal_is_low(self):
+        assert _honeypot_severity({'ratio'}) == 'LOW'
+
+    def test_two_heuristic_signals_is_medium(self):
+        assert _honeypot_severity({'ratio', 'unmatched_fp'}) == 'MEDIUM'
+
+    def test_ttl_spread_alone_is_low_never_high(self):
+        assert _honeypot_severity({'ttl_spread'}) == 'LOW'
+
+    def test_ttl_spread_plus_one_other_is_medium_not_high(self):
+        assert _honeypot_severity({'ttl_spread', 'port_profile'}) == 'MEDIUM'
+
+    def test_named_match_alone_is_high(self):
+        assert _honeypot_severity(set(), named_match=True) == 'HIGH'
+
+    def test_confirmed_alone_is_high(self):
+        assert _honeypot_severity(set(), confirmed=True) == 'HIGH'
+
+    def test_named_match_overrides_signal_count(self):
+        assert _honeypot_severity({'ratio', 'unmatched_fp'}, named_match=True) == 'HIGH'
+
+
 class TestGenerateFindingsHoneypot:
     """generate_findings() 'Likely Honeypot / Decoy Host' finding."""
 
@@ -2247,12 +2276,15 @@ class TestGenerateFindingsHoneypot:
         )
 
     def test_tarpit_file_flags_host(self, nmap_dir):
+        # A single heuristic signal is now LOW, not MEDIUM -- see
+        # _honeypot_severity() and TestHoneypotSeverity. Two-plus signals
+        # (test_both_signals_combine_in_one_finding, below) still reach MEDIUM.
         (nmap_dir / 'discovery').mkdir(exist_ok=True)
         (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.1,19,20\n')
         generate_findings(str(nmap_dir), 'Internal')
         records = json.loads((nmap_dir / 'findings.json').read_text())
         hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
-        assert hp and hp[0]['severity'] == 'MEDIUM'
+        assert hp and hp[0]['severity'] == 'LOW'
         assert hp[0]['host'] == '10.0.0.1'
         assert '19/20' in hp[0]['detail']
 
@@ -2288,6 +2320,7 @@ class TestGenerateFindingsHoneypot:
         records = json.loads((nmap_dir / 'findings.json').read_text())
         hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
         assert len(hp) == 1
+        assert hp[0]['severity'] == 'MEDIUM'
         assert '20/20' in hp[0]['detail']
         assert 'no known service signature' in hp[0]['detail']
 
@@ -2313,6 +2346,100 @@ class TestGenerateFindingsHoneypot:
         assert not [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
 
     def test_absent_tarpit_file_no_crash(self, nmap_dir):
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        assert not [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+
+    def test_silent_open_ports_flag_host(self, nmap_dir):
+        nmap_results = nmap_dir / 'nmap_results'
+        nmap_results.mkdir()
+        for port in ('2222', '3333', '4444'):
+            xml = (
+                '<?xml version="1.0"?><nmaprun>'
+                f'<host><address addr="10.0.0.20" addrtype="ipv4"/>'
+                f'<ports><port protocol="tcp" portid="{port}">'
+                '<state state="open"/>'
+                '</port></ports></host></nmaprun>'
+            )
+            (nmap_results / f'port{port}.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert hp and hp[0]['host'] == '10.0.0.20'
+        assert 'returned no data at all' in hp[0]['detail']
+        assert hp[0]['severity'] == 'LOW'
+
+    def test_suspected_honeypots_file_ttl_spread_flags_host(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_honeypots.txt').write_text(
+            '10.0.0.21,ttl_spread,64|128\n')
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert hp and hp[0]['host'] == '10.0.0.21'
+        assert hp[0]['severity'] == 'LOW'
+        assert 'inconsistent TTLs' in hp[0]['detail']
+
+    def test_suspected_honeypots_file_port_profile_flags_host(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_honeypots.txt').write_text(
+            '10.0.0.22,port_profile,Thinkst Canary\n')
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert hp and hp[0]['host'] == '10.0.0.22'
+        assert 'Thinkst Canary' in hp[0]['detail']
+
+    def test_named_signature_match_is_high_severity(self, nmap_dir):
+        nmap_results = nmap_dir / 'nmap_results'
+        nmap_results.mkdir()
+        needle, product = HONEYPOT_SIGNATURES[0]
+        parts = needle.split(' ', 1)
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.23" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="22">'
+            '<state state="open"/>'
+            f'<service product="{parts[0]}" version="{parts[1] if len(parts) > 1 else ""}"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nmap_results / 'port22.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert hp and hp[0]['severity'] == 'HIGH'
+        assert product in hp[0]['detail']
+
+    def test_confirmed_honeypot_is_high_severity(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'confirmed_honeypots.txt').write_text('10.0.0.24\n')
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert hp and hp[0]['severity'] == 'HIGH'
+        assert 'active confirmation probe' in hp[0]['detail']
+
+    def test_all_signals_combine_into_one_finding(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.25,20,20\n')
+        (nmap_dir / 'discovery' / 'suspected_honeypots.txt').write_text(
+            '10.0.0.25,ttl_spread,64|128\n')
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert len(hp) == 1
+        assert hp[0]['severity'] == 'MEDIUM'
+        assert '20/20' in hp[0]['detail']
+        assert 'inconsistent TTLs' in hp[0]['detail']
+
+    def test_unreadable_suspected_honeypots_file_degrades_to_no_data(self, nmap_dir):
+        (nmap_dir / 'discovery' / 'suspected_honeypots.txt').mkdir(parents=True)
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        assert not [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+
+    def test_unreadable_confirmed_honeypots_file_degrades_to_no_data(self, nmap_dir):
+        (nmap_dir / 'discovery' / 'confirmed_honeypots.txt').mkdir(parents=True)
         generate_findings(str(nmap_dir), 'Internal')
         records = json.loads((nmap_dir / 'findings.json').read_text())
         assert not [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']

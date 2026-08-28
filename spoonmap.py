@@ -3217,6 +3217,25 @@ HONEYPOT_MIN_PORTS_SCANNED = 10      # need enough sample size to trust the rati
 HONEYPOT_OPEN_PORT_FRACTION = 0.9    # fraction of scanned TCP ports found open on one host
 HONEYPOT_MIN_UNMATCHED_PORTS = 3     # open ports with an unidentified (servicefp) response
 
+def _honeypot_severity(signals, named_match=False, confirmed=False):
+    """Return 'HIGH'/'MEDIUM'/'LOW', or None when nothing is flagged.
+
+    HIGH requires near-certainty: a named-product signature match or an
+    active probe confirmation. Two or more independent heuristic signals
+    ('ratio', 'unmatched_fp', 'silent', 'ttl_spread', 'port_profile')
+    together are MEDIUM; any single heuristic signal alone is LOW. This
+    structurally keeps TTL spread -- which NAT/load-balancing can also
+    produce -- from ever reaching HIGH on its own: it can only ever be one
+    signal among the set, never named_match or confirmed.
+    """
+    if named_match or confirmed:
+        return 'HIGH'
+    if len(signals) >= 2:
+        return 'MEDIUM'
+    if len(signals) == 1:
+        return 'LOW'
+    return None
+
 # Port sets characteristic of known deception/decoy tooling default
 # deployments. Superset match, not exact: an operator-customised deployment
 # (an extra port, or unrelated services sharing the box) should still match
@@ -3976,9 +3995,16 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                 if ip:
                     printer_ips.add(ip)
 
-    # ── suspected honeypot / tarpit hosts ─────────────────────────────────────
-    tarpit_hosts = {}   # {ip: (open_count, total_scanned)}
-    tarpit_file = f'{_disc(output_path)}/suspected_tarpits.txt'
+    # ── suspected honeypot / decoy hosts ──────────────────────────────────────
+    disc = _disc(output_path)
+    signals_by_ip = {}   # {ip: {signal_name, ...}}
+    reasons_by_ip = {}   # {ip: [human-readable reason, ...]}
+
+    def _add_signal(ip, name, reason):
+        signals_by_ip.setdefault(ip, set()).add(name)
+        reasons_by_ip.setdefault(ip, []).append(reason)
+
+    tarpit_file = f'{disc}/suspected_tarpits.txt'
     if os.path.exists(tarpit_file):
         # _report_suspected_tarpits() writes this file line by line, not
         # atomically, so an interrupt or a full disk can leave a partial final
@@ -3994,29 +4020,76 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                     if len(parts) == 3:
                         ip, open_count, total = parts
                         try:
-                            tarpit_hosts[ip] = (int(open_count), int(total))
+                            oc, total_i = int(open_count), int(total)
                         except ValueError:
                             continue
+                        _add_signal(ip, 'ratio',
+                                    f'{oc}/{total_i} scanned TCP ports responded open')
         except OSError:
-            tarpit_hosts = {}
+            pass
 
-    unmatched_counts = _count_unmatched_service_ports(output_path)  # {ip: count}
-    unmatched_flagged = {ip for ip, count in unmatched_counts.items()
-                         if count >= HONEYPOT_MIN_UNMATCHED_PORTS}
+    unmatched_counts = _count_unmatched_service_ports(output_path)
+    for ip, count in unmatched_counts.items():
+        if count >= HONEYPOT_MIN_UNMATCHED_PORTS:
+            _add_signal(ip, 'unmatched_fp',
+                        f'{count} open ports returned data matching no known service signature')
 
-    for ip in sorted(set(tarpit_hosts) | unmatched_flagged):
-        reasons = []
-        if ip in tarpit_hosts:
-            open_count, total = tarpit_hosts[ip]
-            reasons.append(f'{open_count}/{total} scanned TCP ports responded open')
-        if ip in unmatched_flagged:
-            reasons.append(f'{unmatched_counts[ip]} open ports returned data matching '
-                            'no known service signature')
-        add('MEDIUM', ip, 'multiple', 'Likely Honeypot / Decoy Host',
+    silent_counts = _count_silent_open_ports(output_path)
+    for ip, count in silent_counts.items():
+        if count >= HONEYPOT_MIN_UNMATCHED_PORTS:
+            _add_signal(ip, 'silent',
+                        f'{count} open ports accepted a connection and returned no data at all')
+
+    honeypot_file = f'{disc}/suspected_honeypots.txt'
+    if os.path.exists(honeypot_file):
+        try:
+            with open(honeypot_file) as fh:
+                for line in fh:
+                    parts = line.strip().split(',', 2)
+                    if len(parts) == 3:
+                        ip, sig_type, value = parts
+                        if sig_type == 'ttl_spread':
+                            _add_signal(ip, 'ttl_spread',
+                                        f'TCP responses observed with inconsistent TTLs '
+                                        f'({value}) across scanned ports on one host')
+                        elif sig_type == 'port_profile':
+                            _add_signal(ip, 'port_profile',
+                                        f'open port set matches the known deployment '
+                                        f'profile of {value}')
+        except OSError:
+            pass
+
+    named_matches = _named_honeypot_matches(output_path)  # {ip: product_name}
+    named_matches.update(_vnc_heralding_match(output_path))  # merge in the vnc-info-based signal
+
+    confirmed_ips = set()
+    confirmed_file = f'{disc}/confirmed_honeypots.txt'
+    if os.path.exists(confirmed_file):
+        try:
+            with open(confirmed_file) as fh:
+                confirmed_ips = {line.strip() for line in fh if line.strip()}
+        except OSError:
+            pass
+
+    all_flagged_ips = set(signals_by_ip) | set(named_matches) | confirmed_ips
+    for ip in sorted(all_flagged_ips, key=_ip_sort_key):
+        signals = signals_by_ip.get(ip, set())
+        named = named_matches.get(ip)
+        confirmed = ip in confirmed_ips
+        severity = _honeypot_severity(signals, named_match=bool(named), confirmed=confirmed)
+        if severity is None:
+            continue
+        reasons = list(reasons_by_ip.get(ip, []))
+        if named:
+            reasons.insert(0, f'service fingerprint matches known honeypot product {named}')
+        if confirmed:
+            reasons.append('active confirmation probe: host answered on a port never '
+                            'scanned open, consistent with a decoy accepting all connections')
+        add(severity, ip, 'multiple', 'Likely Honeypot / Decoy Host',
             '; '.join(reasons) + '. Consistent with tarpit/decoy tooling (e.g. LaBrea, '
-            'portspoof, Artillery) rather than a genuine service host. Recommend '
-            'deprioritizing further enumeration of this host and manually validating '
-            'before trusting other findings collected from it.')
+            'portspoof, Cowrie, Dionaea, Artillery, Thinkst Canary) rather than a genuine '
+            'service host. Recommend deprioritizing further enumeration of this host and '
+            'manually validating before trusting other findings collected from it.')
 
     # ── parse every nmap XML result file ─────────────────────────────────────
     open_ports_by_host = {}  # {ip: [port_key, ...]} — for external exposure check
