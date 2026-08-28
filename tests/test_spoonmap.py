@@ -2469,6 +2469,52 @@ class TestFullPortScan:
         assert 'Hosts Found on Port U_53' not in result
         assert not (disc / 'suspected_tarpits.txt').exists()
 
+    def test_full_scan_flags_suspected_honeypot_port_profile(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        canary_ports = list(HONEYPOT_PORT_PROFILES['Thinkst Canary'])
+        fake_results = {p: {'10.0.0.9'} for p in canary_ports}
+        with patch('spoonmap._run_masscan_batch', return_value=fake_results):
+            mass_scan('Full', ['1-65535'], '53', '10000', '/fake/targets.txt', '')
+        honeypot_file = tmp_path / 'discovery' / 'suspected_honeypots.txt'
+        assert honeypot_file.exists()
+        assert '10.0.0.9,port_profile,Thinkst Canary' in honeypot_file.read_text()
+
+    def test_full_scan_resume_flags_suspected_honeypot_ttl_spread(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        live_dir = disc / 'live_hosts'
+        live_dir.mkdir(parents=True)
+        targets = disc / 'resolved_targets.txt'
+        targets.write_text('10.0.0.0/24\n')
+        cached = disc / 'masscan_results' / 'portFull.xml'
+        cached.write_text('<nmaprun/>')
+        _write_target_stamp(cached, targets)
+        (live_dir / 'port22.txt').write_text('10.0.0.9\n')
+        (live_dir / 'port80.txt').write_text('10.0.0.9\n')
+        # The resume path reads TTL spread back from masscan_results' own XML,
+        # not from live_hosts/ — seed a probe-style file alongside the cache.
+        ttl_xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4" addr="10.0.0.9"/>'
+            '<ports>'
+            '<port protocol="tcp" portid="22">'
+            '<state state="open" reason="syn-ack" reason_ttl="64"/></port>'
+            '<port protocol="tcp" portid="80">'
+            '<state state="open" reason="syn-ack" reason_ttl="128"/></port>'
+            '</ports></host></nmaprun>'
+        )
+        (disc / 'masscan_results' / 'port_probe.xml').write_text(ttl_xml)
+
+        with patch('spoonmap._run_masscan_batch') as mock_batch:
+            mass_scan('Full', ['1-65535'], '53', '10000',
+                      str(targets), '', resume=True)
+
+        assert not mock_batch.called
+        honeypot_file = disc / 'suspected_honeypots.txt'
+        assert honeypot_file.exists()
+        assert '10.0.0.9,ttl_spread,64|128' in honeypot_file.read_text()
+
     def _setup_full_resume_cache(self, tmp_path, xml_text):
         spoonmap.output_path = str(tmp_path)
         disc = tmp_path / 'discovery'
@@ -2561,6 +2607,33 @@ class TestMassScanTarpitFlag:
             mass_scan('All', tcp_ports, '88', '1000',
                       '/fake/targets.txt', '', batch_size=len(tcp_ports))
         assert not (tmp_path / 'discovery' / 'suspected_tarpits.txt').exists()
+
+
+class TestMassScanHoneypotFlag:
+    """mass_scan() batch-path wiring of the suspected-honeypot check (non-Full scans)."""
+
+    def test_batch_scan_flags_suspected_honeypot_port_profile(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        canary_ports = list(HONEYPOT_PORT_PROFILES['Thinkst Canary'])
+        fast_response = {p: {'10.0.0.9'} for p in canary_ports}
+        # 445 is a member of the Canary profile and is in SLOW_PORTS (always
+        # solo-scanned), which adds calls beyond a fixed fast/slow probe pair
+        # — return_value covers every call regardless of count.
+        with patch('spoonmap._run_masscan_batch', return_value=fast_response):
+            mass_scan('All', canary_ports, '88', '1000',
+                      '/fake/targets.txt', '', batch_size=len(canary_ports))
+        honeypot_file = tmp_path / 'discovery' / 'suspected_honeypots.txt'
+        assert honeypot_file.exists()
+        assert '10.0.0.9,port_profile,Thinkst Canary' in honeypot_file.read_text()
+
+    def test_batch_scan_no_honeypot_flag_for_unrelated_ports(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        tcp_ports = ['9001', '9002', '9003']
+        fast_response = {p: {'10.0.0.9'} for p in tcp_ports}
+        with patch('spoonmap._run_masscan_batch', side_effect=[fast_response, {}]):
+            mass_scan('All', tcp_ports, '88', '1000',
+                      '/fake/targets.txt', '', batch_size=len(tcp_ports))
+        assert not (tmp_path / 'discovery' / 'suspected_honeypots.txt').exists()
 
 
 # ── _load_config ──────────────────────────────────────────────────────────────
@@ -9180,6 +9253,61 @@ class TestTtlSpreadByHost:
         )
         (tmp_path / 'port22.xml').write_text(xml)
         assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_host_without_ports_element_skipped(self, tmp_path):
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4" addr="10.0.0.6"/></host>'
+            '</nmaprun>'
+        )
+        (tmp_path / 'port22.xml').write_text(xml)
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_port_without_state_element_skipped(self, tmp_path):
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4" addr="10.0.0.7"/>'
+            '<ports><port protocol="tcp" portid="22"/></ports></host>'
+            '</nmaprun>'
+        )
+        (tmp_path / 'port22.xml').write_text(xml)
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_state_without_reason_ttl_skipped(self, tmp_path):
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4" addr="10.0.0.8"/>'
+            '<ports><port protocol="tcp" portid="22">'
+            '<state state="open" reason="syn-ack"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (tmp_path / 'port22.xml').write_text(xml)
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_multi_port_single_host_ignores_only_udp_port(self, tmp_path):
+        """nmap-style XML: one <host> holding every port in one <ports> block.
+
+        Masscan's own XML gives one <host> per open port, so the pre-fix code
+        (which only ever read the first <port> child) happened to work there.
+        _nmap_port_discovery() writes masscan_results/portDirect.xml in this
+        multi-port-per-host shape instead, and a UDP-first port there used to
+        make the function bail before looking at any of the host's other,
+        TCP, ports.
+        """
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4" addr="10.0.0.9"/>'
+            '<ports>'
+            '<port protocol="udp" portid="53">'
+            '<state state="open" reason="udp-response" reason_ttl="200"/></port>'
+            '<port protocol="tcp" portid="22">'
+            '<state state="open" reason="syn-ack" reason_ttl="64"/></port>'
+            '<port protocol="tcp" portid="80">'
+            '<state state="open" reason="syn-ack" reason_ttl="128"/></port>'
+            '</ports></host></nmaprun>'
+        )
+        (tmp_path / 'portDirect.xml').write_text(xml)
+        assert _ttl_spread_by_host(str(tmp_path)) == {'10.0.0.9': [64, 128]}
 
 
 class TestPortProfileMatch:

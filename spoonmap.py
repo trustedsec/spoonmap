@@ -1947,20 +1947,20 @@ def _ttl_spread_by_host(masscan_dir):
             ports_elem = host.find('ports')
             if ports_elem is None:
                 continue
-            port_elem = ports_elem.find('port')
-            if port_elem is None or port_elem.attrib.get('protocol') == 'udp':
-                continue
-            state_elem = port_elem.find('state')
-            if state_elem is None:
-                continue
-            ttl_text = state_elem.attrib.get('reason_ttl')
-            if ttl_text is None:
-                continue
-            try:
-                ttl = int(ttl_text)
-            except ValueError:
-                continue
-            ttls_by_ip.setdefault(ip, set()).add(ttl)
+            for port_elem in ports_elem.findall('port'):
+                if port_elem.attrib.get('protocol') == 'udp':
+                    continue
+                state_elem = port_elem.find('state')
+                if state_elem is None:
+                    continue
+                ttl_text = state_elem.attrib.get('reason_ttl')
+                if ttl_text is None:
+                    continue
+                try:
+                    ttl = int(ttl_text)
+                except ValueError:
+                    continue
+                ttls_by_ip.setdefault(ip, set()).add(ttl)
     return {ip: sorted(ttls) for ip, ttls in ttls_by_ip.items() if len(ttls) > 1}
 
 
@@ -2028,8 +2028,9 @@ def _report_suspected_honeypots(flagged, disc):
             product = signals['port_profile']
             lines.append(f'{ip},port_profile,{product}\n')
             print(_COLOR_ERROR
-                  + f'Warning: {ip}\'s open ports match the known deployment profile '
-                  + f'of {product} — possible decoy host.'
+                  + f'Warning: {ip}\'s open ports match a candidate port profile for '
+                  + f'{product} (unverified against current upstream defaults) — '
+                  + 'possible decoy host.'
                   + _COLOR_RESET)
     _atomic_write(honeypot_file, ''.join(lines))
 
