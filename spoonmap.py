@@ -4028,13 +4028,23 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
         except OSError:
             pass
 
-    unmatched_counts = _count_unmatched_service_ports(output_path)
+    # A directory-walk failure here (e.g. nmap_results/ left root-owned by an
+    # earlier sudo run, then read by a later non-root --resume) must degrade
+    # this one signal source to "no data", never take down the findings phase
+    # -- same guarantee the file readers above already have.
+    try:
+        unmatched_counts = _count_unmatched_service_ports(output_path)
+    except OSError:
+        unmatched_counts = {}
     for ip, count in unmatched_counts.items():
         if count >= HONEYPOT_MIN_UNMATCHED_PORTS:
             _add_signal(ip, 'unmatched_fp',
                         f'{count} open ports returned data matching no known service signature')
 
-    silent_counts = _count_silent_open_ports(output_path)
+    try:
+        silent_counts = _count_silent_open_ports(output_path)
+    except OSError:
+        silent_counts = {}
     for ip, count in silent_counts.items():
         if count >= HONEYPOT_MIN_UNMATCHED_PORTS:
             _add_signal(ip, 'silent',
@@ -4059,8 +4069,15 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
         except OSError:
             pass
 
-    named_matches = _named_honeypot_matches(output_path)  # {ip: product_name}
-    named_matches.update(_vnc_heralding_match(output_path))  # merge in the vnc-info-based signal
+    try:
+        named_matches = _named_honeypot_matches(output_path)  # {ip: product_name}
+    except OSError:
+        named_matches = {}
+    try:
+        vnc_matches = _vnc_heralding_match(output_path)
+    except OSError:
+        vnc_matches = {}
+    named_matches.update(vnc_matches)  # merge in the vnc-info-based signal
 
     confirmed_ips = set()
     confirmed_file = f'{disc}/confirmed_honeypots.txt'
@@ -4074,13 +4091,18 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
     all_flagged_ips = set(signals_by_ip) | set(named_matches) | confirmed_ips
     for ip in sorted(all_flagged_ips, key=_ip_sort_key):
         signals = signals_by_ip.get(ip, set())
+        named_present = ip in named_matches
         named = named_matches.get(ip)
         confirmed = ip in confirmed_ips
-        severity = _honeypot_severity(signals, named_match=bool(named), confirmed=confirmed)
+        severity = _honeypot_severity(signals, named_match=named_present, confirmed=confirmed)
         if severity is None:
-            continue
+            # Unreachable: every ip in all_flagged_ips is a member of
+            # signals_by_ip, named_matches, or confirmed_ips, and
+            # _honeypot_severity() returns non-None for any non-empty
+            # combination of those three inputs.
+            continue  # pragma: no cover
         reasons = list(reasons_by_ip.get(ip, []))
-        if named:
+        if named_present:
             reasons.insert(0, f'service fingerprint matches known honeypot product {named}')
         if confirmed:
             reasons.append('active confirmation probe: host answered on a port never '

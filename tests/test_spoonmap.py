@@ -2444,6 +2444,112 @@ class TestGenerateFindingsHoneypot:
         records = json.loads((nmap_dir / 'findings.json').read_text())
         assert not [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
 
+    # ── directory-walk helper failures must degrade one signal, not the whole
+    #    findings phase (nmap_results/ or nse_results/ left root-owned by an
+    #    earlier sudo run, then read by a later non-root --resume) ────────────
+
+    def test_unmatched_service_ports_helper_oserror_degrades(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.30,19,20\n')
+        with patch('spoonmap._count_unmatched_service_ports', side_effect=OSError('perm')):
+            generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert [r['host'] for r in hp] == ['10.0.0.30']
+        assert hp[0]['severity'] == 'LOW'
+
+    def test_silent_open_ports_helper_oserror_degrades(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.31,19,20\n')
+        with patch('spoonmap._count_silent_open_ports', side_effect=OSError('perm')):
+            generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert [r['host'] for r in hp] == ['10.0.0.31']
+        assert hp[0]['severity'] == 'LOW'
+
+    def test_named_honeypot_matches_helper_oserror_degrades(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.32,19,20\n')
+        with patch('spoonmap._named_honeypot_matches', side_effect=OSError('perm')):
+            generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert [r['host'] for r in hp] == ['10.0.0.32']
+        assert hp[0]['severity'] == 'LOW'
+
+    def test_vnc_heralding_match_helper_oserror_degrades(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.33,19,20\n')
+        with patch('spoonmap._vnc_heralding_match', side_effect=OSError('perm')):
+            generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert [r['host'] for r in hp] == ['10.0.0.33']
+        assert hp[0]['severity'] == 'LOW'
+
+    def test_named_match_with_empty_product_still_flags_host(self, nmap_dir):
+        # A future HONEYPOT_SIGNATURES edit could resolve to an empty/falsy
+        # product string; presence in named_matches, not truthiness, must
+        # decide whether the host is flagged.
+        with patch('spoonmap._named_honeypot_matches', return_value={'10.0.0.77': ''}):
+            generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert hp and hp[0]['host'] == '10.0.0.77'
+        assert hp[0]['severity'] == 'HIGH'
+
+    def test_all_eight_signal_sources_combine_into_one_high_finding(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.99,20,20\n')
+        (nmap_dir / 'discovery' / 'suspected_honeypots.txt').write_text(
+            '10.0.0.99,ttl_spread,64|128\n')
+        (nmap_dir / 'discovery' / 'confirmed_honeypots.txt').write_text('10.0.0.99\n')
+        nmap_results = nmap_dir / 'nmap_results'
+        nmap_results.mkdir()
+        needle, product = HONEYPOT_SIGNATURES[0]
+        parts = needle.split(' ', 1)
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.99" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="22">'
+            '<state state="open"/>'
+            f'<service product="{parts[0]}" version="{parts[1] if len(parts) > 1 else ""}"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nmap_results / 'port22.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert len(hp) == 1
+        assert hp[0]['host'] == '10.0.0.99'
+        assert hp[0]['severity'] == 'HIGH'
+        detail = hp[0]['detail']
+        assert product in detail
+        assert '20/20' in detail
+        assert 'inconsistent TTLs' in detail
+        assert 'active confirmation probe' in detail
+        # Named-signature reason is inserted first, confirmed-probe reason is
+        # appended last -- heuristic reasons (ratio, ttl_spread) land in between
+        # in the order their signal sources were checked.
+        assert (detail.index(product) < detail.index('20/20')
+                < detail.index('inconsistent TTLs')
+                < detail.index('active confirmation probe'))
+
+    def test_two_hosts_each_flagged_by_different_single_signal_independently(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.40,19,20\n')
+        (nmap_dir / 'discovery' / 'suspected_honeypots.txt').write_text(
+            '10.0.0.41,ttl_spread,64|128\n')
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = {r['host']: r for r in records if r['title'] == 'Likely Honeypot / Decoy Host'}
+        assert set(hp) == {'10.0.0.40', '10.0.0.41'}
+        assert hp['10.0.0.40']['severity'] == 'LOW'
+        assert '19/20' in hp['10.0.0.40']['detail']
+        assert hp['10.0.0.41']['severity'] == 'LOW'
+        assert 'inconsistent TTLs' in hp['10.0.0.41']['detail']
+
 
 # ── _previous_results_exist / _delete_previous_results ───────────────────────
 
