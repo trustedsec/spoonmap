@@ -17,7 +17,7 @@
 - `honeypot_active_confirm` defaults to `false`; an absent key means `false`. No interactive prompt of its own — mirrors `check_for_updates`'s documented precedent exactly (a courtesy/opt-in network-touching behavior must never fire unless explicitly turned on, because SpooNMAP runs from client-network jumpboxes).
 - **Deviation from the approved spec, discovered during planning:** the spec called for a live interactive per-host prompt after the Stage 1 warning. Verified against `main()`: every `input()` call in this codebase happens before any scan starts — `mass_scan()` and its callees never prompt mid-run (no precedent, and adding one would require threading terminal-state save/restore into the masscan progress-thread path for no other feature). The active probe is therefore **config-key-gated only**, exactly like `check_for_updates`, with no interactive prompt. This means an interactive run without a pre-existing `config.json` never gets a chance to opt in mid－scan — the operator would need to hand-edit `config.json` and re-run with `--resume` (`check_for_updates` has this same limitation today). Flagging this for user sign-off; it is the only substantive change from the approved spec.
 - TTL spread alone must never reach HIGH severity (NAT/load-balancing produces the same pattern) — enforced structurally by `_honeypot_severity()`, not by a special case (see Task 6).
-- The honeypot signature strings (`HONEYPOT_SIGNATURES`) and port profiles (`HONEYPOT_PORT_PROFILES`) are **placeholders pending verification** against current upstream defaults — each is written with an explicit code comment saying so, per the design doc's caveat. Do not present them as verified.
+- The honeypot signature strings (`HONEYPOT_SIGNATURES`) and port profiles (`HONEYPOT_PORT_PROFILES`) are **placeholders pending verification** against current upstream defaults — each is written with an explicit code comment saying so, per the design doc's caveat. Do not present them as verified. The one exception is `_vnc_heralding_match()` (Task 3 Step 7): checked directly against `johnnykv/heralding`'s current `master` source and is not a placeholder.
 
 ---
 
@@ -795,6 +795,143 @@ git add spoonmap.py tests/test_spoonmap.py
 git commit -m "feat: add named honeypot signature matching (Stage 2, post-nmap)"
 ```
 
+- [ ] **Step 7: Add the Heralding VNC honeypot signature**
+
+Verified against upstream source (`johnnykv/heralding`, `heralding/capabilities/vnc.py`,
+current `master`), not a placeholder: Heralding's VNC capability hardcodes
+`RFB_VERSION = b'RFB 003.007\n'` — it unconditionally sends protocol version 3.7 to
+every client, then requires the client's version reply to match those exact bytes or
+it closes the session immediately, without ever sending a security-type list. Real RFB
+servers negotiate/downgrade instead of hard-matching one exact version string. nmap's
+`vnc-info` therefore reports protocol 3.7 with no `Security types` line at all against
+a Heralding instance — a distinct shape from a real (if legacy) RFB 3.7 server, which
+always completes the security-type exchange. `vnclowpot` was also checked and has no
+equivalent standalone signature (it completes a normal 3.8 handshake offering only VNC
+Authentication, indistinguishable from a legitimately hardened real VNC server), so it
+is deliberately not included here.
+
+This doesn't fit `_honeypot_signature_match()`'s shape: that function matches a single
+substring in `-sV`'s product/version/extrainfo text (`nmap_results/*.xml`). The
+Heralding tell is a compound condition (version present AND security-types absent) on
+`vnc-info`'s own script output, which lives in `nse_results/*.xml`, not
+`nmap_results/*.xml` — a separate walk is needed.
+
+**Files:**
+- Modify: `spoonmap.py` (new function, placed after `_named_honeypot_matches()`)
+- Test: `tests/test_spoonmap.py` (new `TestVncHeraldingMatch` class)
+
+**Interfaces:**
+- Produces: `_vnc_heralding_match(output_path) -> dict[str, str]` — `{ip: 'Heralding VNC Honeypot'}`, walking `nse_results/*.xml` directly (its own XML walk, not `_iter_open_tcp_ports()`, since that generator only yields `<service>` elements, not `<script>` elements).
+- Consumes: nothing new — same `xml.etree.ElementTree as etree` already imported at `spoonmap.py:30`.
+
+Add to `tests/test_spoonmap.py`, right after `TestNamedHoneypotMatches`:
+
+```python
+class TestVncHeraldingMatch:
+    """Unit tests for _vnc_heralding_match()."""
+
+    def _xml(self, ip, port, vnc_info_output):
+        return (
+            '<?xml version="1.0"?><nmaprun>'
+            f'<host><address addr="{ip}" addrtype="ipv4"/>'
+            f'<ports><port protocol="tcp" portid="{port}">'
+            '<state state="open"/>'
+            f'<script id="vnc-info" output="{vnc_info_output}"/>'
+            '</port></ports></host></nmaprun>'
+        )
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+    def test_heralding_shape_matches(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = self._xml('10.0.0.1', '5900', 'Protocol version: 3.7')
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {'10.0.0.1': 'Heralding VNC Honeypot'}
+
+    def test_real_37_server_with_security_types_no_match(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = self._xml('10.0.0.2', '5900',
+                         'Protocol version: 3.7&#10;Security types: &#10;  VNC Authentication (2)')
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+    def test_38_server_no_match(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = self._xml('10.0.0.3', '5900', 'Protocol version: 3.8')
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+    def test_no_vnc_info_script_no_match(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.4" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="5900">'
+            '<state state="open"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+```
+
+Run: `uv run pytest tests/test_spoonmap.py::TestVncHeraldingMatch -v`
+Expected: FAIL with `NameError`/`ImportError`
+
+Add `_vnc_heralding_match,` to the test file's import block, alphabetically.
+
+Implement in `spoonmap.py`, right after `_named_honeypot_matches()`:
+
+```python
+
+def _vnc_heralding_match(output_path):
+    """Return {ip: 'Heralding VNC Honeypot'} for hosts whose vnc-info output
+    matches Heralding's VNC capability: it hardcodes RFB protocol version 3.7
+    and closes the connection before ever sending a security-type list,
+    unlike any real RFB implementation (which always completes that
+    exchange, even on legacy 3.7 servers). Verified against upstream source
+    (johnnykv/heralding, heralding/capabilities/vnc.py)."""
+    matches = {}
+    nse_dir = f'{output_path}/nse_results'
+    if not os.path.exists(nse_dir):
+        return matches
+    for fname in sorted(os.listdir(nse_dir)):
+        if not fname.endswith('.xml') or fname.startswith('portU_'):
+            continue
+        try:
+            root = etree.parse(f'{nse_dir}/{fname}')
+        except etree.ParseError:
+            continue
+        for host in root.findall('host'):
+            addr_elem = host.find("address[@addrtype='ipv4']")
+            ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
+            if not ip or ip in matches:
+                continue
+            for port_elem in host.findall('.//port'):
+                script_elem = port_elem.find("script[@id='vnc-info']")
+                if script_elem is None:
+                    continue
+                out = script_elem.attrib.get('output', '')
+                if '3.7' in out and 'Security types' not in out:
+                    matches[ip] = 'Heralding VNC Honeypot'
+                break
+    return matches
+```
+
+Run: `uv run pytest tests/test_spoonmap.py::TestVncHeraldingMatch -v`
+Expected: PASS
+
+Commit:
+
+```bash
+git add spoonmap.py tests/test_spoonmap.py
+git commit -m "feat: add Heralding VNC honeypot signature (vnc-info protocol 3.7 tell)"
+```
+
 ---
 
 ## Task 4: Active confirmation probe (operator-gated)
@@ -1347,7 +1484,7 @@ Replaces the existing flat-MEDIUM honeypot finding block with tiered severity co
 - Test: `tests/test_spoonmap.py` (new `TestHoneypotSeverity` class; new tests in `TestGenerateFindingsHoneypot` for the four new signal sources)
 
 **Interfaces:**
-- Consumes: `_count_unmatched_service_ports`, `_count_silent_open_ports` (Task 1), `_named_honeypot_matches` (Task 3), `_ip_sort_key` (existing), `HONEYPOT_MIN_UNMATCHED_PORTS` (existing).
+- Consumes: `_count_unmatched_service_ports`, `_count_silent_open_ports` (Task 1), `_named_honeypot_matches`, `_vnc_heralding_match` (Task 3), `_ip_sort_key` (existing), `HONEYPOT_MIN_UNMATCHED_PORTS` (existing).
 - Produces: `_honeypot_severity(signals, named_match=False, confirmed=False) -> str | None` — `'HIGH'`/`'MEDIUM'`/`'LOW'`/`None`.
 
 - [ ] **Step 1: Write the failing severity-tiering tests**
@@ -1648,6 +1785,7 @@ with:
             pass
 
     named_matches = _named_honeypot_matches(output_path)  # {ip: product_name}
+    named_matches.update(_vnc_heralding_match(output_path))  # merge in the vnc-info-based signal
 
     confirmed_ips = set()
     confirmed_file = f'{disc}/confirmed_honeypots.txt'
@@ -1724,7 +1862,12 @@ HIGH); known port-profile matching against `HONEYPOT_PORT_PROFILES`
 (Thinkst Canary, Artillery — placeholders pending verification against
 current upstream defaults); named-product signature matching against
 `HONEYPOT_SIGNATURES` (Cowrie/Kippo, Dionaea default banners — same
-verification caveat) via the -sV service data already captured; and
+verification caveat) via the -sV service data already captured; a
+source-verified Heralding VNC honeypot tell (`_vnc_heralding_match()`,
+Task 3 Step 7 — vnc-info reporting RFB protocol 3.7 with no security-type
+list, since Heralding's VNC capability hardcodes that exact version and
+drops the connection on any client mismatch, unlike a real RFB server)
+read from `nse_results/*.xml` rather than `nmap_results/*.xml`; and
 silent-open-port counting (`_count_silent_open_ports()`), which complements
 the existing unmatched-fingerprint count by catching a tarpit that holds a
 connection open and sends nothing back — `servicefp` is only set when *some*
@@ -1794,6 +1937,6 @@ Expected: PASS, no skips other than the documented port-conflict/root-gated ones
 
 ## Self-Review Notes
 
-- **Spec coverage:** all four new signals (TTL spread, port-profile, named-signature, silent-open) are implemented (Tasks 1-3), severity tiering is implemented (Task 6), the active probe is implemented and config-gated (Tasks 4-5), and the behavior-change/placeholder-signature caveats from the spec are carried into code comments and CLAUDE.md (Task 7). Uptime/lastboot correlation and OS/CPE-conflict detection remain explicitly out of scope, as agreed.
+- **Spec coverage:** all four new signals (TTL spread, port-profile, named-signature, silent-open) plus the source-verified Heralding VNC honeypot signature (`_vnc_heralding_match()`, Task 3 Step 7) are implemented (Tasks 1-3), severity tiering is implemented (Task 6), the active probe is implemented and config-gated (Tasks 4-5), and the behavior-change/placeholder-signature caveats from the spec are carried into code comments and CLAUDE.md (Task 7). Uptime/lastboot correlation, OS/CPE-conflict detection, and a standalone vnclowpot signature (checked, no reliable tell found) remain explicitly out of scope, as agreed.
 - **Deviation flagged prominently:** the interactive-prompt-vs-config-only-gate change is called out in Global Constraints, in Task 4's design, and in the CLAUDE.md paragraph — not buried.
-- **Type/name consistency checked:** `_flag_honeypot_signals()` (Task 2) is consumed by `_confirm_flagged_honeypots()` (Task 4) and by nothing else; `_iter_open_tcp_ports()` (Task 1) is consumed by `_count_unmatched_service_ports()`, `_count_silent_open_ports()` (Task 1), and `_named_honeypot_matches()` (Task 3) — all three call sites use the same `(ip, service_elem)` tuple shape. `mass_scan()`'s new `honeypot_active_confirm` parameter name matches the config key name and the `main()` local variable name throughout Task 5.
+- **Type/name consistency checked:** `_flag_honeypot_signals()` (Task 2) is consumed by `_confirm_flagged_honeypots()` (Task 4) and by nothing else; `_iter_open_tcp_ports()` (Task 1) is consumed by `_count_unmatched_service_ports()`, `_count_silent_open_ports()` (Task 1), and `_named_honeypot_matches()` (Task 3) — all three call sites use the same `(ip, service_elem)` tuple shape. `_vnc_heralding_match()` (Task 3 Step 7) deliberately does *not* reuse `_iter_open_tcp_ports()` — that generator only yields `<service>` elements from `nmap_results/*.xml`, not the `<script id="vnc-info">` elements in `nse_results/*.xml` this signal needs — and merges into `named_matches` (a plain `dict.update()`, both returning the same `{ip: product_name}` shape) rather than a fifth parallel dict threaded through `_honeypot_severity()`. `mass_scan()`'s new `honeypot_active_confirm` parameter name matches the config key name and the `main()` local variable name throughout Task 5.

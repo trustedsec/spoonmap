@@ -68,12 +68,27 @@ banners/service output already captured by `-sV`:
 - Dionaea's FTP greeting and SMB native-OS string.
 - Conpot's SNMP sysDescr for the default ICS templates
   (`Siemens, SIMATIC, S7-200`).
+- Heralding's VNC capability (`heralding/capabilities/vnc.py`): hardcodes
+  `RFB_VERSION = b'RFB 003.007\n'` — it unconditionally sends protocol
+  version 3.7 to *every* client, then requires the client's version reply to
+  match those exact bytes or it closes the session immediately without ever
+  sending a security-type list. Real RFB implementations negotiate/downgrade
+  instead of hard-matching. Verified directly against upstream source
+  (`johnnykv/heralding`, current `master`), not asserted from memory.
+  Signature: `vnc-info` reporting **protocol version 3.7 with no security
+  types enumerated** (nmap requests 3.8; Heralding's mismatch check drops the
+  connection before offering any). `vnclowpot` (`magisterquis/vnclowpot`) was
+  also checked and cut — it completes a normal 3.8 handshake offering only
+  VNC Authentication, indistinguishable from a legitimately hardened real VNC
+  server, so no standalone signature for it is included.
 
 **These exact strings must be verified against current upstream honeypot
 source/config before shipping** — they drift between versions and I'm
 working from familiarity, not a fresh check of each project's current
 defaults. Flagged as an explicit implementation task, not asserted as
-correct here.
+correct here. (Done for the Heralding entry above as part of this design
+revision; the Cowrie/Dionaea/Conpot entries above still need the same
+verification pass before implementation.)
 
 `_honeypot_signature_match(banner_text)` — returns product name or `None`.
 
