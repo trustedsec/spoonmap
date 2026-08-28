@@ -977,6 +977,57 @@ def preprocess_targets(target_file, output_path):
 
     return masscan_file, ip_to_hostname
 
+
+def _merge_ssl_cert_hostnames(output_path, ip_to_hostname):
+    """Fill gaps in ip_to_hostname from ssl-cert CN/SAN data in nse_results/.
+
+    Never overwrites an existing (operator-supplied) entry -- a name typed
+    into the target file always wins over a cert-derived guess.  For an IP
+    with no prior entry, prefers the certificate's commonName; falls back to
+    the first non-wildcard Subject Alternative Name.  A host whose only
+    names are wildcards gets no entry, since a wildcard is not a usable
+    scan target.  Returns a new dict; persists it to
+    <output_path>/discovery/ip_hostname_map.json via _write_if_changed().
+    """
+    nse_dir = f'{output_path}/nse_results'
+    merged = dict(ip_to_hostname)
+
+    if os.path.isdir(nse_dir):
+        for fname in sorted(os.listdir(nse_dir)):
+            if not fname.endswith('.xml'):
+                continue
+            try:
+                root = etree.parse(f'{nse_dir}/{fname}')
+            except Exception:
+                continue
+
+            for host in root.findall('host'):
+                addr_elem = host.find("address[@addrtype='ipv4']")
+                if addr_elem is None:
+                    addr_elem = host.find('address')
+                ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
+                if not ip or ip in merged:
+                    continue
+
+                for port_elem in host.iter('port'):
+                    scripts = {s.attrib['id']: s.attrib.get('output', '')
+                               for s in port_elem.findall('script') if s.attrib.get('id')}
+                    ssl_out = scripts.get('ssl-cert')
+                    if not ssl_out:
+                        continue
+                    for name in _extract_ssl_cert_hostnames(ssl_out):
+                        if not name.startswith('*.'):
+                            merged[ip] = name
+                            break
+                    if ip in merged:
+                        break
+
+    mapping_file = os.path.join(_disc(output_path), 'ip_hostname_map.json')
+    os.makedirs(_disc(output_path), exist_ok=True)
+    _write_if_changed(mapping_file, json.dumps(merged, indent=2))
+
+    return merged
+
 def _get_scripts_for_port(dest_port, target_scan):
     """Return comma-separated NSE script list for dest_port, or None.
 
@@ -6599,6 +6650,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             snmp_any_validated = {}
             if script_scan:
                 snmp_any_validated = _validate_snmp_any_community(output_path, target_scan)
+                ip_to_hostname = _merge_ssl_cert_hostnames(output_path, ip_to_hostname)
 
         # Combine all live hosts into one file
         disc = _disc(output_path)

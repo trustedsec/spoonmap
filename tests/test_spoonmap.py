@@ -42,6 +42,7 @@ from spoonmap import (
     _count_unmatched_service_ports,
     _external_exposure_scripts,
     _extract_ssl_cert_hostnames,
+    _merge_ssl_cert_hostnames,
     _format_eta,
     _raise_fd_limit,
     _sql_version_year,
@@ -1203,6 +1204,85 @@ def _nmap_xml_hostscript(host_ip, protocol, portid, hostscripts):
 def nmap_dir(tmp_path):
     (tmp_path / 'nse_results').mkdir()
     return tmp_path  # callers write files under tmp_path/nse_results/
+
+
+class TestMergeSslCertHostnames:
+    def test_fills_gap_for_ip_with_no_prior_entry(self, tmp_path):
+        (tmp_path / 'nse_results').mkdir()
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': 'Subject: commonName=example.corp\n'})
+        (tmp_path / 'nse_results' / 'port443.xml').write_text(xml)
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        assert result == {'1.2.3.4': 'example.corp'}
+
+    def test_never_overwrites_operator_supplied_entry(self, tmp_path):
+        (tmp_path / 'nse_results').mkdir()
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': 'Subject: commonName=cert-name.corp\n'})
+        (tmp_path / 'nse_results' / 'port443.xml').write_text(xml)
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {'1.2.3.4': 'operator-name.corp'})
+
+        assert result == {'1.2.3.4': 'operator-name.corp'}
+
+    def test_wildcard_only_cert_does_not_fill_gap(self, tmp_path):
+        (tmp_path / 'nse_results').mkdir()
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': 'Subject Alternative Name: DNS:*.example.corp\n'})
+        (tmp_path / 'nse_results' / 'port443.xml').write_text(xml)
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        assert result == {}
+
+    def test_cn_preferred_over_wildcard_san(self, tmp_path):
+        (tmp_path / 'nse_results').mkdir()
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': (
+                            'Subject: commonName=example.corp\n'
+                            'Subject Alternative Name: DNS:*.example.corp, DNS:example.corp\n'
+                        )})
+        (tmp_path / 'nse_results' / 'port443.xml').write_text(xml)
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        assert result == {'1.2.3.4': 'example.corp'}
+
+    def test_no_op_when_nse_results_missing(self, tmp_path):
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {'9.9.9.9': 'kept.corp'})
+        assert result == {'9.9.9.9': 'kept.corp'}
+
+    def test_no_op_when_no_ssl_cert_script_present(self, tmp_path):
+        (tmp_path / 'nse_results').mkdir()
+        xml = _nmap_xml('1.2.3.4', 'tcp', '445',
+                        scripts={'smb2-security-mode': 'Message signing enabled but not required'})
+        (tmp_path / 'nse_results' / 'port445.xml').write_text(xml)
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        assert result == {}
+
+    def test_writes_merged_map_to_disk(self, tmp_path):
+        (tmp_path / 'nse_results').mkdir()
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': 'Subject: commonName=example.corp\n'})
+        (tmp_path / 'nse_results' / 'port443.xml').write_text(xml)
+
+        _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        import json as _json
+        on_disk = _json.loads((tmp_path / 'discovery' / 'ip_hostname_map.json').read_text())
+        assert on_disk == {'1.2.3.4': 'example.corp'}
+
+    def test_ignores_unparseable_xml_file(self, tmp_path):
+        (tmp_path / 'nse_results').mkdir()
+        (tmp_path / 'nse_results' / 'port443.xml').write_text('not valid xml <<<')
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        assert result == {}
 
 
 class TestGenerateFindings:
