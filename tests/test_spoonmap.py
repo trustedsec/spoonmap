@@ -1300,6 +1300,21 @@ class TestMergeSslCertHostnames:
 
         assert result == {'1.2.3.4': 'api.example.corp'}
 
+    def test_ignores_non_xml_files_in_nse_results(self, tmp_path):
+        """nse_results/ legitimately holds .coverage sidecars and .failed
+        quarantine files alongside real .xml output; neither should be
+        opened as XML nor prevent a real .xml file in the same directory
+        from being merged."""
+        (tmp_path / 'nse_results').mkdir()
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': 'Subject: commonName=example.corp\n'})
+        (tmp_path / 'nse_results' / 'port443.xml').write_text(xml)
+        (tmp_path / 'nse_results' / 'port443.xml.coverage').write_text('not xml at all')
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        assert result == {'1.2.3.4': 'example.corp'}
+
 
 class TestGenerateFindings:
     # ── anonymous FTP ────────────────────────────────────────────────────────

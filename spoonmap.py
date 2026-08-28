@@ -1003,8 +1003,6 @@ def _merge_ssl_cert_hostnames(output_path, ip_to_hostname):
 
             for host in root.findall('host'):
                 addr_elem = host.find("address[@addrtype='ipv4']")
-                if addr_elem is None:
-                    addr_elem = host.find('address')
                 ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
                 if not ip or ip in merged:
                     continue
@@ -4943,8 +4941,9 @@ def _write_findings_txt(output_path, target_scan, findings):
             lines.append(f'  Affected hosts ({len(hosts)}):')
             if title in _PER_HOST_DETAIL_TITLES:
                 # Detail varies per host (exposure label + embedded vuln check;
-                # the VNC desktop name), so render it inline rather than
-                # collapsing the group to one shared description.
+                # the VNC desktop name; the discovered TLS certificate
+                # hostname list), so render it inline rather than collapsing
+                # the group to one shared description.
                 for h, d in sorted(grp['host_details']):
                     lines.append(f'{h}  —  {d}')
             else:
