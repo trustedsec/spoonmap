@@ -41,6 +41,8 @@ from spoonmap import (
     _count_hosts_in_file,
     _count_unmatched_service_ports,
     _external_exposure_scripts,
+    _extract_ssl_cert_hostnames,
+    _merge_ssl_cert_hostnames,
     _format_eta,
     _raise_fd_limit,
     _sql_version_year,
@@ -328,6 +330,59 @@ class TestResolveHostname:
         with patch('spoonmap.socket.gethostbyname', side_effect=OSError('nope')):
             assert resolve_hostname('bad.example.com') is None
         assert 'Could not resolve hostname' in capsys.readouterr().out
+
+
+class TestExtractSslCertHostnames:
+    def test_cn_only(self):
+        out = (
+            'Subject: commonName=example.corp\n'
+            'Issuer: commonName=Example CA\n'
+            'Not valid before: 2021-01-01T00:00:00\n'
+            'Not valid after:  2099-01-01T00:00:00\n'
+        )
+        assert _extract_ssl_cert_hostnames(out) == ['example.corp']
+
+    def test_cn_plus_san(self):
+        out = (
+            'Subject: commonName=example.corp\n'
+            'Subject Alternative Name: DNS:example.corp, DNS:www.example.corp\n'
+            'Issuer: commonName=Example CA\n'
+        )
+        assert _extract_ssl_cert_hostnames(out) == ['example.corp', 'www.example.corp']
+
+    def test_san_only_no_cn(self):
+        out = 'Subject Alternative Name: DNS:api.example.corp, DNS:cdn.example.corp\n'
+        assert _extract_ssl_cert_hostnames(out) == ['api.example.corp', 'cdn.example.corp']
+
+    def test_wildcard_included_in_result(self):
+        out = (
+            'Subject: commonName=example.corp\n'
+            'Subject Alternative Name: DNS:example.corp, DNS:*.example.corp\n'
+        )
+        assert _extract_ssl_cert_hostnames(out) == ['example.corp', '*.example.corp']
+
+    def test_does_not_pick_up_issuer_common_name(self):
+        # Issuer's commonName must never be mistaken for the subject's hostname.
+        out = (
+            'Subject: commonName=example.corp\n'
+            'Issuer: commonName=DigiCert TLS RSA SHA256 2020 CA1\n'
+        )
+        assert _extract_ssl_cert_hostnames(out) == ['example.corp']
+
+    def test_duplicate_name_in_cn_and_san_not_repeated(self):
+        out = (
+            'Subject: commonName=example.corp\n'
+            'Subject Alternative Name: DNS:example.corp, DNS:www.example.corp\n'
+        )
+        result = _extract_ssl_cert_hostnames(out)
+        assert result == ['example.corp', 'www.example.corp']
+        assert result.count('example.corp') == 1
+
+    def test_malformed_output_returns_empty_list(self):
+        assert _extract_ssl_cert_hostnames('garbage, no useful fields here') == []
+
+    def test_empty_string_returns_empty_list(self):
+        assert _extract_ssl_cert_hostnames('') == []
 
 
 class TestCountHostsInFile:
@@ -1151,6 +1206,116 @@ def nmap_dir(tmp_path):
     return tmp_path  # callers write files under tmp_path/nse_results/
 
 
+class TestMergeSslCertHostnames:
+    def test_fills_gap_for_ip_with_no_prior_entry(self, tmp_path):
+        (tmp_path / 'nse_results').mkdir()
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': 'Subject: commonName=example.corp\n'})
+        (tmp_path / 'nse_results' / 'port443.xml').write_text(xml)
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        assert result == {'1.2.3.4': 'example.corp'}
+
+    def test_never_overwrites_operator_supplied_entry(self, tmp_path):
+        (tmp_path / 'nse_results').mkdir()
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': 'Subject: commonName=cert-name.corp\n'})
+        (tmp_path / 'nse_results' / 'port443.xml').write_text(xml)
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {'1.2.3.4': 'operator-name.corp'})
+
+        assert result == {'1.2.3.4': 'operator-name.corp'}
+
+    def test_wildcard_only_cert_does_not_fill_gap(self, tmp_path):
+        (tmp_path / 'nse_results').mkdir()
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': 'Subject Alternative Name: DNS:*.example.corp\n'})
+        (tmp_path / 'nse_results' / 'port443.xml').write_text(xml)
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        assert result == {}
+
+    def test_cn_preferred_over_wildcard_san(self, tmp_path):
+        (tmp_path / 'nse_results').mkdir()
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': (
+                            'Subject: commonName=example.corp\n'
+                            'Subject Alternative Name: DNS:*.example.corp, DNS:example.corp\n'
+                        )})
+        (tmp_path / 'nse_results' / 'port443.xml').write_text(xml)
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        assert result == {'1.2.3.4': 'example.corp'}
+
+    def test_no_op_when_nse_results_missing(self, tmp_path):
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {'9.9.9.9': 'kept.corp'})
+        assert result == {'9.9.9.9': 'kept.corp'}
+
+    def test_no_op_when_no_ssl_cert_script_present(self, tmp_path):
+        (tmp_path / 'nse_results').mkdir()
+        xml = _nmap_xml('1.2.3.4', 'tcp', '445',
+                        scripts={'smb2-security-mode': 'Message signing enabled but not required'})
+        (tmp_path / 'nse_results' / 'port445.xml').write_text(xml)
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        assert result == {}
+
+    def test_writes_merged_map_to_disk(self, tmp_path):
+        (tmp_path / 'nse_results').mkdir()
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': 'Subject: commonName=example.corp\n'})
+        (tmp_path / 'nse_results' / 'port443.xml').write_text(xml)
+
+        _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        import json as _json
+        on_disk = _json.loads((tmp_path / 'discovery' / 'ip_hostname_map.json').read_text())
+        assert on_disk == {'1.2.3.4': 'example.corp'}
+
+    def test_ignores_unparseable_xml_file(self, tmp_path):
+        (tmp_path / 'nse_results').mkdir()
+        (tmp_path / 'nse_results' / 'port443.xml').write_text('not valid xml <<<')
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        assert result == {}
+
+    def test_finds_cn_on_second_port_when_first_is_wildcard_only(self, tmp_path):
+        """Exercise the port-scanning loop: wildcard on first port, CN on second."""
+        (tmp_path / 'nse_results').mkdir()
+        # First port (8443) has wildcard-only cert
+        xml1 = _nmap_xml('1.2.3.4', 'tcp', '8443',
+                         scripts={'ssl-cert': 'Subject Alternative Name: DNS:*.example.corp\n'})
+        # Second port (443) has usable CN
+        xml2 = _nmap_xml('1.2.3.4', 'tcp', '443',
+                         scripts={'ssl-cert': 'Subject: commonName=api.example.corp\n'})
+        (tmp_path / 'nse_results' / 'port8443.xml').write_text(xml1)
+        (tmp_path / 'nse_results' / 'port443.xml').write_text(xml2)
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        assert result == {'1.2.3.4': 'api.example.corp'}
+
+    def test_ignores_non_xml_files_in_nse_results(self, tmp_path):
+        """nse_results/ legitimately holds .coverage sidecars and .failed
+        quarantine files alongside real .xml output; neither should be
+        opened as XML nor prevent a real .xml file in the same directory
+        from being merged."""
+        (tmp_path / 'nse_results').mkdir()
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': 'Subject: commonName=example.corp\n'})
+        (tmp_path / 'nse_results' / 'port443.xml').write_text(xml)
+        (tmp_path / 'nse_results' / 'port443.xml.coverage').write_text('not xml at all')
+
+        result = _merge_ssl_cert_hostnames(str(tmp_path), {})
+
+        assert result == {'1.2.3.4': 'example.corp'}
+
+
 class TestGenerateFindings:
     # ── anonymous FTP ────────────────────────────────────────────────────────
 
@@ -1437,6 +1602,55 @@ class TestGenerateFindings:
         (nmap_dir / 'nse_results' / 'port443.xml').write_text(xml)
         generate_findings(str(nmap_dir), 'External')
         assert 'Expired TLS Certificate' not in (nmap_dir / 'findings.txt').read_text()
+
+    def test_ssl_cert_hostnames_flagged_on_external(self, nmap_dir):
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': (
+                            'Subject: commonName=example.corp\n'
+                            'Subject Alternative Name: DNS:example.corp, DNS:www.example.corp\n'
+                        )})
+        (nmap_dir / 'nse_results' / 'port443.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        txt = (nmap_dir / 'findings.txt').read_text()
+        assert 'TLS Certificate Hostname(s) Identified' in txt
+        assert 'example.corp' in txt
+        assert 'www.example.corp' in txt
+
+    def test_ssl_cert_hostnames_includes_wildcard_in_detail(self, nmap_dir):
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': (
+                            'Subject: commonName=example.corp\n'
+                            'Subject Alternative Name: DNS:example.corp, DNS:*.example.corp\n'
+                        )})
+        (nmap_dir / 'nse_results' / 'port443.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        txt = (nmap_dir / 'findings.txt').read_text()
+        assert '*.example.corp' in txt
+
+    def test_ssl_cert_hostnames_not_flagged_on_internal(self, nmap_dir):
+        xml = _nmap_xml('10.0.0.2', 'tcp', '443',
+                        scripts={'ssl-cert': 'Subject: commonName=internal.corp\n'})
+        (nmap_dir / 'nse_results' / 'port443.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        assert 'TLS Certificate Hostname(s) Identified' not in (nmap_dir / 'findings.txt').read_text()
+
+    def test_ssl_cert_no_parseable_names_no_finding(self, nmap_dir):
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': 'Not valid after:  2099-01-01T00:00:00\n'})
+        (nmap_dir / 'nse_results' / 'port443.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        assert 'TLS Certificate Hostname(s) Identified' not in (nmap_dir / 'findings.txt').read_text()
+
+    def test_ssl_cert_hostname_finding_is_low_severity(self, nmap_dir):
+        xml = _nmap_xml('1.2.3.4', 'tcp', '443',
+                        scripts={'ssl-cert': 'Subject: commonName=example.corp\n'})
+        (nmap_dir / 'nse_results' / 'port443.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        import json as _json
+        records = _json.loads((nmap_dir / 'findings.json').read_text())
+        matches = [r for r in records if r['title'] == 'TLS Certificate Hostname(s) Identified']
+        assert len(matches) == 1
+        assert matches[0]['severity'] == 'LOW'
 
     # ── known-bad service detection ───────────────────────────────────────────
 

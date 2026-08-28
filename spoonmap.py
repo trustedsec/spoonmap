@@ -580,6 +580,39 @@ def resolve_hostname(hostname):
         print(_COLOR_ERROR + f'Warning: Could not resolve hostname {hostname}: {e}' + _COLOR_RESET)
         return None
 
+def _extract_ssl_cert_hostnames(ssl_cert_output):
+    """Extract hostnames from ssl-cert NSE script output (CN + SAN).
+
+    Returns a deduped, order-preserved list: the certificate's commonName
+    first, then each Subject Alternative Name DNS: entry in the order nmap
+    printed them.  Wildcard names (e.g. '*.example.com') are returned like
+    any other name -- callers that feed a scan target must filter those out
+    themselves.  Anchored to the 'Subject:' line specifically (not
+    'Issuer:'), since ssl-cert output carries a commonName for both and only
+    the subject's identifies the host being scanned.
+    """
+    hostnames = []
+    seen = set()
+
+    cn_match = re.search(r'^Subject:.*?commonName=([^\s/,]+)', ssl_cert_output, re.MULTILINE)
+    if cn_match:
+        cn = cn_match.group(1).strip()
+        if cn and cn not in seen:
+            hostnames.append(cn)
+            seen.add(cn)
+
+    san_match = re.search(r'^Subject Alternative Name:\s*(.+)$', ssl_cert_output, re.MULTILINE)
+    if san_match:
+        for entry in san_match.group(1).split(','):
+            entry = entry.strip()
+            if entry.startswith('DNS:'):
+                name = entry[len('DNS:'):].strip()
+                if name and name not in seen:
+                    hostnames.append(name)
+                    seen.add(name)
+
+    return hostnames
+
 def _write_if_changed(path, content):
     """Write *content* to *path* only if it differs from the current contents.
 
@@ -943,6 +976,56 @@ def preprocess_targets(target_file, output_path):
     print(_COLOR_INFO + f'Target file: {masscan_file}' + _COLOR_RESET)
 
     return masscan_file, ip_to_hostname
+
+
+def _merge_ssl_cert_hostnames(output_path, ip_to_hostname):
+    """Fill gaps in ip_to_hostname from ssl-cert CN/SAN data in nse_results/.
+
+    Never overwrites an existing (operator-supplied) entry -- a name typed
+    into the target file always wins over a cert-derived guess.  For an IP
+    with no prior entry, prefers the certificate's commonName; falls back to
+    the first non-wildcard Subject Alternative Name.  A host whose only
+    names are wildcards gets no entry, since a wildcard is not a usable
+    scan target.  Returns a new dict; persists it to
+    <output_path>/discovery/ip_hostname_map.json via _write_if_changed().
+    """
+    nse_dir = f'{output_path}/nse_results'
+    merged = dict(ip_to_hostname)
+
+    if os.path.isdir(nse_dir):
+        for fname in sorted(os.listdir(nse_dir)):
+            if not fname.endswith('.xml'):
+                continue
+            try:
+                root = etree.parse(f'{nse_dir}/{fname}')
+            except Exception:
+                continue
+
+            for host in root.findall('host'):
+                addr_elem = host.find("address[@addrtype='ipv4']")
+                ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
+                if not ip or ip in merged:
+                    continue
+
+                for port_elem in host.iter('port'):
+                    scripts = {s.attrib.get('id'): s.attrib.get('output', '')
+                               for s in port_elem.findall('script') if s.attrib.get('id')}
+                    ssl_out = scripts.get('ssl-cert')
+                    if not ssl_out:
+                        continue
+                    for name in _extract_ssl_cert_hostnames(ssl_out):
+                        if not name.startswith('*.'):
+                            merged[ip] = name
+                            break
+                    if ip in merged:
+                        break
+
+    mapping_file = os.path.join(_disc(output_path), 'ip_hostname_map.json')
+    os.makedirs(_disc(output_path), exist_ok=True)
+    _write_if_changed(mapping_file, json.dumps(merged, indent=2))
+
+    return merged
+
 
 def _get_scripts_for_port(dest_port, target_scan):
     """Return comma-separated NSE script list for dest_port, or None.
@@ -3851,6 +3934,13 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                             add('MEDIUM', ip, port_str, 'Expired TLS Certificate',
                                 f'Certificate expired on {expiry}.')
 
+                # ── ssl-cert — hostnames from CN/SAN (External only) ─────
+                if 'ssl-cert' in scripts and target_scan == 'External':
+                    cert_hostnames = _extract_ssl_cert_hostnames(scripts['ssl-cert'])
+                    if cert_hostnames:
+                        add('LOW', ip, port_str, 'TLS Certificate Hostname(s) Identified',
+                            f'Certificate presents: {", ".join(cert_hostnames)}.')
+
                 # ── ldap-signing-check (ports 389 / 3268) ────────────────────
                 if 'ldap-signing-check' in scripts and target_scan == 'Internal':
                     if 'NOT REQUIRED' in scripts['ldap-signing-check'].upper():
@@ -4480,6 +4570,15 @@ _FINDING_REPRO = {
             '|_Not valid after:  2022-01-01T00:00:00'
         ),
     },
+    'TLS Certificate Hostname(s) Identified': {
+        'flags': '--script ssl-cert',
+        'sample': (
+            'PORT    STATE SERVICE\n'
+            '443/tcp open  https\n'
+            '| ssl-cert: Subject: commonName=example.corp\n'
+            '|_Subject Alternative Name: DNS:example.corp, DNS:www.example.corp'
+        ),
+    },
     'SQL Server Instance Discovered': {
         'flags': '--script ms-sql-info',
         'sample': (
@@ -4799,6 +4898,7 @@ def _write_artifact(path, content):
 _PER_HOST_DETAIL_TITLES = frozenset({
     'Service Exposed Externally',
     'VNC Desktop Name Disclosed',
+    'TLS Certificate Hostname(s) Identified',
 })
 
 
@@ -4841,8 +4941,9 @@ def _write_findings_txt(output_path, target_scan, findings):
             lines.append(f'  Affected hosts ({len(hosts)}):')
             if title in _PER_HOST_DETAIL_TITLES:
                 # Detail varies per host (exposure label + embedded vuln check;
-                # the VNC desktop name), so render it inline rather than
-                # collapsing the group to one shared description.
+                # the VNC desktop name; the discovered TLS certificate
+                # hostname list), so render it inline rather than collapsing
+                # the group to one shared description.
                 for h, d in sorted(grp['host_details']):
                     lines.append(f'{h}  —  {d}')
             else:
@@ -6566,6 +6667,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             snmp_any_validated = {}
             if script_scan:
                 snmp_any_validated = _validate_snmp_any_community(output_path, target_scan)
+                ip_to_hostname = _merge_ssl_cert_hostnames(output_path, ip_to_hostname)
 
         # Combine all live hosts into one file
         disc = _disc(output_path)
