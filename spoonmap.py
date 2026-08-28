@@ -2036,6 +2036,9 @@ def _report_suspected_honeypots(flagged, disc):
     _atomic_write(honeypot_file, ''.join(lines))
 
 
+_EXPAND_SCANNED_PORTS_MAX_SPAN = 100_000
+
+
 def _expand_scanned_ports(scanned_ports):
     """Expand a dest_ports-style list (individual port strings and/or
     'N-M' range strings) into the set of integer ports it covers.
@@ -2046,14 +2049,38 @@ def _expand_scanned_ports(scanned_ports):
     ports as strings (e.g. '64835' not in {'1-65535'}) is always True since
     the range is never expanded — this expands it into real integers so
     membership tests are correct.
+
+    dest_ports is unvalidated operator input — a hand-typed Custom port
+    list or a raw config.json value — so a malformed token ('80-', 'http',
+    '8O80', '80/tcp') is skipped rather than raising: this function runs
+    ahead of _maybe_confirm_honeypot()'s enabled-flag check, so an
+    unhandled ValueError here would abort mass_scan()/main() and discard a
+    completed scan's aggregation even when the active-probe feature is
+    off. Skipping a bad token only shrinks the "confirmed scanned" set,
+    which can only narrow the probe candidate pool, never widen it or
+    reintroduce the range-string false-positive this function fixes.
+
+    A range whose span exceeds _EXPAND_SCANNED_PORTS_MAX_SPAN (100,000 —
+    far more than any real scan needs, since the full port space is only
+    65535) is skipped rather than expanded, so a token like
+    '1-4294967295' can't materialize a multi-billion-element set.
     """
     expanded = set()
     for p in scanned_ports:
         if '-' in p:
             start, end = p.split('-', 1)
-            expanded.update(range(int(start), int(end) + 1))
+            try:
+                start_i, end_i = int(start), int(end)
+            except ValueError:
+                continue
+            if end_i < start_i or (end_i - start_i + 1) > _EXPAND_SCANNED_PORTS_MAX_SPAN:
+                continue
+            expanded.update(range(start_i, end_i + 1))
         else:
-            expanded.add(int(p))
+            try:
+                expanded.add(int(p))
+            except ValueError:
+                continue
     return expanded
 
 

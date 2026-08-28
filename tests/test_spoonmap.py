@@ -9750,6 +9750,33 @@ class TestExpandScannedPorts:
         expanded = _expand_scanned_ports(['80', '49152-49153'])
         assert expanded == {80, 49152, 49153}
 
+    @pytest.mark.parametrize('token', ['80-', 'http', '8O80', '80/tcp'])
+    def test_malformed_token_is_skipped_not_raised(self, token):
+        # dest_ports is unvalidated operator input (interactive Custom list
+        # or a raw config.json value) — a malformed token must be skipped,
+        # not raise, since this runs ahead of the honeypot-probe enabled
+        # check and an unhandled ValueError here would discard a completed
+        # scan's aggregation even when the probe feature is off.
+        assert _expand_scanned_ports([token]) == set()
+
+    def test_malformed_token_alongside_valid_entries_keeps_valid_ones(self):
+        expanded = _expand_scanned_ports(['80', 'http', '443'])
+        assert expanded == {80, 443}
+
+    def test_huge_range_span_is_skipped_not_materialized(self):
+        # A span above _EXPAND_SCANNED_PORTS_MAX_SPAN must not be expanded
+        # into a giant set — skip it instead of attempting to build one.
+        assert _expand_scanned_ports(['1-4294967295']) == set()
+
+    def test_range_span_at_cap_boundary_is_expanded(self):
+        # A span exactly at the cap is still a legitimate range and must
+        # expand normally.
+        expanded = _expand_scanned_ports(['1-100000'])
+        assert len(expanded) == 100000
+
+    def test_inverted_range_is_skipped(self):
+        assert _expand_scanned_ports(['100-1']) == set()
+
 
 class TestSelectConfirmProbePorts:
     """Unit tests for _select_confirm_probe_ports()."""
@@ -9779,12 +9806,21 @@ class TestSelectConfirmProbePorts:
 
     def test_udp_scanned_ports_do_not_shrink_candidate_pool(self):
         # 'U:49200'-style keys must not be compared against bare int ports.
-        # This also guards against a crash: _expand_scanned_ports() calls
-        # int() on anything without a '-', so a leaked 'U:NNNN' key reaching
-        # it unfiltered raises ValueError instead of merely miscounting.
+        # They're filtered out by _select_confirm_probe_ports() before
+        # reaching _expand_scanned_ports() (which would otherwise just
+        # skip the unparseable 'U:NNNN' token rather than raise).
         scanned = [f'U:{p}' for p in range(49152, 49200)]
         ports = _select_confirm_probe_ports('10.0.0.1', scanned, count=3)
         assert len(ports) == 3
+
+    def test_malformed_token_alongside_valid_entries_still_yields_result(self):
+        # A garbage token mixed in with real dest_ports entries must not
+        # crash _select_confirm_probe_ports(); it's simply skipped as
+        # "not confirmed scanned", which can only shrink the pool.
+        scanned = ['80', '80-', 'http', '443']
+        ports = _select_confirm_probe_ports('10.0.0.1', scanned, count=3)
+        assert len(ports) == 3
+        assert not (set(ports) & {'80', '443'})
 
     def test_full_scan_range_spec_excludes_entire_ephemeral_range(self):
         # dest_ports=['1-65535'] (a Full scan) scanned every port, including
