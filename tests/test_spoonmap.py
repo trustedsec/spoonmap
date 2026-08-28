@@ -1,5 +1,6 @@
 """Tests for spoonmap.py"""
 import ast
+import contextlib
 import datetime
 import inspect
 import io
@@ -52,6 +53,7 @@ from spoonmap import (
     _handle_previous_results,
     _prior_default,
     _prompt_int,
+    _report_confirmed_honeypots,
     _prompt_yes_no,
     _CONFIG_DOCS,
     _CONFIG_FIELD_ORDER,
@@ -80,14 +82,17 @@ from spoonmap import (
     _discover_external_masscan,
     _discover_internal_masscan,
     _external_host_discovery,
+    _active_confirm_probe,
     _flag_honeypot_signals,
     _flag_suspected_tarpits,
     _honeypot_signature_match,
+    _maybe_confirm_honeypot,
     _named_honeypot_matches,
     _nmap_host_discovery,
     _port_profile_match,
     _report_suspected_honeypots,
     _report_suspected_tarpits,
+    _select_confirm_probe_ports,
     _stream_masscan_progress,
     _vnc_heralding_match,
     preprocess_targets,
@@ -9658,6 +9663,95 @@ class TestReportSuspectedHoneypots:
     def test_empty_flagged_writes_nothing(self, tmp_path):
         _report_suspected_honeypots({}, str(tmp_path))
         assert not (tmp_path / 'suspected_honeypots.txt').exists()
+
+
+class TestSelectConfirmProbePorts:
+    """Unit tests for _select_confirm_probe_ports()."""
+
+    def test_returns_requested_count(self):
+        ports = _select_confirm_probe_ports('10.0.0.1', [], count=3)
+        assert len(ports) == 3
+
+    def test_ports_are_in_ephemeral_range(self):
+        ports = _select_confirm_probe_ports('10.0.0.1', [], count=5)
+        assert all(49152 <= int(p) <= 65535 for p in ports)
+
+    def test_excludes_scanned_ports(self):
+        scanned = [str(p) for p in range(49152, 49152 + 100)]
+        ports = _select_confirm_probe_ports('10.0.0.1', scanned, count=3)
+        assert not (set(ports) & set(scanned))
+
+    def test_deterministic_for_same_ip(self):
+        a = _select_confirm_probe_ports('10.0.0.1', [], count=3)
+        b = _select_confirm_probe_ports('10.0.0.1', [], count=3)
+        assert a == b
+
+    def test_different_ips_can_differ(self):
+        a = _select_confirm_probe_ports('10.0.0.1', [], count=3)
+        b = _select_confirm_probe_ports('10.0.0.2', [], count=3)
+        assert a != b
+
+    def test_udp_scanned_ports_do_not_shrink_candidate_pool(self):
+        # 'U:49200'-style keys must not be compared against bare int ports.
+        scanned = [f'U:{p}' for p in range(49152, 49200)]
+        ports = _select_confirm_probe_ports('10.0.0.1', scanned, count=3)
+        assert len(ports) == 3
+
+
+class TestActiveConfirmProbe:
+    """Unit tests for _active_confirm_probe()."""
+
+    def test_returns_true_when_any_port_connects(self):
+        def connector(addr, timeout):
+            if addr[1] == 50000:
+                raise OSError('refused')
+            return contextlib.nullcontext()
+        assert _active_confirm_probe('10.0.0.1', ['50000', '50001'], connector=connector) is True
+
+    def test_returns_false_when_nothing_connects(self):
+        def connector(addr, timeout):
+            raise OSError('refused')
+        assert _active_confirm_probe('10.0.0.1', ['50000', '50001'], connector=connector) is False
+
+    def test_empty_probe_ports_returns_false(self):
+        def connector(addr, timeout):
+            raise AssertionError('must not be called with no ports')
+        assert _active_confirm_probe('10.0.0.1', [], connector=connector) is False
+
+
+class TestMaybeConfirmHoneypot:
+    """Unit tests for _maybe_confirm_honeypot()."""
+
+    def test_disabled_never_probes(self):
+        def connector(addr, timeout):
+            raise AssertionError('must not be called when disabled')
+        result = _maybe_confirm_honeypot(False, '10.0.0.1', ['50000'], connector=connector)
+        assert result is False
+
+    def test_enabled_runs_probe(self):
+        def connector(addr, timeout):
+            return contextlib.nullcontext()
+        result = _maybe_confirm_honeypot(True, '10.0.0.1', ['50000'], connector=connector)
+        assert result is True
+
+
+class TestReportConfirmedHoneypots:
+    """Unit tests for _report_confirmed_honeypots()."""
+
+    def test_writes_file_and_warns(self, tmp_path, capsys):
+        _report_confirmed_honeypots({'10.0.0.1'}, str(tmp_path))
+        content = (tmp_path / 'confirmed_honeypots.txt').read_text()
+        assert content.strip() == '10.0.0.1'
+        assert '10.0.0.1' in capsys.readouterr().out
+
+    def test_empty_confirmed_writes_nothing(self, tmp_path):
+        _report_confirmed_honeypots(set(), str(tmp_path))
+        assert not (tmp_path / 'confirmed_honeypots.txt').exists()
+
+    def test_multiple_hosts_sorted(self, tmp_path):
+        _report_confirmed_honeypots({'10.0.0.10', '10.0.0.2'}, str(tmp_path))
+        content = (tmp_path / 'confirmed_honeypots.txt').read_text()
+        assert content.splitlines() == ['10.0.0.2', '10.0.0.10']
 
 
 # ── TestSMBCoupling ────────────────────────────────────────────────────────────

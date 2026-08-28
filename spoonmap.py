@@ -25,6 +25,7 @@ import threading
 import time
 import queue
 from queue import Queue
+import random
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as etree
@@ -2035,7 +2036,82 @@ def _report_suspected_honeypots(flagged, disc):
     _atomic_write(honeypot_file, ''.join(lines))
 
 
-def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file, batch_size=1, resume=False, discovery_file=None, target_scan='Internal'):
+def _select_confirm_probe_ports(ip, scanned_ports, count=3):
+    """Return `count` deterministic high ports, seeded from ip, that were
+    never part of this run's scanned port set.
+
+    Deterministic (seeded from the target IP, not global randomness) so the
+    probe is reproducible and testable without mocking random state. Ports
+    are drawn from the ephemeral range (49152-65535) specifically because a
+    legitimate host is unlikely to run a fixed service there, so an answer
+    is a strong tell rather than a false positive from a real service the
+    scan happened not to cover.
+    """
+    scanned = {p for p in scanned_ports if not p.startswith('U:')}
+    rng = random.Random(ip)
+    candidates = [p for p in range(49152, 65536) if str(p) not in scanned]
+    return [str(p) for p in rng.sample(candidates, min(count, len(candidates)))]
+
+
+def _active_confirm_probe(ip, probe_ports, timeout=2, connector=None):
+    """Return True if a raw TCP connect succeeds on any of probe_ports.
+
+    A real host has no reason to answer on an unscanned, unrelated ephemeral
+    port; a decoy that accepts every connection will. connector defaults to
+    socket.create_connection and is injectable for testing.
+    """
+    connect = connector or socket.create_connection
+    for port in probe_ports:
+        try:
+            with connect((ip, int(port)), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _maybe_confirm_honeypot(enabled, ip, probe_ports, connector=None):
+    """Run the active confirmation probe only if the operator opted in.
+
+    Mirrors _maybe_check_for_updates(): a thin, directly-testable gate so
+    "does a default run ever send an unrequested probe" is a real test, not
+    something buried inside mass_scan().
+    """
+    if not enabled:
+        return False
+    return _active_confirm_probe(ip, probe_ports, connector=connector)
+
+
+def _report_confirmed_honeypots(confirmed_ips, disc):
+    """Persist actively-confirmed decoy hosts to disc/confirmed_honeypots.txt
+    and warn on stdout."""
+    if not confirmed_ips:
+        return
+    confirmed_file = os.path.join(disc, 'confirmed_honeypots.txt')
+    lines = []
+    for ip in sorted(confirmed_ips, key=_ip_sort_key):
+        lines.append(f'{ip}\n')
+        print(_COLOR_ERROR
+              + f'Warning: {ip} answered a connection on a port never scanned open '
+              + 'during this run — confirmed decoy/honeypot host.'
+              + _COLOR_RESET)
+    _atomic_write(confirmed_file, ''.join(lines))
+
+
+def _confirm_flagged_honeypots(flagged, enabled, dest_ports, disc):
+    """Run the active probe (if enabled) against every host
+    _flag_honeypot_signals() flagged, and persist whichever ones answer."""
+    if not flagged:
+        return
+    confirmed = set()
+    for ip in flagged:
+        probe_ports = _select_confirm_probe_ports(ip, dest_ports)
+        if _maybe_confirm_honeypot(enabled, ip, probe_ports):
+            confirmed.add(ip)
+    _report_confirmed_honeypots(confirmed, disc)
+
+
+def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file, batch_size=1, resume=False, discovery_file=None, target_scan='Internal', honeypot_active_confirm=False):
     status_summary = '\nSummary'
 
     if not os.path.exists(f'{_disc(output_path)}/masscan_results'):
@@ -2113,7 +2189,9 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                         status_summary += status_update
                         print(_COLOR_PROGRESS + status_update + _COLOR_RESET)
             _report_suspected_tarpits(_flag_suspected_tarpits(full_results, 65535), disc)
-            _report_suspected_honeypots(_flag_honeypot_signals(full_results, f'{disc}/masscan_results'), disc)
+            honeypot_flags = _flag_honeypot_signals(full_results, f'{disc}/masscan_results')
+            _report_suspected_honeypots(honeypot_flags, disc)
+            _confirm_flagged_honeypots(honeypot_flags, honeypot_active_confirm, dest_ports, disc)
             # This path's results are read straight back off disk, so it is the
             # most exposed to a live_hosts/ directory left over from a wider scope.
             _report_out_of_scope_retained(full_results, scope_ranges, target_file)
@@ -2166,7 +2244,9 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             status_summary += status_update
             print(_COLOR_PROGRESS + status_update + _COLOR_RESET)
         _report_suspected_tarpits(_flag_suspected_tarpits(full_results, 65535), disc)
-        _report_suspected_honeypots(_flag_honeypot_signals(full_results, f'{disc}/masscan_results'), disc)
+        honeypot_flags = _flag_honeypot_signals(full_results, f'{disc}/masscan_results')
+        _report_suspected_honeypots(honeypot_flags, disc)
+        _confirm_flagged_honeypots(honeypot_flags, honeypot_active_confirm, dest_ports, disc)
         # Retaining cached hosts means this path can now carry a host from a
         # previous, wider engagement scope, exactly as the resume path can, so it
         # owes the operator the same disclosure.
@@ -2441,7 +2521,9 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             _print_completion_status('Masscan', batch_idx + 1, total_batches, scan_start_time)
 
     _report_suspected_tarpits(_flag_suspected_tarpits(port_ips, len(tcp_ports)), disc)
-    _report_suspected_honeypots(_flag_honeypot_signals(port_ips, f'{disc}/masscan_results'), disc)
+    honeypot_flags = _flag_honeypot_signals(port_ips, f'{disc}/masscan_results')
+    _report_suspected_honeypots(honeypot_flags, disc)
+    _confirm_flagged_honeypots(honeypot_flags, honeypot_active_confirm, dest_ports, disc)
 
     # ── SMB port coupling ─────────────────────────────────────────────────────
     smb_in_scope = [p for p in _SMB_COUPLED_PORTS if p in set(dest_ports)]
