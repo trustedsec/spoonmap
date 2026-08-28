@@ -27,6 +27,7 @@ from spoonmap import (
     EXTERNAL_SENSITIVE_PORTS,
     HONEYPOT_MIN_PORTS_SCANNED,
     HONEYPOT_OPEN_PORT_FRACTION,
+    HONEYPOT_PORT_PROFILES,
     HOST_DISCOVERY_NMAP_THRESHOLD,
     INTERNAL_DISCOVERY_MAX_RATE,
     INTERNAL_DISCOVERY_STATE_CEILING,
@@ -46,6 +47,7 @@ from spoonmap import (
     _raise_fd_limit,
     _sql_version_year,
     _summarize_vulns,
+    _ttl_spread_by_host,
     _handle_previous_results,
     _prior_default,
     _prompt_int,
@@ -77,8 +79,11 @@ from spoonmap import (
     _discover_external_masscan,
     _discover_internal_masscan,
     _external_host_discovery,
+    _flag_honeypot_signals,
     _flag_suspected_tarpits,
     _nmap_host_discovery,
+    _port_profile_match,
+    _report_suspected_honeypots,
     _report_suspected_tarpits,
     _stream_masscan_progress,
     preprocess_targets,
@@ -9113,6 +9118,168 @@ class TestReportSuspectedTarpits:
                 _report_suspected_tarpits({'10.0.0.2': (18, 20)}, str(tmp_path))
         assert tarpit_file.read_text() == '10.0.0.1,19,20\n'
         assert [p.name for p in tmp_path.iterdir()] == ['suspected_tarpits.txt']
+
+
+class TestTtlSpreadByHost:
+    """Unit tests for _ttl_spread_by_host()."""
+
+    def _masscan_xml(self, ip, port, reason_ttl, protocol='tcp'):
+        return (
+            '<?xml version="1.0"?><nmaprun>'
+            f'<host><address addr="{ip}" addrtype="ipv4"/>'
+            f'<ports><port protocol="{protocol}" portid="{port}">'
+            f'<state state="open" reason="syn-ack" reason_ttl="{reason_ttl}"/>'
+            '</port></ports></host></nmaprun>'
+        )
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert _ttl_spread_by_host(str(tmp_path / 'nope')) == {}
+
+    def test_consistent_ttl_not_flagged(self, tmp_path):
+        (tmp_path / 'port22.xml').write_text(self._masscan_xml('10.0.0.1', '22', 64))
+        (tmp_path / 'port80.xml').write_text(self._masscan_xml('10.0.0.1', '80', 64))
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_inconsistent_ttl_flagged_sorted(self, tmp_path):
+        (tmp_path / 'port22.xml').write_text(self._masscan_xml('10.0.0.2', '22', 128))
+        (tmp_path / 'port80.xml').write_text(self._masscan_xml('10.0.0.2', '80', 64))
+        assert _ttl_spread_by_host(str(tmp_path)) == {'10.0.0.2': [64, 128]}
+
+    def test_single_port_never_flagged(self, tmp_path):
+        (tmp_path / 'port22.xml').write_text(self._masscan_xml('10.0.0.3', '22', 64))
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_udp_ports_ignored(self, tmp_path):
+        (tmp_path / 'port22.xml').write_text(self._masscan_xml('10.0.0.4', '22', 64))
+        (tmp_path / 'portU_53.xml').write_text(
+            self._masscan_xml('10.0.0.4', '53', 200, protocol='udp'))
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_malformed_xml_skipped(self, tmp_path):
+        (tmp_path / 'port80.xml').write_text('<nmaprun><host>')
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_host_without_ipv4_address_skipped(self, tmp_path):
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="00:11:22:33:44:55" addrtype="mac"/>'
+            '<ports><port protocol="tcp" portid="22">'
+            '<state state="open" reason="syn-ack" reason_ttl="64"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (tmp_path / 'port22.xml').write_text(xml)
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_non_numeric_ttl_skipped(self, tmp_path):
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.5" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="22">'
+            '<state state="open" reason="syn-ack" reason_ttl="not-a-number"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (tmp_path / 'port22.xml').write_text(xml)
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+
+class TestPortProfileMatch:
+    """Unit tests for _port_profile_match()."""
+
+    def test_exact_profile_match(self):
+        profile = next(iter(HONEYPOT_PORT_PROFILES.values()))
+        assert _port_profile_match(profile) is not None
+
+    def test_superset_still_matches(self):
+        profile = next(iter(HONEYPOT_PORT_PROFILES.values()))
+        assert _port_profile_match(profile | {'54321'}) is not None
+
+    def test_subset_does_not_match(self):
+        profile = next(iter(HONEYPOT_PORT_PROFILES.values()))
+        partial = set(list(profile)[:-1]) if len(profile) > 1 else set()
+        assert _port_profile_match(partial) is None
+
+    def test_unrelated_ports_no_match(self):
+        assert _port_profile_match({'12345'}) is None
+
+    def test_empty_ports_no_match(self):
+        assert _port_profile_match(set()) is None
+
+
+class TestFlagHoneypotSignals:
+    """Unit tests for _flag_honeypot_signals()."""
+
+    def _masscan_xml(self, ip, port, reason_ttl):
+        return (
+            '<?xml version="1.0"?><nmaprun>'
+            f'<host><address addr="{ip}" addrtype="ipv4"/>'
+            f'<ports><port protocol="tcp" portid="{port}">'
+            f'<state state="open" reason="syn-ack" reason_ttl="{reason_ttl}"/>'
+            '</port></ports></host></nmaprun>'
+        )
+
+    def test_ttl_spread_flagged(self, tmp_path):
+        (tmp_path / 'port22.xml').write_text(self._masscan_xml('10.0.0.1', '22', 64))
+        (tmp_path / 'port80.xml').write_text(self._masscan_xml('10.0.0.1', '80', 128))
+        port_ips = {'22': {'10.0.0.1'}, '80': {'10.0.0.1'}}
+        result = _flag_honeypot_signals(port_ips, str(tmp_path))
+        assert result['10.0.0.1']['ttl_spread'] == [64, 128]
+
+    def test_port_profile_flagged(self, tmp_path):
+        profile = next(iter(HONEYPOT_PORT_PROFILES.items()))
+        name, ports = profile
+        port_ips = {p: {'10.0.0.2'} for p in ports}
+        result = _flag_honeypot_signals(port_ips, str(tmp_path))
+        assert result['10.0.0.2']['port_profile'] == name
+
+    def test_udp_ports_excluded_from_profile_match(self, tmp_path):
+        port_ips = {'U:22': {'10.0.0.3'}, 'U:80': {'10.0.0.3'}}
+        result = _flag_honeypot_signals(port_ips, str(tmp_path))
+        assert '10.0.0.3' not in result
+
+    def test_no_signals_no_entry(self, tmp_path):
+        port_ips = {'22': {'10.0.0.4'}}
+        result = _flag_honeypot_signals(port_ips, str(tmp_path))
+        assert result == {}
+
+    def test_both_signals_combine_for_same_host(self, tmp_path):
+        name, ports = next(iter(HONEYPOT_PORT_PROFILES.items()))
+        ports = list(ports)
+        (tmp_path / f'port{ports[0]}.xml').write_text(
+            self._masscan_xml('10.0.0.5', ports[0], 64))
+        (tmp_path / f'port{ports[1]}.xml').write_text(
+            self._masscan_xml('10.0.0.5', ports[1], 128))
+        port_ips = {p: {'10.0.0.5'} for p in ports}
+        result = _flag_honeypot_signals(port_ips, str(tmp_path))
+        assert result['10.0.0.5']['ttl_spread'] == [64, 128]
+        assert result['10.0.0.5']['port_profile'] == name
+
+
+class TestReportSuspectedHoneypots:
+    """Unit tests for _report_suspected_honeypots()."""
+
+    def test_writes_ttl_spread_line_and_warns(self, tmp_path, capsys):
+        flagged = {'10.0.0.1': {'ttl_spread': [64, 128]}}
+        _report_suspected_honeypots(flagged, str(tmp_path))
+        content = (tmp_path / 'suspected_honeypots.txt').read_text()
+        assert '10.0.0.1,ttl_spread,64|128' in content
+        out = capsys.readouterr().out
+        assert '10.0.0.1' in out
+
+    def test_writes_port_profile_line(self, tmp_path):
+        flagged = {'10.0.0.2': {'port_profile': 'Thinkst Canary'}}
+        _report_suspected_honeypots(flagged, str(tmp_path))
+        content = (tmp_path / 'suspected_honeypots.txt').read_text()
+        assert '10.0.0.2,port_profile,Thinkst Canary' in content
+
+    def test_both_signals_write_two_lines(self, tmp_path):
+        flagged = {'10.0.0.3': {'ttl_spread': [64, 128], 'port_profile': 'Artillery'}}
+        _report_suspected_honeypots(flagged, str(tmp_path))
+        content = (tmp_path / 'suspected_honeypots.txt').read_text()
+        assert content.count('10.0.0.3,') == 2
+
+    def test_empty_flagged_writes_nothing(self, tmp_path):
+        _report_suspected_honeypots({}, str(tmp_path))
+        assert not (tmp_path / 'suspected_honeypots.txt').exists()
 
 
 # ── TestSMBCoupling ────────────────────────────────────────────────────────────

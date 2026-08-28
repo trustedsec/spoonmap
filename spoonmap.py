@@ -1918,6 +1918,122 @@ def _report_suspected_tarpits(suspected, disc):
     _atomic_write(tarpit_file, ''.join(lines))
 
 
+def _ttl_spread_by_host(masscan_dir):
+    """Return {ip: sorted distinct reason_ttl values} for hosts whose open
+    TCP ports report more than one distinct TTL in masscan's own XML output.
+
+    One host has one TCP/IP stack; every open port on a real host reports the
+    same TTL. More than one value across a host's ports is characteristic of
+    several emulated listeners behind one address (honeyd, T-Pot's per-service
+    containers) rather than a single machine. NAT/load-balancing can also
+    produce this pattern, so this signal alone is deliberately never enough to
+    reach HIGH severity -- see _honeypot_severity().
+    """
+    ttls_by_ip = {}
+    if not os.path.exists(masscan_dir):
+        return {}
+    for fname in sorted(os.listdir(masscan_dir)):
+        if not fname.endswith('.xml'):
+            continue
+        try:
+            root = etree.parse(os.path.join(masscan_dir, fname))
+        except etree.ParseError:
+            continue
+        for host in root.findall('host'):
+            addr_elem = host.find("address[@addrtype='ipv4']")
+            ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
+            if not ip:
+                continue
+            ports_elem = host.find('ports')
+            if ports_elem is None:
+                continue
+            port_elem = ports_elem.find('port')
+            if port_elem is None or port_elem.attrib.get('protocol') == 'udp':
+                continue
+            state_elem = port_elem.find('state')
+            if state_elem is None:
+                continue
+            ttl_text = state_elem.attrib.get('reason_ttl')
+            if ttl_text is None:
+                continue
+            try:
+                ttl = int(ttl_text)
+            except ValueError:
+                continue
+            ttls_by_ip.setdefault(ip, set()).add(ttl)
+    return {ip: sorted(ttls) for ip, ttls in ttls_by_ip.items() if len(ttls) > 1}
+
+
+def _port_profile_match(open_ports):
+    """Return the matching product name when open_ports is a superset of a
+    known honeypot deployment's default port profile, else None."""
+    port_set = set(open_ports)
+    for name, profile in HONEYPOT_PORT_PROFILES.items():
+        if profile <= port_set:
+            return name
+    return None
+
+
+def _flag_honeypot_signals(port_ips, masscan_dir):
+    """Return {ip: {'ttl_spread': [...], 'port_profile': name}} for hosts
+    matching either the TTL-inconsistency or known-port-profile heuristic.
+
+    TTL spread is read back from masscan_dir's XML files (reason_ttl is not
+    threaded through port_ips's in-memory {port_key: {ips}} shape); port
+    profile matching reuses port_ips directly since it already has the
+    per-host open-port set this needs, at zero extra I/O.
+    """
+    flagged = {}
+
+    for ip, ttls in _ttl_spread_by_host(masscan_dir).items():
+        flagged.setdefault(ip, {})['ttl_spread'] = ttls
+
+    hosts_ports = {}
+    for port_key, ips in port_ips.items():
+        if port_key.startswith('U:'):
+            continue
+        for ip in ips:
+            hosts_ports.setdefault(ip, set()).add(port_key)
+    for ip, ports in hosts_ports.items():
+        match = _port_profile_match(ports)
+        if match:
+            flagged.setdefault(ip, {})['port_profile'] = match
+
+    return flagged
+
+
+def _report_suspected_honeypots(flagged, disc):
+    """Persist TTL-spread/port-profile flagged hosts to
+    disc/suspected_honeypots.txt and warn on stdout.
+
+    One line per (ip, signal) pair -- a host can carry both signals -- so the
+    format mirrors _report_suspected_tarpits() but is not a straight port:
+    'ip,ttl_spread,64|128' or 'ip,port_profile,Thinkst Canary'.
+    """
+    if not flagged:
+        return
+    honeypot_file = os.path.join(disc, 'suspected_honeypots.txt')
+    lines = []
+    for ip in sorted(flagged, key=_ip_sort_key):
+        signals = flagged[ip]
+        if 'ttl_spread' in signals:
+            ttl_str = '|'.join(str(t) for t in signals['ttl_spread'])
+            lines.append(f'{ip},ttl_spread,{ttl_str}\n')
+            print(_COLOR_ERROR
+                  + f'Warning: {ip} returned inconsistent TTLs ({ttl_str}) across '
+                  + 'scanned ports — possible multiple emulated services behind one '
+                  + 'address.'
+                  + _COLOR_RESET)
+        if 'port_profile' in signals:
+            product = signals['port_profile']
+            lines.append(f'{ip},port_profile,{product}\n')
+            print(_COLOR_ERROR
+                  + f'Warning: {ip}\'s open ports match the known deployment profile '
+                  + f'of {product} — possible decoy host.'
+                  + _COLOR_RESET)
+    _atomic_write(honeypot_file, ''.join(lines))
+
+
 def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file, batch_size=1, resume=False, discovery_file=None, target_scan='Internal'):
     status_summary = '\nSummary'
 
@@ -1996,6 +2112,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                         status_summary += status_update
                         print(_COLOR_PROGRESS + status_update + _COLOR_RESET)
             _report_suspected_tarpits(_flag_suspected_tarpits(full_results, 65535), disc)
+            _report_suspected_honeypots(_flag_honeypot_signals(full_results, f'{disc}/masscan_results'), disc)
             # This path's results are read straight back off disk, so it is the
             # most exposed to a live_hosts/ directory left over from a wider scope.
             _report_out_of_scope_retained(full_results, scope_ranges, target_file)
@@ -2048,6 +2165,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             status_summary += status_update
             print(_COLOR_PROGRESS + status_update + _COLOR_RESET)
         _report_suspected_tarpits(_flag_suspected_tarpits(full_results, 65535), disc)
+        _report_suspected_honeypots(_flag_honeypot_signals(full_results, f'{disc}/masscan_results'), disc)
         # Retaining cached hosts means this path can now carry a host from a
         # previous, wider engagement scope, exactly as the resume path can, so it
         # owes the operator the same disclosure.
@@ -2322,6 +2440,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             _print_completion_status('Masscan', batch_idx + 1, total_batches, scan_start_time)
 
     _report_suspected_tarpits(_flag_suspected_tarpits(port_ips, len(tcp_ports)), disc)
+    _report_suspected_honeypots(_flag_honeypot_signals(port_ips, f'{disc}/masscan_results'), disc)
 
     # ── SMB port coupling ─────────────────────────────────────────────────────
     smb_in_scope = [p for p in _SMB_COUPLED_PORTS if p in set(dest_ports)]
@@ -2955,6 +3074,20 @@ SLOW_PORTS = frozenset({
 HONEYPOT_MIN_PORTS_SCANNED = 10      # need enough sample size to trust the ratio
 HONEYPOT_OPEN_PORT_FRACTION = 0.9    # fraction of scanned TCP ports found open on one host
 HONEYPOT_MIN_UNMATCHED_PORTS = 3     # open ports with an unidentified (servicefp) response
+
+# Port sets characteristic of known deception/decoy tooling default
+# deployments. Superset match, not exact: an operator-customised deployment
+# (an extra port, or unrelated services sharing the box) should still match
+# on its known baseline.
+#
+# NOTE: these are placeholders pending verification against current upstream
+# defaults before shipping -- both projects' default port lists can change
+# between releases and installs are commonly customised. Verify against each
+# project's current documentation/config before relying on this in a report.
+HONEYPOT_PORT_PROFILES = {
+    'Thinkst Canary': frozenset(['21', '22', '23', '80', '443', '445', '3389']),
+    'Artillery':       frozenset(['21', '22', '23', '25', '80', '443', '3306', '3389', '8080']),
+}
 
 # Scripts run on EXTERNAL scans only
 EXTERNAL_PORT_SCRIPTS = {
