@@ -3683,6 +3683,47 @@ def _count_silent_open_ports(output_path):
     return counts
 
 
+# Well-known *default, unconfigured* banners of common honeypot/decoy
+# products, matched against the concatenated product/version/extrainfo text
+# nmap's -sV already captures.
+#
+# NOTE: these are placeholders pending verification against current upstream
+# defaults before shipping -- both signature strings and default configs can
+# drift between releases. Verify against each project's current source/docs
+# before relying on this in a report.
+HONEYPOT_SIGNATURES = (
+    ('OpenSSH 6.0p1 Debian-4+deb7u2', 'Cowrie/Kippo SSH Honeypot'),
+    ('Welcome to the ftp service', 'Dionaea FTP Honeypot'),
+)
+
+
+def _honeypot_signature_match(text):
+    """Return the matching product name when text contains a known
+    default/unconfigured honeypot banner, else None."""
+    for needle, product in HONEYPOT_SIGNATURES:
+        if needle in text:
+            return product
+    return None
+
+
+def _named_honeypot_matches(output_path):
+    """Return {ip: product_name} for hosts whose -sV service banner matches
+    a known default honeypot signature. First match wins per host."""
+    matches = {}
+    for ip, service_elem in _iter_open_tcp_ports(output_path):
+        if ip in matches or service_elem is None:
+            continue
+        attrib = service_elem.attrib
+        text = ' '.join(filter(None, (
+            attrib.get('product'), attrib.get('version'), attrib.get('extrainfo'))))
+        if not text:
+            continue
+        product = _honeypot_signature_match(text)
+        if product:
+            matches[ip] = product
+    return matches
+
+
 def generate_findings(output_path, target_scan, snmp_any_validated=None):
     """Parse nmap script output and write findings.txt and findings.md."""
     nmap_dir = f'{output_path}/nse_results'

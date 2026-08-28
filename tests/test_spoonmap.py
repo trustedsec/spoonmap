@@ -28,6 +28,7 @@ from spoonmap import (
     HONEYPOT_MIN_PORTS_SCANNED,
     HONEYPOT_OPEN_PORT_FRACTION,
     HONEYPOT_PORT_PROFILES,
+    HONEYPOT_SIGNATURES,
     HOST_DISCOVERY_NMAP_THRESHOLD,
     INTERNAL_DISCOVERY_MAX_RATE,
     INTERNAL_DISCOVERY_STATE_CEILING,
@@ -81,6 +82,8 @@ from spoonmap import (
     _external_host_discovery,
     _flag_honeypot_signals,
     _flag_suspected_tarpits,
+    _honeypot_signature_match,
+    _named_honeypot_matches,
     _nmap_host_discovery,
     _port_profile_match,
     _report_suspected_honeypots,
@@ -2010,6 +2013,80 @@ class TestCountSilentOpenPorts:
             (nmap_results / f'port{port}.xml').write_text(
                 self._xml('10.0.0.7', port, service_attrs=None))
         assert _count_silent_open_ports(str(tmp_path)) == {'10.0.0.7': 3}
+
+
+class TestHoneypotSignatureMatch:
+    """Unit tests for _honeypot_signature_match()."""
+
+    def test_known_signature_matches(self):
+        needle, product = HONEYPOT_SIGNATURES[0]
+        assert _honeypot_signature_match(f'prefix {needle} suffix') == product
+
+    def test_unrelated_text_no_match(self):
+        assert _honeypot_signature_match('OpenSSH 9.6p1 Ubuntu') is None
+
+    def test_empty_text_no_match(self):
+        assert _honeypot_signature_match('') is None
+
+
+class TestNamedHoneypotMatches:
+    """Unit tests for _named_honeypot_matches()."""
+
+    def _xml(self, ip, port, product=None, version=None, extrainfo=None):
+        attrs = []
+        if product is not None:
+            attrs.append(f'product="{product}"')
+        if version is not None:
+            attrs.append(f'version="{version}"')
+        if extrainfo is not None:
+            attrs.append(f'extrainfo="{extrainfo}"')
+        service_elem = f'<service {" ".join(attrs)}/>' if attrs else ''
+        return (
+            '<?xml version="1.0"?><nmaprun>'
+            f'<host><address addr="{ip}" addrtype="ipv4"/>'
+            f'<ports><port protocol="tcp" portid="{port}">'
+            f'<state state="open"/>{service_elem}'
+            '</port></ports></host></nmaprun>'
+        )
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert _named_honeypot_matches(str(tmp_path)) == {}
+
+    def test_signature_match_across_product_version_extrainfo(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        needle, product = HONEYPOT_SIGNATURES[0]
+        parts = needle.split(' ', 1)
+        prod_val = parts[0]
+        rest = parts[1] if len(parts) > 1 else ''
+        xml = self._xml('10.0.0.1', '22', product=prod_val, version=rest)
+        (nmap_results / 'port22.xml').write_text(xml)
+        assert _named_honeypot_matches(str(tmp_path)) == {'10.0.0.1': product}
+
+    def test_no_service_element_no_match(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        (nmap_results / 'port22.xml').write_text(self._xml('10.0.0.2', '22'))
+        assert _named_honeypot_matches(str(tmp_path)) == {}
+
+    def test_unrelated_service_no_match(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.3', '22', product='OpenSSH', version='9.6p1')
+        (nmap_results / 'port22.xml').write_text(xml)
+        assert _named_honeypot_matches(str(tmp_path)) == {}
+
+    def test_first_match_wins_per_host(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        needle, product = HONEYPOT_SIGNATURES[0]
+        parts = needle.split(' ', 1)
+        xml = self._xml('10.0.0.4', '22', product=parts[0],
+                         version=parts[1] if len(parts) > 1 else '')
+        (nmap_results / 'port22.xml').write_text(xml)
+        xml2 = self._xml('10.0.0.4', '80', product='OpenSSH', version='9.6p1')
+        (nmap_results / 'port80.xml').write_text(xml2)
+        assert _named_honeypot_matches(str(tmp_path)) == {'10.0.0.4': product}
 
 
 class TestGenerateFindingsHoneypot:
