@@ -3478,19 +3478,17 @@ def _classify_sql(hostname, ms_sql_output='', azure_output=''):
     return False, None, year
 
 
-def _count_unmatched_service_ports(output_path):
-    """Return {ip: count} of open TCP ports whose nmap -sV probe captured data
-    that matched none of nmap's service signatures.
+def _iter_open_tcp_ports(output_path):
+    """Yield (ip, service_elem) for every open TCP port in nmap_results/*.xml.
 
-    nmap only sets the service element's servicefp attribute when it connected,
-    read data back, and failed to identify it against any known protocol —
-    a strong tell for decoy tools (e.g. Artillery) that hand back a random
-    string on every full connect instead of speaking a real protocol.
+    service_elem is None when nmap recorded no <service> element at all.
+    Shared by _count_unmatched_service_ports() and _count_silent_open_ports()
+    so the XML-walk defensiveness (skip a host with no addr, skip malformed
+    XML, skip UDP files) lives in one place instead of being duplicated.
     """
     nmap_dir = f'{output_path}/nmap_results'
-    counts = {}
     if not os.path.exists(nmap_dir):
-        return counts
+        return
     for fname in sorted(os.listdir(nmap_dir)):
         if not fname.endswith('.xml') or fname.startswith('portU_'):
             continue
@@ -3511,9 +3509,43 @@ def _count_unmatched_service_ports(output_path):
                 state_elem = port_elem.find('state')
                 if state_elem is not None and state_elem.attrib.get('state') != 'open':
                     continue
-                service_elem = port_elem.find('service')
-                if service_elem is not None and service_elem.attrib.get('servicefp'):
-                    counts[ip] = counts.get(ip, 0) + 1
+                yield ip, port_elem.find('service')
+
+
+def _count_unmatched_service_ports(output_path):
+    """Return {ip: count} of open TCP ports whose nmap -sV probe captured data
+    that matched none of nmap's service signatures.
+
+    nmap only sets the service element's servicefp attribute when it connected,
+    read data back, and failed to identify it against any known protocol —
+    a strong tell for decoy tools (e.g. Artillery) that hand back a random
+    string on every full connect instead of speaking a real protocol.
+    """
+    counts = {}
+    for ip, service_elem in _iter_open_tcp_ports(output_path):
+        if service_elem is not None and service_elem.attrib.get('servicefp'):
+            counts[ip] = counts.get(ip, 0) + 1
+    return counts
+
+
+def _count_silent_open_ports(output_path):
+    """Return {ip: count} of open TCP ports where nmap's -sV probe got
+    nothing at all back — no service name, no product, no servicefp.
+
+    Complements _count_unmatched_service_ports(), which only counts ports
+    where nmap connected and read *some* data that failed to match a
+    signature (servicefp set). A tarpit that holds the connection open and
+    sends nothing back scores zero on that check but is exactly what this
+    one is for.
+    """
+    counts = {}
+    for ip, service_elem in _iter_open_tcp_ports(output_path):
+        if service_elem is None:
+            counts[ip] = counts.get(ip, 0) + 1
+            continue
+        attrib = service_elem.attrib
+        if not attrib.get('name') and not attrib.get('product') and not attrib.get('servicefp'):
+            counts[ip] = counts.get(ip, 0) + 1
     return counts
 
 

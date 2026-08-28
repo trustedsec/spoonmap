@@ -39,6 +39,7 @@ from spoonmap import (
     _classify_sql,
     _config_int,
     _count_hosts_in_file,
+    _count_silent_open_ports,
     _count_unmatched_service_ports,
     _external_exposure_scripts,
     _format_eta,
@@ -1900,6 +1901,85 @@ class TestCountUnmatchedServicePorts:
         )
         (nmap_results / 'port9999.xml').write_text(xml)
         assert _count_unmatched_service_ports(str(tmp_path)) == {'10.0.0.8': 1}
+
+
+class TestCountSilentOpenPorts:
+    """Unit tests for _count_silent_open_ports()."""
+
+    def _xml(self, ip, port, protocol='tcp', state='open', service_attrs=None):
+        service_elem = ''
+        if service_attrs is not None:
+            attrs = ' '.join(f'{k}="{v}"' for k, v in service_attrs.items())
+            service_elem = f'<service {attrs}/>'
+        return (
+            '<?xml version="1.0"?><nmaprun>'
+            f'<host><address addr="{ip}" addrtype="ipv4"/>'
+            f'<ports><port protocol="{protocol}" portid="{port}">'
+            f'<state state="{state}"/>{service_elem}'
+            '</port></ports></host></nmaprun>'
+        )
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_no_service_element_at_all_is_silent(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        (nmap_results / 'port9999.xml').write_text(self._xml('10.0.0.1', '9999', service_attrs=None))
+        assert _count_silent_open_ports(str(tmp_path)) == {'10.0.0.1': 1}
+
+    def test_service_with_no_name_product_or_fp_is_silent(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.2', '9999', service_attrs={})
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {'10.0.0.2': 1}
+
+    def test_matched_service_not_silent(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.3', '22', service_attrs={'name': 'ssh', 'product': 'OpenSSH'})
+        (nmap_results / 'port22.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_unmatched_fingerprint_not_silent(self, tmp_path):
+        # servicefp means *something* came back -- this is
+        # _count_unmatched_service_ports()'s signal, not this one's.
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.4', '9999', service_attrs={
+            'name': 'unknown', 'servicefp': 'SF-Port9999-TCP:...',
+        })
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_closed_port_not_counted(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.5', '9999', state='closed', service_attrs=None)
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_udp_files_skipped(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.6', '53', protocol='udp', service_attrs=None)
+        (nmap_results / 'portU_53.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_malformed_xml_skipped(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        (nmap_results / 'port80.xml').write_text('<nmaprun><host>')
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_multiple_silent_ports_same_host_aggregate(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        for port in ('2222', '3333', '4444'):
+            (nmap_results / f'port{port}.xml').write_text(
+                self._xml('10.0.0.7', port, service_attrs=None))
+        assert _count_silent_open_ports(str(tmp_path)) == {'10.0.0.7': 3}
 
 
 class TestGenerateFindingsHoneypot:
