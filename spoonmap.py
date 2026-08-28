@@ -1986,7 +1986,19 @@ def _flag_honeypot_signals(port_ips, masscan_dir):
     """
     flagged = {}
 
-    for ip, ttls in _ttl_spread_by_host(masscan_dir).items():
+    # masscan_results/ can be unreadable for reasons that have nothing to do
+    # with this signal -- most commonly a directory left root-owned by an
+    # earlier sudo run and read back by a later non-root --resume. This runs
+    # near the end of mass_scan(), after every batch has completed, so an
+    # OSError escaping here would unwind mass_scan() and main() and discard a
+    # finished scan's entire aggregation over an advisory heuristic. Degrade to
+    # no TTL-spread signal instead; the port-profile half below reads only
+    # in-memory data and is unaffected.
+    try:
+        ttl_spread = _ttl_spread_by_host(masscan_dir)
+    except OSError:
+        ttl_spread = {}
+    for ip, ttls in ttl_spread.items():
         flagged.setdefault(ip, {})['ttl_spread'] = ttls
 
     hosts_ports = {}
@@ -2003,6 +2015,31 @@ def _flag_honeypot_signals(port_ips, masscan_dir):
     return flagged
 
 
+def _scope_filtered_flags(flagged, scope_ranges):
+    """Return *flagged* with every out-of-scope host removed.
+
+    _flag_honeypot_signals() draws on data that can outlive the current
+    authorisation: port_ips/full_results are unioned with cached
+    ``live_hosts/portN.txt`` files that a narrowed ``ranges.txt`` deliberately
+    never prunes, and _ttl_spread_by_host() walks every XML file still sitting
+    in ``masscan_results/`` from an even wider set of earlier runs.  That is
+    harmless for the Stage 1 signals, which only read and disclose -- but the
+    Stage 2 active confirmation probe *sends packets*, so it must never be
+    handed a host this engagement is not authorised to touch.  Filter here, at
+    the call site, ahead of _confirm_flagged_honeypots().
+
+    An empty *scope_ranges* is permissive and returns *flagged* unchanged,
+    matching _report_out_of_scope_retained(): an absent or unparseable
+    target_file means there is no authorisation record to compare against, so
+    nothing is claimed either way rather than silently disabling a feature the
+    operator turned on.
+    """
+    if not scope_ranges:
+        return flagged
+    return {ip: signals for ip, signals in flagged.items()
+            if _ip_in_ranges(ip, scope_ranges)}
+
+
 def _report_suspected_honeypots(flagged, disc):
     """Persist TTL-spread/port-profile flagged hosts to
     disc/suspected_honeypots.txt and warn on stdout.
@@ -2010,9 +2047,16 @@ def _report_suspected_honeypots(flagged, disc):
     One line per (ip, signal) pair -- a host can carry both signals -- so the
     format mirrors _report_suspected_tarpits() but is not a straight port:
     'ip,ttl_spread,64|128' or 'ip,port_profile,Thinkst Canary'.
+
+    The file is written unconditionally, so an empty result truncates it.  This
+    diverges from _report_suspected_tarpits(), which still returns early and
+    leaves a stale file in place -- deliberately, because generate_findings()
+    now *counts* signals to pick HIGH/MEDIUM/LOW.  A leftover line from an
+    earlier, broader run used to be a merely redundant reason string; it now
+    inflates a later, narrower run's severity, and nothing else on disk would
+    show why.  Truncating is the only way a signal that stopped firing stops
+    being scored.
     """
-    if not flagged:
-        return
     honeypot_file = os.path.join(disc, 'suspected_honeypots.txt')
     lines = []
     for ip in sorted(flagged, key=_ip_sort_key):
@@ -2137,9 +2181,15 @@ def _maybe_confirm_honeypot(enabled, ip, probe_ports, connector=None):
 
 def _report_confirmed_honeypots(confirmed_ips, disc):
     """Persist actively-confirmed decoy hosts to disc/confirmed_honeypots.txt
-    and warn on stdout."""
-    if not confirmed_ips:
-        return
+    and warn on stdout.
+
+    Written unconditionally, so an empty result truncates it -- same reasoning
+    as _report_suspected_honeypots(), and more acute here: a stale line pins
+    generate_findings() at HIGH *and* makes the deliverable assert "active
+    confirmation probe: host answered ..." for a probe that did not run this
+    time at all, which is exactly what happens when an operator turns
+    honeypot_active_confirm back off.
+    """
     confirmed_file = os.path.join(disc, 'confirmed_honeypots.txt')
     lines = []
     for ip in sorted(confirmed_ips, key=_ip_sort_key):
@@ -2159,8 +2209,20 @@ def _confirm_flagged_honeypots(flagged, enabled, dest_ports, disc, connector=Non
     _active_confirm_probe() and is injectable for testing, so the
     enabled=True path can be exercised with a fake connector instead of a
     real socket connection or internals-patching.
+
+    The enabled check happens *here*, not only inside _maybe_confirm_honeypot():
+    _select_confirm_probe_ports() builds and samples a ~16k-element candidate
+    set per host, and enabled=False is the default and overwhelmingly common
+    case, so doing that work only to discard it was pure waste on every scan
+    that flagged anything.  _report_confirmed_honeypots() is still called on
+    that path -- with an empty set, which truncates any stale
+    confirmed_honeypots.txt.  Skipping it would leave a previous run's
+    confirmations feeding generate_findings()'s severity math after the
+    operator turned the probe back off, which is the precise scenario that file
+    truncation exists to prevent.
     """
-    if not flagged:
+    if not flagged or not enabled:
+        _report_confirmed_honeypots(set(), disc)
         return
     confirmed = set()
     for ip in flagged:
@@ -2250,7 +2312,11 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             _report_suspected_tarpits(_flag_suspected_tarpits(full_results, 65535), disc)
             honeypot_flags = _flag_honeypot_signals(full_results, f'{disc}/masscan_results')
             _report_suspected_honeypots(honeypot_flags, disc)
-            _confirm_flagged_honeypots(honeypot_flags, honeypot_active_confirm, dest_ports, disc)
+            # Scope-filter before the probe: this is the only honeypot signal
+            # that sends packets, and honeypot_flags can carry hosts from a
+            # prior, wider engagement (see _scope_filtered_flags).
+            _confirm_flagged_honeypots(_scope_filtered_flags(honeypot_flags, scope_ranges),
+                                       honeypot_active_confirm, dest_ports, disc)
             # This path's results are read straight back off disk, so it is the
             # most exposed to a live_hosts/ directory left over from a wider scope.
             _report_out_of_scope_retained(full_results, scope_ranges, target_file)
@@ -2305,7 +2371,9 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         _report_suspected_tarpits(_flag_suspected_tarpits(full_results, 65535), disc)
         honeypot_flags = _flag_honeypot_signals(full_results, f'{disc}/masscan_results')
         _report_suspected_honeypots(honeypot_flags, disc)
-        _confirm_flagged_honeypots(honeypot_flags, honeypot_active_confirm, dest_ports, disc)
+        # Scope-filter before the probe -- see _scope_filtered_flags().
+        _confirm_flagged_honeypots(_scope_filtered_flags(honeypot_flags, scope_ranges),
+                                   honeypot_active_confirm, dest_ports, disc)
         # Retaining cached hosts means this path can now carry a host from a
         # previous, wider engagement scope, exactly as the resume path can, so it
         # owes the operator the same disclosure.
@@ -2582,7 +2650,9 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
     _report_suspected_tarpits(_flag_suspected_tarpits(port_ips, len(tcp_ports)), disc)
     honeypot_flags = _flag_honeypot_signals(port_ips, f'{disc}/masscan_results')
     _report_suspected_honeypots(honeypot_flags, disc)
-    _confirm_flagged_honeypots(honeypot_flags, honeypot_active_confirm, dest_ports, disc)
+    # Scope-filter before the probe -- see _scope_filtered_flags().
+    _confirm_flagged_honeypots(_scope_filtered_flags(honeypot_flags, scope_ranges),
+                               honeypot_active_confirm, dest_ports, disc)
 
     # ── SMB port coupling ─────────────────────────────────────────────────────
     smb_in_scope = [p for p in _SMB_COUPLED_PORTS if p in set(dest_ports)]
@@ -3847,14 +3917,33 @@ def _count_silent_open_ports(output_path):
 # products, matched against the concatenated product/version/extrainfo text
 # nmap's -sV already captures.
 #
-# NOTE: these are placeholders pending verification against current upstream
-# defaults before shipping -- both signature strings and default configs can
-# drift between releases. Verify against each project's current source/docs
-# before relying on this in a report.
-HONEYPOT_SIGNATURES = (
-    ('OpenSSH 6.0p1 Debian-4+deb7u2', 'Cowrie/Kippo SSH Honeypot'),
-    ('Welcome to the ftp service', 'Dionaea FTP Honeypot'),
-)
+# DELIBERATELY EMPTY. This ships with no generic banner signatures. Two
+# candidates (Cowrie/Kippo and Dionaea) were carried here during development
+# and both were verified *incorrect* against nmap's actual output in final
+# review, so they were removed rather than patched in place:
+#
+#   - Cowrie/Kippo: the needle used a hyphen ('OpenSSH 6.0p1 Debian-4+deb7u2'),
+#     but nmap's own nmap-service-probes match template for that banner renders
+#     it with a space ('... Debian 4+deb7u2'), so it could never fire. The
+#     superficial fix -- swap the hyphen for a space -- is strictly worse:
+#     nmap applies that same space-insertion to *every* genuine Debian OpenSSH
+#     host, so the "fixed" signature would report HIGH-severity honeypot on one
+#     of the most common SSH banners on the internet.
+#   - Dionaea: the needle ('Welcome to the ftp service') is an unrecognised
+#     banner, which nmap records in the service element's `servicefp`
+#     attribute. _named_honeypot_matches() reads only product/version/extrainfo,
+#     so no such string can ever reach the matcher.
+#
+# The mechanism below (this tuple, _honeypot_signature_match(),
+# _named_honeypot_matches()) is kept as the extensibility point so a future
+# verified signature is a one-line addition rather than a re-thread of the
+# whole path. Add an entry here ONLY after confirming it against real `-sV`
+# output from the product in question -- not against a synthetic test fixture,
+# which is exactly what let both removed entries look correct for so long.
+# The one named-product match this release does ship is the independently
+# source-verified Heralding VNC tell in _vnc_heralding_match(), which does not
+# use this table at all.
+HONEYPOT_SIGNATURES = ()
 
 
 def _honeypot_signature_match(text):
@@ -4063,9 +4152,13 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                                         f'TCP responses observed with inconsistent TTLs '
                                         f'({value}) across scanned ports on one host')
                         elif sig_type == 'port_profile':
+                            # The caveat is load-bearing: HONEYPOT_PORT_PROFILES
+                            # is still an unverified placeholder table, and this
+                            # string lands verbatim in an engagement deliverable.
                             _add_signal(ip, 'port_profile',
-                                        f'open port set matches the known deployment '
-                                        f'profile of {value}')
+                                        f'open port set matches a candidate port '
+                                        f'profile for {value} (unverified against '
+                                        f'current upstream defaults)')
         except OSError:
             pass
 
