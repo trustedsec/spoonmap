@@ -298,9 +298,20 @@ behind one address, though NAT/load-balancing can produce the same pattern,
 which is why this signal alone is capped at LOW and can never alone reach
 HIGH); known port-profile matching against `HONEYPOT_PORT_PROFILES`
 (Thinkst Canary, Artillery — placeholders pending verification against
-current upstream defaults); named-product signature matching against
-`HONEYPOT_SIGNATURES` (Cowrie/Kippo, Dionaea default banners — same
-verification caveat) via the -sV service data already captured; a
+current upstream defaults — the finding's own reason text carries that
+caveat verbatim, since it lands in an engagement deliverable); generic
+named-product signature matching against `HONEYPOT_SIGNATURES` via the -sV
+service data already captured, **which ships EMPTY in this release** — the
+two development-era entries (Cowrie/Kippo, Dionaea) were both verified
+incorrect against nmap's real output in final review and removed rather than
+patched, so there are no active generic signatures and the mechanism
+(`_honeypot_signature_match()`, `_named_honeypot_matches()`) is retained
+purely as an extensibility point for future entries verified against real
+`-sV` output rather than a synthetic fixture (the reasons are recorded at
+the tuple itself; the short version is that the Cowrie needle's hyphen can
+never match nmap's space-rendered template, and "fixing" it would
+false-positive HIGH on every ordinary Debian OpenSSH host, while the Dionaea
+needle only ever appears in `servicefp`, a field the matcher never reads); a
 source-verified Heralding VNC honeypot tell (`_vnc_heralding_match()`,
 Task 3 Step 7 — vnc-info reporting RFB protocol 3.7 with no security-type
 list, since Heralding's VNC capability hardcodes that exact version and
@@ -313,7 +324,9 @@ data came back and failed to match, so a LaBrea-style silent host previously
 scored zero on that check alone. `_iter_open_tcp_ports()` is the shared,
 per-element-defensive XML walk both nmap-side counters and the signature
 matcher use, factored out of what was originally
-`_count_unmatched_service_ports()`'s own walk. Severity is HIGH for a named
+`_count_unmatched_service_ports()`'s own walk. With `HONEYPOT_SIGNATURES`
+empty, the Heralding VNC tell is the only named-product match this release
+can produce. Severity is HIGH for a named
 signature match or an active-probe confirmation, MEDIUM for two or more
 heuristic signals together, LOW for exactly one — a behavior change from the
 single flat MEDIUM this finding used to emit unconditionally. An optional
@@ -321,8 +334,10 @@ active confirmation probe (`_active_confirm_probe()`) attempts a raw TCP
 connect against a handful of high, never-scanned ports
 (`_select_confirm_probe_ports()`, deterministic per-IP via a seeded
 `random.Random(ip)` rather than global randomness, so it is reproducible and
-testable) on any flagged host; a real host has no reason to answer on an
-ephemeral port outside the scan, so an answer is treated as confirmation.
+testable) on any host flagged by the TTL-spread or port-profile signals —
+**not** on a host flagged only by the older tarpit-ratio heuristic, which
+feeds the finding but never the probe; a real host has no reason to answer on
+an ephemeral port outside the scan, so an answer is treated as confirmation.
 This is the one signal that sends new traffic, so it is gated behind
 `honeypot_active_confirm` in config.json — default false, absent means
 false, no interactive prompt of its own — mirroring `check_for_updates`'s
@@ -337,4 +352,37 @@ that pattern.) `discovery/suspected_honeypots.txt` (Stage 1: TTL spread and
 port-profile hits, one line per `(ip, signal)` pair) and
 `discovery/confirmed_honeypots.txt` (Stage 2: active-probe confirmations)
 are new sibling files to the existing `discovery/suspected_tarpits.txt`,
-read back the same defensively-parsed way in `generate_findings()`.
+read back the same defensively-parsed way in `generate_findings()`. Unlike
+`suspected_tarpits.txt`, both of those are written **unconditionally** — an
+empty result truncates the file rather than leaving the previous run's
+content in place. That divergence is deliberate: severity is now computed by
+*counting* signals, so a stale line from an earlier, broader run silently
+inflates a later, narrower run's severity, and a stale
+`confirmed_honeypots.txt` line additionally makes the deliverable assert
+"host answered on a port never scanned open" for a probe that did not run
+this time at all (exactly what happens when the operator turns
+`honeypot_active_confirm` back off). The `enabled` check happens in
+`_confirm_flagged_honeypots()` itself, ahead of the per-host loop, so the
+common disabled case skips `_select_confirm_probe_ports()`'s candidate-set
+work entirely — but that path still truncates the file rather than returning
+outright, for the reason just given. Every host handed to the probe is first
+run through `_scope_filtered_flags()` against the current `target_file`,
+since the probe is the only honeypot signal that *sends packets* and the
+flag dict is built from cached `live_hosts/` and `masscan_results/` data
+that a narrowed `ranges.txt` deliberately never prunes; an empty/unparseable
+scope is permissive, matching `_report_out_of_scope_retained()`.
+
+**Three limitations an operator enabling `honeypot_active_confirm` needs to
+know.** (1) On a **Full** scan (`dest_ports == ['1-65535']`) essentially every
+ephemeral port has already been scanned, so `_select_confirm_probe_ports()`
+finds few or zero unscanned candidates and the probe effectively does
+nothing — silently, with no message either way. (2) **All** honeypot
+detection, Stage 1 signals and the active probe alike, lives inside
+`mass_scan()`; the alternate direct-nmap port-discovery path (taken for
+small/medium scans below the configured `nmap_threshold` work-unit ceiling)
+performs none of it. (3) Every signal in this feature only ever becomes a
+*finding* when `script_scan: true`, because `generate_findings()` returns
+immediately when `nse_results/` does not exist and the default is off — the
+Stage 1 stdout warnings and the `discovery/*.txt` files are still written
+either way, since those come from `mass_scan()`, not `generate_findings()`.
+None of the three is fixed in code; they are documented as-is.

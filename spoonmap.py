@@ -6038,11 +6038,17 @@ _CONFIG_DOCS = {
     'honeypot_active_confirm': [
         ('__honeypot_active_confirm_note__',
          'Optional. When true, SpooNMAP attempts a small number of raw TCP connects '
-         'against unscanned high ports on any host flagged as a suspected honeypot, '
-         'to confirm it. Default false, and absent means false: the tool sends no '
-         'traffic beyond the scan itself unless you turn this on. A confirmed host '
-         'answered a port that was never part of this scan, which is a strong tell '
-         'that it accepts every connection rather than running a real service.'),
+         'against unscanned high ports on any host flagged by the TTL-spread or '
+         'port-profile signals, to confirm it. Hosts flagged only by the tarpit '
+         'open-port-ratio heuristic are not probed. Default false, and absent means '
+         'false: the tool sends no traffic beyond the scan itself unless you turn '
+         'this on. A confirmed host answered a port that was never part of this '
+         'scan, which is a strong tell that it accepts every connection rather than '
+         'running a real service. Limitations: hosts outside target_file are never '
+         'probed; on a Full (1-65535) scan there are almost no unscanned ports left '
+         'to probe, so it does little or nothing; and honeypot detection as a whole '
+         'only runs on the masscan path, not the direct-nmap path used for scans '
+         'below nmap_threshold.'),
     ],
     'target_scan': [
         ('__target_scan_choices__',
