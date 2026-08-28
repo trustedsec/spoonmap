@@ -307,6 +307,7 @@ git update-index --no-skip-worktree ranges.txt
 | `nmap_threshold` | Integer | Work-unit threshold for tool selection (default: 5,000,000 — see below); prompted under "Tune advanced settings" |
 | `resume` | `"True"` / `"False"` | Skip completed port discovery on restart (default: False) |
 | `check_for_updates` | `"True"` / `"False"` | Contact api.github.com at startup to check for a newer release. Off unless set; see `--check-update` for a one-off check (default: False) |
+| `honeypot_active_confirm` | `"True"` / `"False"` | Actively confirm suspected decoy hosts with a few raw TCP connects to unscanned high ports. Off unless set; only probes in-scope hosts flagged by the TTL-spread or port-profile signals, and only on the masscan scan path (default: False) |
 | `__generated_by_prompts__` | String | Present only in a config the prompts wrote. While it is present, **[d]elete**/**[a]ppend** re-ask the options using this file's values as defaults; remove it to keep them fixed |
 
 Keys beginning and ending with `__` are documentation and are ignored by the loader, so you can annotate the file freely — a re-prompted run preserves them.
@@ -527,6 +528,7 @@ After scanning, `generate_findings()` parses all nmap XML results and produces s
 | HIGH | IKE Aggressive Mode with Pre-Shared Key (U:500, confirmed by `ike-version`) |
 | HIGH | RealVNC Authentication Bypass (CVE-2006-2369) (5900/5901, confirmed by `realvnc-auth-bypass`) |
 | HIGH | Service Exposed Externally (databases, RDP, SMB, SNMP, WebLogic, VNC, WSUS 8530/8531, etc. — external scan only) |
+| HIGH | Likely Honeypot / Decoy Host — named product match (Heralding VNC) or an active confirmation-probe answer |
 | MEDIUM | SMBv1 protocol enabled |
 | MEDIUM | Weak SSH algorithms (deprecated ciphers/MACs/KEX) |
 | MEDIUM | Java RMI registry exposed |
@@ -536,6 +538,8 @@ After scanning, `generate_findings()` parses all nmap XML results and produces s
 | MEDIUM | OpenAI-Compatible LLM API Unauthenticated (1234/1337/3000/8000, custom NSE — internal scan) |
 | MEDIUM | Gradio LLM Web UI Accessible (7860, custom NSE — internal scan) |
 | MEDIUM | KoboldCpp LLM API Unauthenticated (5001, custom NSE — internal scan) |
+| MEDIUM | Likely Honeypot / Decoy Host — two or more heuristic signals on one host |
+| LOW | Likely Honeypot / Decoy Host — exactly one heuristic signal (tarpit open-port ratio, TTL spread, port profile, unmatched fingerprints, or silent open ports) |
 | LOW | Anonymous FTP login (default LOW — review the share; escalate if it exposes sensitive data or is writable) |
 | LOW | FTP exposed externally (plaintext protocol — credentials/data in cleartext; use FTPS/SFTP) |
 | LOW | Telnet exposed externally (plaintext protocol — credentials/data in cleartext; use SSH) |

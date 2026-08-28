@@ -79,9 +79,11 @@ is exact-pinned in the `dev` group too (same reasoning as ruff — a bare `uvx
 --from` pin on bandit itself let its transitive dependencies float). `ruff
 format` is deliberately **not** adopted — reformatting the module and the
 11k-line test file would bury every future diff, and `E501` alone flags 288
-existing lines. The bandit baseline holds 32 reviewed findings (list-form
+existing lines. The bandit baseline holds 36 reviewed findings (list-form
 `subprocess` calls, `xml.etree` parsing of masscan/nmap output we invoked
-ourselves), so only a *new* finding fails; regenerate it deliberately and
+ourselves, and one deterministic-but-non-cryptographic `random.Random` seed
+for honeypot probe-port selection), so only a *new* finding fails; regenerate
+it deliberately and
 justify additions in the commit message rather than adding inline `# nosec`
 suppressions. `workflow-lint` runs `actionlint` (YAML/expression errors) and
 `zizmor` (Actions-specific security auditing — unpinned actions, script
@@ -286,4 +288,101 @@ Internal discovery runs a single masscan sweep (no source-port override) followe
 - **IPv4-only, enforced at the edges**: the tool scans IPv4 exclusively (masscan/nmap invocations, target expansion, and address sorting all assume it). IPv6 is rejected rather than half-supported, in two places. (1) `_build_discovery_target_file()`'s `_parse_ranges()` skips any entry `ipaddress.ip_network()` resolves to a non-v4 network and prints the offending file, line number, and content — previously the v6 bounds were stored silently and only surfaced hundreds of lines later as `AddressValueError: ... (>= 2**32)` from `summarize_address_range()`, and only when an exclusions file happened to be configured. (2) The masscan/discovery XML parsers (`_parse_masscan_ping_xml()`, `_parse_nmap_sn_xml()`, `_run_masscan_batch()`) select `address[@addrtype='ipv4']` instead of the first `<address>` child, matching what the nmap-side parsers already did, so a dual-stacked host's IPv6 or MAC string can't enter `live_ips`/`port_ips` and become a masscan `-iL` target. Address sorting goes through `_ip_sort_key()`, which orders valid IPv4 numerically and sorts anything unparseable last instead of raising — the three former inline `tuple(int(o) for o in x.split('.'))` keys ran *after* a completed sweep, so one odd entry discarded the whole thing.
 - **XML result parsing is per-element defensive**: every `etree.parse()` site guards the *walk* as well as the parse. Attributes are read with `.attrib.get(...)` and the element is skipped when the identifier is missing — never a bare `attrib['addr']` or `findall('address')[0]`, both of which raise `KeyError`/`IndexError` that `except etree.ParseError` does not catch. Those exceptions escaped the guard and discarded the results for *every other host* in the file (or, in `_host_elem_to_dict()`, lost `spoonmap_output.xml`/`.json` for the whole run) over one truncated element. `<script>` elements with no `id=` are filtered out of the comprehensions for the same reason. Where a fallback to the first `<address>` child is wanted after `address[@addrtype='ipv4']` misses (`generate_findings()`, `_scan_extra_sql_ports()`), it is a `None`-checked `find('address')`.
 - **Firewall state table safety**: internal discovery caps masscan at `INTERNAL_DISCOVERY_MAX_RATE = 1000 pps`; at that rate with a 60 s half-open timeout, concurrent state entries peak at ~60 K regardless of target range size; for ranges above `INTERNAL_DISCOVERY_STATE_CEILING = 262_144` hosts the port list is trimmed from 10 to 5 to keep total packet volume bounded. Separately and for the same reason, `mass_scan()` clamps a **Full** scan to `full_scan_rate` — 10000 pps External, 1000 pps Internal — since a single 1-65535 invocation fans out every port across every target at once. This cap applies *only* to `scan_type == 'Full'`; category and custom batched scans scan a handful of ports per invocation and always use the operator's full `max_rate`. The clamp prints a notice when it actually lowers the rate, because `main()`'s run summary echoes the *requested* `max_rate`: clamping silently made the summary contradict what masscan was told to do, and read as the operator's `--max-rate` having been ignored outright.
-- **Honeypot/tarpit detection**: `mass_scan()` flags hosts open on ≥`HONEYPOT_OPEN_PORT_FRACTION` (90%) of scanned TCP ports (min sample `HONEYPOT_MIN_PORTS_SCANNED = 10`) as likely tarpits (LaBrea, portspoof) via `_flag_suspected_tarpits()`/`_report_suspected_tarpits()`, writing `discovery/suspected_tarpits.txt`. Separately, `_count_unmatched_service_ports()` reads `nmap_results/*.xml` and counts open ports whose `-sV` probe captured a `servicefp` (no signature match); `≥HONEYPOT_MIN_UNMATCHED_PORTS = 3` such ports on one host is consistent with decoys (e.g. Artillery) that return random data on full connect. Both signals surface as a single "Likely Honeypot / Decoy Host" MEDIUM finding in `generate_findings()`. `_flag_suspected_tarpits()` counts TCP ports only, skipping any `port_key` that starts with `U:`, so every loop that reconstructs a port key from a `live_hosts/portNN.txt` filename must run the stem through `_fname_port()` (`'U_53'` → `'U:53'`) — the raw stem was counted as TCP, skewing the open-port fraction, and printed as `Hosts Found on Port U_53`.
+- **Honeypot/tarpit detection**: `mass_scan()` flags hosts open on ≥`HONEYPOT_OPEN_PORT_FRACTION` (90%) of scanned TCP ports (min sample `HONEYPOT_MIN_PORTS_SCANNED = 10`) as likely tarpits (LaBrea, portspoof) via `_flag_suspected_tarpits()`/`_report_suspected_tarpits()`, writing `discovery/suspected_tarpits.txt`. Separately, `_count_unmatched_service_ports()` reads `nmap_results/*.xml` and counts open ports whose `-sV` probe captured a `servicefp` (no signature match); `≥HONEYPOT_MIN_UNMATCHED_PORTS = 3` such ports on one host is consistent with decoys (e.g. Artillery) that return random data on full connect. Both signals surface as a single "Likely Honeypot / Decoy Host" finding in `generate_findings()`, severity-tiered as described below. `_flag_suspected_tarpits()` counts TCP ports only, skipping any `port_key` that starts with `U:`, so every loop that reconstructs a port key from a `live_hosts/portNN.txt` filename must run the stem through `_fname_port()` (`'U_53'` → `'U:53'`) — the raw stem was counted as TCP, skewing the open-port fraction, and printed as `Hosts Found on Port U_53`.
+ Four more signals feed the same finding, each combined and tiered by
+`_honeypot_severity()` rather than emitted as separate findings: TTL
+inconsistency across a host's open ports (`_ttl_spread_by_host()`, read back
+from `masscan_results/*.xml` at Stage 1, since one TCP/IP stack always
+reports one TTL — several differing values means several emulated listeners
+behind one address, though NAT/load-balancing can produce the same pattern,
+which is why this signal alone is capped at LOW and can never alone reach
+HIGH); known port-profile matching against `HONEYPOT_PORT_PROFILES`
+(Thinkst Canary, Artillery — placeholders pending verification against
+current upstream defaults — the finding's own reason text carries that
+caveat verbatim, since it lands in an engagement deliverable); generic
+named-product signature matching against `HONEYPOT_SIGNATURES` via the -sV
+service data already captured, **which ships EMPTY in this release** — the
+two development-era entries (Cowrie/Kippo, Dionaea) were both verified
+incorrect against nmap's real output in final review and removed rather than
+patched, so there are no active generic signatures and the mechanism
+(`_honeypot_signature_match()`, `_named_honeypot_matches()`) is retained
+purely as an extensibility point for future entries verified against real
+`-sV` output rather than a synthetic fixture (the reasons are recorded at
+the tuple itself; the short version is that the Cowrie needle's hyphen can
+never match nmap's space-rendered template, and "fixing" it would
+false-positive HIGH on every ordinary Debian OpenSSH host, while the Dionaea
+needle only ever appears in `servicefp`, a field the matcher never reads); a
+source-verified Heralding VNC honeypot tell (`_vnc_heralding_match()`,
+Task 3 Step 7 — vnc-info reporting RFB protocol 3.7 with no security-type
+list, since Heralding's VNC capability hardcodes that exact version and
+drops the connection on any client mismatch, unlike a real RFB server)
+read from `nse_results/*.xml` rather than `nmap_results/*.xml`; and
+silent-open-port counting (`_count_silent_open_ports()`), which complements
+the existing unmatched-fingerprint count by catching a tarpit that holds a
+connection open and sends nothing back — `servicefp` is only set when *some*
+data came back and failed to match, so a LaBrea-style silent host previously
+scored zero on that check alone. `_iter_open_tcp_ports()` is the shared,
+per-element-defensive XML walk both nmap-side counters and the signature
+matcher use, factored out of what was originally
+`_count_unmatched_service_ports()`'s own walk. With `HONEYPOT_SIGNATURES`
+empty, the Heralding VNC tell is the only named-product match this release
+can produce. Severity is HIGH for a named
+signature match or an active-probe confirmation, MEDIUM for two or more
+heuristic signals together, LOW for exactly one — a behavior change from the
+single flat MEDIUM this finding used to emit unconditionally. An optional
+active confirmation probe (`_active_confirm_probe()`) attempts a raw TCP
+connect against a handful of high, never-scanned ports
+(`_select_confirm_probe_ports()`, deterministic per-IP via a seeded
+`random.Random(ip)` rather than global randomness, so it is reproducible and
+testable) on any host flagged by the TTL-spread or port-profile signals —
+**not** on a host flagged only by the older tarpit-ratio heuristic, which
+feeds the finding but never the probe; a real host has no reason to answer on
+an ephemeral port outside the scan, so an answer is treated as confirmation.
+This is the one signal that sends new traffic, so it is gated behind
+`honeypot_active_confirm` in config.json — default false, absent means
+false, no interactive prompt of its own — mirroring `check_for_updates`'s
+existing precedent exactly and for the same reason: SpooNMAP runs from
+client-network jumpboxes, and an unrequested probe against a possible
+client-deployed decoy must never fire without the operator explicitly
+turning it on. (An earlier design considered a live per-host prompt after
+the Stage 1 warning instead; every `input()` call in this codebase happens
+in `main()` before any scan starts, and `mass_scan()` never prompts
+mid-run, so the config-only gate was used instead to stay consistent with
+that pattern.) `discovery/suspected_honeypots.txt` (Stage 1: TTL spread and
+port-profile hits, one line per `(ip, signal)` pair) and
+`discovery/confirmed_honeypots.txt` (Stage 2: active-probe confirmations)
+are new sibling files to the existing `discovery/suspected_tarpits.txt`,
+read back the same defensively-parsed way in `generate_findings()`. Unlike
+`suspected_tarpits.txt`, both of those are written **unconditionally** — an
+empty result truncates the file rather than leaving the previous run's
+content in place. That divergence is deliberate: severity is now computed by
+*counting* signals, so a stale line from an earlier, broader run silently
+inflates a later, narrower run's severity, and a stale
+`confirmed_honeypots.txt` line additionally makes the deliverable assert
+"host answered on a port never scanned open" for a probe that did not run
+this time at all (exactly what happens when the operator turns
+`honeypot_active_confirm` back off). The `enabled` check happens in
+`_confirm_flagged_honeypots()` itself, ahead of the per-host loop, so the
+common disabled case skips `_select_confirm_probe_ports()`'s candidate-set
+work entirely — but that path still truncates the file rather than returning
+outright, for the reason just given. Every host handed to the probe is first
+run through `_scope_filtered_flags()` against the current `target_file`,
+since the probe is the only honeypot signal that *sends packets* and the
+flag dict is built from cached `live_hosts/` and `masscan_results/` data
+that a narrowed `ranges.txt` deliberately never prunes; an empty/unparseable
+scope is permissive, matching `_report_out_of_scope_retained()`.
+
+**Three limitations an operator enabling `honeypot_active_confirm` needs to
+know.** (1) On a **Full** scan (`dest_ports == ['1-65535']`) essentially every
+ephemeral port has already been scanned, so `_select_confirm_probe_ports()`
+finds few or zero unscanned candidates and the probe effectively does
+nothing — silently, with no message either way. (2) **All** honeypot
+detection, Stage 1 signals and the active probe alike, lives inside
+`mass_scan()`; the alternate direct-nmap port-discovery path (taken for
+small/medium scans below the configured `nmap_threshold` work-unit ceiling)
+performs none of it. (3) Every signal in this feature only ever becomes a
+*finding* when `script_scan: true`, because `generate_findings()` returns
+immediately when `nse_results/` does not exist and the default is off — the
+Stage 1 stdout warnings and the `discovery/*.txt` files are still written
+either way, since those come from `mass_scan()`, not `generate_findings()`.
+None of the three is fixed in code; they are documented as-is.

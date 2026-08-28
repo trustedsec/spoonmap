@@ -1,5 +1,6 @@
 """Tests for spoonmap.py"""
 import ast
+import contextlib
 import datetime
 import inspect
 import io
@@ -27,6 +28,8 @@ from spoonmap import (
     EXTERNAL_SENSITIVE_PORTS,
     HONEYPOT_MIN_PORTS_SCANNED,
     HONEYPOT_OPEN_PORT_FRACTION,
+    HONEYPOT_PORT_PROFILES,
+    HONEYPOT_SIGNATURES,
     HOST_DISCOVERY_NMAP_THRESHOLD,
     INTERNAL_DISCOVERY_MAX_RATE,
     INTERNAL_DISCOVERY_STATE_CEILING,
@@ -39,15 +42,19 @@ from spoonmap import (
     _classify_sql,
     _config_int,
     _count_hosts_in_file,
+    _count_silent_open_ports,
     _count_unmatched_service_ports,
     _external_exposure_scripts,
     _format_eta,
     _raise_fd_limit,
     _sql_version_year,
     _summarize_vulns,
+    _ttl_spread_by_host,
     _handle_previous_results,
     _prior_default,
     _prompt_int,
+    _report_confirmed_honeypots,
+    _scope_filtered_flags,
     _prompt_yes_no,
     _CONFIG_DOCS,
     _CONFIG_FIELD_ORDER,
@@ -76,10 +83,22 @@ from spoonmap import (
     _discover_external_masscan,
     _discover_internal_masscan,
     _external_host_discovery,
+    _active_confirm_probe,
+    _confirm_flagged_honeypots,
+    _expand_scanned_ports,
+    _flag_honeypot_signals,
     _flag_suspected_tarpits,
+    _honeypot_severity,
+    _honeypot_signature_match,
+    _maybe_confirm_honeypot,
+    _named_honeypot_matches,
     _nmap_host_discovery,
+    _port_profile_match,
+    _report_suspected_honeypots,
     _report_suspected_tarpits,
+    _select_confirm_probe_ports,
     _stream_masscan_progress,
+    _vnc_heralding_match,
     preprocess_targets,
     _discovery_wait,
     _internal_host_discovery,
@@ -1902,6 +1921,419 @@ class TestCountUnmatchedServicePorts:
         assert _count_unmatched_service_ports(str(tmp_path)) == {'10.0.0.8': 1}
 
 
+class TestCountSilentOpenPorts:
+    """Unit tests for _count_silent_open_ports()."""
+
+    def _xml(self, ip, port, protocol='tcp', state='open', service_attrs=None):
+        service_elem = ''
+        if service_attrs is not None:
+            attrs = ' '.join(f'{k}="{v}"' for k, v in service_attrs.items())
+            service_elem = f'<service {attrs}/>'
+        return (
+            '<?xml version="1.0"?><nmaprun>'
+            f'<host><address addr="{ip}" addrtype="ipv4"/>'
+            f'<ports><port protocol="{protocol}" portid="{port}">'
+            f'<state state="{state}"/>{service_elem}'
+            '</port></ports></host></nmaprun>'
+        )
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_no_service_element_at_all_is_silent(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        (nmap_results / 'port9999.xml').write_text(self._xml('10.0.0.1', '9999', service_attrs=None))
+        assert _count_silent_open_ports(str(tmp_path)) == {'10.0.0.1': 1}
+
+    def test_service_with_no_name_product_or_fp_is_silent(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.2', '9999', service_attrs={})
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {'10.0.0.2': 1}
+
+    def test_matched_service_not_silent(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.3', '22', service_attrs={'name': 'ssh', 'product': 'OpenSSH'})
+        (nmap_results / 'port22.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_unmatched_fingerprint_not_silent(self, tmp_path):
+        # servicefp means *something* came back -- this is
+        # _count_unmatched_service_ports()'s signal, not this one's.
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.4', '9999', service_attrs={
+            'name': 'unknown', 'servicefp': 'SF-Port9999-TCP:...',
+        })
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_name_only_not_silent(self, tmp_path):
+        # Exactly one of the three attributes present alone must clear the
+        # "silent" bar on its own -- otherwise a single clause in the
+        # `not name and not product and not servicefp` check is never the
+        # deciding factor.
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.7', '9999', service_attrs={'name': 'ssh'})
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_product_only_not_silent(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.8', '9999', service_attrs={'product': 'OpenSSH'})
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_servicefp_only_not_silent(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.9', '9999', service_attrs={'servicefp': 'SF-Port9999-TCP:...'})
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_closed_port_not_counted(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.5', '9999', state='closed', service_attrs=None)
+        (nmap_results / 'port9999.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_udp_files_skipped(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.6', '53', protocol='udp', service_attrs=None)
+        (nmap_results / 'portU_53.xml').write_text(xml)
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_malformed_xml_skipped(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        (nmap_results / 'port80.xml').write_text('<nmaprun><host>')
+        assert _count_silent_open_ports(str(tmp_path)) == {}
+
+    def test_multiple_silent_ports_same_host_aggregate(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        for port in ('2222', '3333', '4444'):
+            (nmap_results / f'port{port}.xml').write_text(
+                self._xml('10.0.0.7', port, service_attrs=None))
+        assert _count_silent_open_ports(str(tmp_path)) == {'10.0.0.7': 3}
+
+
+# A stand-in signature table for exercising the generic matching machinery.
+# HONEYPOT_SIGNATURES itself ships EMPTY (see the module comment on it: both
+# development-era entries were verified incorrect against nmap's real output
+# and removed rather than patched), so every test that needs an actual match
+# patches this in. That keeps the extensibility point tested without
+# reintroducing an unverified needle into the shipped table.
+_FAKE_HONEYPOT_SIGNATURES = (
+    ('SpoonmapTestPot 1.0', 'Spoonmap Test Honeypot'),
+    ('SecondTestPot banner', 'Second Test Honeypot'),
+)
+
+
+class TestHoneypotSignatureMatch:
+    """Unit tests for _honeypot_signature_match().
+
+    HONEYPOT_SIGNATURES ships empty, so the shipped behaviour under test is
+    "never matches anything"; the loop body is exercised against
+    _FAKE_HONEYPOT_SIGNATURES instead.
+    """
+
+    def test_shipped_table_is_empty(self):
+        # Pinned deliberately: a future contributor must add a signature only
+        # after verifying it against real -sV output, and re-adding either of
+        # the two removed entries should fail here first.
+        assert HONEYPOT_SIGNATURES == ()
+
+    def test_empty_table_never_matches_anything(self):
+        for text in ('OpenSSH 6.0p1 Debian-4+deb7u2',
+                     '220 Welcome to the ftp service',
+                     'anything at all'):
+            assert _honeypot_signature_match(text) is None
+
+    def test_removed_cowrie_needle_does_not_match_in_either_spelling(self):
+        """Regression: the removed Cowrie/Kippo needle used a hyphen
+        ('Debian-4+deb7u2'); nmap's own nmap-service-probes template renders
+        that banner with a space ('Debian 4+deb7u2'), so the needle could
+        never fire. Neither spelling may match now."""
+        assert _honeypot_signature_match('OpenSSH 6.0p1 Debian-4+deb7u2') is None
+        assert _honeypot_signature_match('OpenSSH 6.0p1 Debian 4+deb7u2') is None
+
+    def test_legitimate_debian_openssh_banner_does_not_match(self):
+        """The worse bug the removal avoids: nmap applies the same
+        space-insertion to every genuine Debian OpenSSH host, so a
+        hyphen-to-space "fix" would have reported HIGH-severity honeypot on
+        one of the most common SSH banners on the internet."""
+        assert _honeypot_signature_match('OpenSSH 9.2p1 Debian 2+deb12u3') is None
+
+    def test_removed_dionaea_needle_does_not_match(self):
+        """Regression: the removed Dionaea needle was an *unrecognised*
+        banner, which nmap records in `servicefp` -- a field
+        _named_honeypot_matches() never reads -- so it could never fire."""
+        assert _honeypot_signature_match('220 Welcome to the ftp service') is None
+
+    def test_unrelated_text_no_match(self):
+        assert _honeypot_signature_match('OpenSSH 9.6p1 Ubuntu') is None
+
+    def test_empty_text_no_match(self):
+        assert _honeypot_signature_match('') is None
+
+    def test_populated_table_matches_and_returns_product(self):
+        """The mechanism is kept as an extensibility point, so it must still
+        work for a future verified entry."""
+        with patch('spoonmap.HONEYPOT_SIGNATURES', _FAKE_HONEYPOT_SIGNATURES):
+            assert (_honeypot_signature_match('prefix SpoonmapTestPot 1.0 suffix')
+                    == 'Spoonmap Test Honeypot')
+
+    def test_populated_table_second_entry_matches(self):
+        with patch('spoonmap.HONEYPOT_SIGNATURES', _FAKE_HONEYPOT_SIGNATURES):
+            assert (_honeypot_signature_match('220 SecondTestPot banner ready')
+                    == 'Second Test Honeypot')
+
+    def test_populated_table_still_returns_none_for_unrelated_text(self):
+        with patch('spoonmap.HONEYPOT_SIGNATURES', _FAKE_HONEYPOT_SIGNATURES):
+            assert _honeypot_signature_match('OpenSSH 9.6p1 Ubuntu') is None
+
+
+class TestNamedHoneypotMatches:
+    """Unit tests for _named_honeypot_matches()."""
+
+    def _xml(self, ip, port, product=None, version=None, extrainfo=None):
+        attrs = []
+        if product is not None:
+            attrs.append(f'product="{product}"')
+        if version is not None:
+            attrs.append(f'version="{version}"')
+        if extrainfo is not None:
+            attrs.append(f'extrainfo="{extrainfo}"')
+        service_elem = f'<service {" ".join(attrs)}/>' if attrs else ''
+        return (
+            '<?xml version="1.0"?><nmaprun>'
+            f'<host><address addr="{ip}" addrtype="ipv4"/>'
+            f'<ports><port protocol="tcp" portid="{port}">'
+            f'<state state="open"/>{service_elem}'
+            '</port></ports></host></nmaprun>'
+        )
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert _named_honeypot_matches(str(tmp_path)) == {}
+
+    def test_shipped_empty_table_matches_nothing(self, tmp_path):
+        """Regression guard for the whole point of the removal: XML that WOULD
+        have matched either removed needle must now produce no match at all,
+        so neither can silently reappear via the finding output."""
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        (nmap_results / 'port22.xml').write_text(
+            self._xml('10.0.0.1', '22', product='OpenSSH',
+                      version='6.0p1', extrainfo='Debian 4+deb7u2'))
+        (nmap_results / 'port21.xml').write_text(
+            self._xml('10.0.0.2', '21', product='Welcome to the ftp service'))
+        assert _named_honeypot_matches(str(tmp_path)) == {}
+
+    def test_signature_match_across_product_version_extrainfo(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.1', '22', product='SpoonmapTestPot', version='1.0')
+        (nmap_results / 'port22.xml').write_text(xml)
+        with patch('spoonmap.HONEYPOT_SIGNATURES', _FAKE_HONEYPOT_SIGNATURES):
+            assert (_named_honeypot_matches(str(tmp_path))
+                    == {'10.0.0.1': 'Spoonmap Test Honeypot'})
+
+    def test_signature_match_only_in_extrainfo(self, tmp_path):
+        """product/version alone don't contain the signature substring — only
+        extrainfo does. Confirms extrainfo is actually consulted, not just
+        accepted as a parameter that's never populated with the needle."""
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.9', '22', product='OpenSSH', version='9.6p1',
+                        extrainfo='SpoonmapTestPot 1.0')
+        (nmap_results / 'port22.xml').write_text(xml)
+        with patch('spoonmap.HONEYPOT_SIGNATURES', _FAKE_HONEYPOT_SIGNATURES):
+            assert (_named_honeypot_matches(str(tmp_path))
+                    == {'10.0.0.9': 'Spoonmap Test Honeypot'})
+
+    def test_no_service_element_no_match(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        (nmap_results / 'port22.xml').write_text(self._xml('10.0.0.2', '22'))
+        with patch('spoonmap.HONEYPOT_SIGNATURES', _FAKE_HONEYPOT_SIGNATURES):
+            assert _named_honeypot_matches(str(tmp_path)) == {}
+
+    def test_service_element_with_no_attributes_no_match(self, tmp_path):
+        """A <service/> element with none of product/version/extrainfo set
+        joins to an empty string; must be skipped, not passed to the
+        signature matcher."""
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.10" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="22">'
+            '<state state="open"/><service/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nmap_results / 'port22.xml').write_text(xml)
+        with patch('spoonmap.HONEYPOT_SIGNATURES', _FAKE_HONEYPOT_SIGNATURES):
+            assert _named_honeypot_matches(str(tmp_path)) == {}
+
+    def test_unrelated_service_no_match(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = self._xml('10.0.0.3', '22', product='OpenSSH', version='9.6p1')
+        (nmap_results / 'port22.xml').write_text(xml)
+        with patch('spoonmap.HONEYPOT_SIGNATURES', _FAKE_HONEYPOT_SIGNATURES):
+            assert _named_honeypot_matches(str(tmp_path)) == {}
+
+    def test_first_match_wins_per_host(self, tmp_path):
+        """Same host has two ports that would EACH independently match a
+        different signature. _iter_open_tcp_ports() walks nmap_results/*.xml
+        in sorted filename order, so 'port21.xml' is encountered before
+        'port22.xml' and must be the one that wins."""
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        (nmap_results / 'port21.xml').write_text(
+            self._xml('10.0.0.4', '21', product='SecondTestPot banner'))
+        (nmap_results / 'port22.xml').write_text(
+            self._xml('10.0.0.4', '22', product='SpoonmapTestPot', version='1.0'))
+        with patch('spoonmap.HONEYPOT_SIGNATURES', _FAKE_HONEYPOT_SIGNATURES):
+            assert (_named_honeypot_matches(str(tmp_path))
+                    == {'10.0.0.4': 'Second Test Honeypot'})
+
+
+class TestVncHeraldingMatch:
+    """Unit tests for _vnc_heralding_match()."""
+
+    def _xml(self, ip, port, vnc_info_output):
+        return (
+            '<?xml version="1.0"?><nmaprun>'
+            f'<host><address addr="{ip}" addrtype="ipv4"/>'
+            f'<ports><port protocol="tcp" portid="{port}">'
+            '<state state="open"/>'
+            f'<script id="vnc-info" output="{vnc_info_output}"/>'
+            '</port></ports></host></nmaprun>'
+        )
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+    def test_heralding_shape_matches(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = self._xml('10.0.0.1', '5900', 'Protocol version: 3.7')
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {'10.0.0.1': 'Heralding VNC Honeypot'}
+
+    def test_real_37_server_with_security_types_no_match(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = self._xml('10.0.0.2', '5900',
+                         'Protocol version: 3.7&#10;Security types: &#10;  VNC Authentication (2)')
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+    def test_38_server_no_match(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = self._xml('10.0.0.3', '5900', 'Protocol version: 3.8')
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+    def test_no_vnc_info_script_no_match(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.4" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="5900">'
+            '<state state="open"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+    def test_udp_named_result_file_skipped(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = self._xml('10.0.0.5', '5900', 'Protocol version: 3.7')
+        (nse_results / 'portU_5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+    def test_malformed_xml_in_one_file_does_not_block_other_files(self, tmp_path):
+        """A truncated/killed-scan XML file must not raise past the guard and
+        abort the walk for every other result file."""
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        (nse_results / 'port5900.xml').write_text('<nmaprun><host>')
+        xml = self._xml('10.0.0.6', '5901', 'Protocol version: 3.7')
+        (nse_results / 'port5901.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {'10.0.0.6': 'Heralding VNC Honeypot'}
+
+    def test_address_without_addr_attribute_skipped(self, tmp_path):
+        """A bare attrib['addr'] would raise KeyError, which `except
+        etree.ParseError` does not catch."""
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="5900">'
+            '<state state="open"/>'
+            '<script id="vnc-info" output="Protocol version: 3.7"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+    def test_mac_only_address_skipped(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="AA:BB:CC:DD:EE:FF" addrtype="mac"/>'
+            '<ports><port protocol="tcp" portid="5900">'
+            '<state state="open"/>'
+            '<script id="vnc-info" output="Protocol version: 3.7"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+
+class TestHoneypotSeverity:
+    """Unit tests for _honeypot_severity()."""
+
+    def test_no_signals_no_match_no_confirm_returns_none(self):
+        assert _honeypot_severity(set()) is None
+
+    def test_single_heuristic_signal_is_low(self):
+        assert _honeypot_severity({'ratio'}) == 'LOW'
+
+    def test_two_heuristic_signals_is_medium(self):
+        assert _honeypot_severity({'ratio', 'unmatched_fp'}) == 'MEDIUM'
+
+    def test_ttl_spread_alone_is_low_never_high(self):
+        assert _honeypot_severity({'ttl_spread'}) == 'LOW'
+
+    def test_ttl_spread_plus_one_other_is_medium_not_high(self):
+        assert _honeypot_severity({'ttl_spread', 'port_profile'}) == 'MEDIUM'
+
+    def test_named_match_alone_is_high(self):
+        assert _honeypot_severity(set(), named_match=True) == 'HIGH'
+
+    def test_confirmed_alone_is_high(self):
+        assert _honeypot_severity(set(), confirmed=True) == 'HIGH'
+
+    def test_named_match_overrides_signal_count(self):
+        assert _honeypot_severity({'ratio', 'unmatched_fp'}, named_match=True) == 'HIGH'
+
+
 class TestGenerateFindingsHoneypot:
     """generate_findings() 'Likely Honeypot / Decoy Host' finding."""
 
@@ -1916,12 +2348,15 @@ class TestGenerateFindingsHoneypot:
         )
 
     def test_tarpit_file_flags_host(self, nmap_dir):
+        # A single heuristic signal is now LOW, not MEDIUM -- see
+        # _honeypot_severity() and TestHoneypotSeverity. Two-plus signals
+        # (test_both_signals_combine_in_one_finding, below) still reach MEDIUM.
         (nmap_dir / 'discovery').mkdir(exist_ok=True)
         (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.1,19,20\n')
         generate_findings(str(nmap_dir), 'Internal')
         records = json.loads((nmap_dir / 'findings.json').read_text())
         hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
-        assert hp and hp[0]['severity'] == 'MEDIUM'
+        assert hp and hp[0]['severity'] == 'LOW'
         assert hp[0]['host'] == '10.0.0.1'
         assert '19/20' in hp[0]['detail']
 
@@ -1957,6 +2392,7 @@ class TestGenerateFindingsHoneypot:
         records = json.loads((nmap_dir / 'findings.json').read_text())
         hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
         assert len(hp) == 1
+        assert hp[0]['severity'] == 'MEDIUM'
         assert '20/20' in hp[0]['detail']
         assert 'no known service signature' in hp[0]['detail']
 
@@ -1985,6 +2421,237 @@ class TestGenerateFindingsHoneypot:
         generate_findings(str(nmap_dir), 'Internal')
         records = json.loads((nmap_dir / 'findings.json').read_text())
         assert not [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+
+    def test_silent_open_ports_flag_host(self, nmap_dir):
+        nmap_results = nmap_dir / 'nmap_results'
+        nmap_results.mkdir()
+        for port in ('2222', '3333', '4444'):
+            xml = (
+                '<?xml version="1.0"?><nmaprun>'
+                f'<host><address addr="10.0.0.20" addrtype="ipv4"/>'
+                f'<ports><port protocol="tcp" portid="{port}">'
+                '<state state="open"/>'
+                '</port></ports></host></nmaprun>'
+            )
+            (nmap_results / f'port{port}.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert hp and hp[0]['host'] == '10.0.0.20'
+        assert 'returned no data at all' in hp[0]['detail']
+        assert hp[0]['severity'] == 'LOW'
+
+    def test_suspected_honeypots_file_ttl_spread_flags_host(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_honeypots.txt').write_text(
+            '10.0.0.21,ttl_spread,64|128\n')
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert hp and hp[0]['host'] == '10.0.0.21'
+        assert hp[0]['severity'] == 'LOW'
+        assert 'inconsistent TTLs' in hp[0]['detail']
+
+    def test_suspected_honeypots_file_port_profile_flags_host(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_honeypots.txt').write_text(
+            '10.0.0.22,port_profile,Thinkst Canary\n')
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert hp and hp[0]['host'] == '10.0.0.22'
+        assert 'Thinkst Canary' in hp[0]['detail']
+
+    def test_named_signature_match_is_high_severity(self, nmap_dir):
+        """The named-match-is-HIGH path, exercised through the only named
+        signature this release ships: the source-verified Heralding VNC tell
+        (vnc-info reporting RFB 3.7 with no security-type list). This test used
+        to drive the same path via a HONEYPOT_SIGNATURES entry; that table now
+        ships empty, so Heralding is the real-world route into this branch."""
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.23" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="5900">'
+            '<state state="open"/>'
+            '<script id="vnc-info" output="Protocol version: 3.7"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nmap_dir / 'nse_results' / 'port5900.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert hp and hp[0]['severity'] == 'HIGH'
+        assert 'Heralding VNC Honeypot' in hp[0]['detail']
+
+    def test_removed_signatures_produce_no_named_match_finding(self, nmap_dir):
+        """End-to-end regression for the dropped placeholders: -sV output that
+        would have matched the removed Cowrie/Kippo or Dionaea needles must
+        produce no named match, and in particular must not reach HIGH.
+
+        The Cowrie case doubles as the false-positive guard -- this is exactly
+        what a legitimate, unmodified Debian OpenSSH host looks like after
+        nmap's own space-insertion, and a hyphen-to-space "fix" of that needle
+        would have flagged every one of them HIGH."""
+        nmap_results = nmap_dir / 'nmap_results'
+        nmap_results.mkdir()
+        (nmap_results / 'port22.xml').write_text(
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.23" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="22">'
+            '<state state="open"/>'
+            '<service product="OpenSSH" version="6.0p1" extrainfo="Debian 4+deb7u2"/>'
+            '</port></ports></host></nmaprun>')
+        (nmap_results / 'port21.xml').write_text(
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.26" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="21">'
+            '<state state="open"/>'
+            '<service product="Welcome to the ftp service"/>'
+            '</port></ports></host></nmaprun>')
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert hp == []
+
+    def test_confirmed_honeypot_is_high_severity(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'confirmed_honeypots.txt').write_text('10.0.0.24\n')
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert hp and hp[0]['severity'] == 'HIGH'
+        assert 'active confirmation probe' in hp[0]['detail']
+
+    def test_all_signals_combine_into_one_finding(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.25,20,20\n')
+        (nmap_dir / 'discovery' / 'suspected_honeypots.txt').write_text(
+            '10.0.0.25,ttl_spread,64|128\n')
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert len(hp) == 1
+        assert hp[0]['severity'] == 'MEDIUM'
+        assert '20/20' in hp[0]['detail']
+        assert 'inconsistent TTLs' in hp[0]['detail']
+
+    def test_unreadable_suspected_honeypots_file_degrades_to_no_data(self, nmap_dir):
+        (nmap_dir / 'discovery' / 'suspected_honeypots.txt').mkdir(parents=True)
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        assert not [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+
+    def test_unreadable_confirmed_honeypots_file_degrades_to_no_data(self, nmap_dir):
+        (nmap_dir / 'discovery' / 'confirmed_honeypots.txt').mkdir(parents=True)
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        assert not [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+
+    # ── directory-walk helper failures must degrade one signal, not the whole
+    #    findings phase (nmap_results/ or nse_results/ left root-owned by an
+    #    earlier sudo run, then read by a later non-root --resume) ────────────
+
+    def test_unmatched_service_ports_helper_oserror_degrades(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.30,19,20\n')
+        with patch('spoonmap._count_unmatched_service_ports', side_effect=OSError('perm')):
+            generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert [r['host'] for r in hp] == ['10.0.0.30']
+        assert hp[0]['severity'] == 'LOW'
+
+    def test_silent_open_ports_helper_oserror_degrades(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.31,19,20\n')
+        with patch('spoonmap._count_silent_open_ports', side_effect=OSError('perm')):
+            generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert [r['host'] for r in hp] == ['10.0.0.31']
+        assert hp[0]['severity'] == 'LOW'
+
+    def test_named_honeypot_matches_helper_oserror_degrades(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.32,19,20\n')
+        with patch('spoonmap._named_honeypot_matches', side_effect=OSError('perm')):
+            generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert [r['host'] for r in hp] == ['10.0.0.32']
+        assert hp[0]['severity'] == 'LOW'
+
+    def test_vnc_heralding_match_helper_oserror_degrades(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.33,19,20\n')
+        with patch('spoonmap._vnc_heralding_match', side_effect=OSError('perm')):
+            generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert [r['host'] for r in hp] == ['10.0.0.33']
+        assert hp[0]['severity'] == 'LOW'
+
+    def test_named_match_with_empty_product_still_flags_host(self, nmap_dir):
+        # A future HONEYPOT_SIGNATURES edit could resolve to an empty/falsy
+        # product string; presence in named_matches, not truthiness, must
+        # decide whether the host is flagged.
+        with patch('spoonmap._named_honeypot_matches', return_value={'10.0.0.77': ''}):
+            generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert hp and hp[0]['host'] == '10.0.0.77'
+        assert hp[0]['severity'] == 'HIGH'
+
+    def test_all_eight_signal_sources_combine_into_one_high_finding(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.99,20,20\n')
+        (nmap_dir / 'discovery' / 'suspected_honeypots.txt').write_text(
+            '10.0.0.99,ttl_spread,64|128\n')
+        (nmap_dir / 'discovery' / 'confirmed_honeypots.txt').write_text('10.0.0.99\n')
+        nmap_results = nmap_dir / 'nmap_results'
+        nmap_results.mkdir()
+        # The named-match signal now comes from the Heralding VNC tell, the
+        # only named signature this release ships (HONEYPOT_SIGNATURES is
+        # empty); it reads nse_results/, not nmap_results/.
+        product = 'Heralding VNC Honeypot'
+        (nmap_dir / 'nse_results' / 'port5900.xml').write_text(
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.99" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="5900">'
+            '<state state="open"/>'
+            '<script id="vnc-info" output="Protocol version: 3.7"/>'
+            '</port></ports></host></nmaprun>')
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = [r for r in records if r['title'] == 'Likely Honeypot / Decoy Host']
+        assert len(hp) == 1
+        assert hp[0]['host'] == '10.0.0.99'
+        assert hp[0]['severity'] == 'HIGH'
+        detail = hp[0]['detail']
+        assert product in detail
+        assert '20/20' in detail
+        assert 'inconsistent TTLs' in detail
+        assert 'active confirmation probe' in detail
+        # Named-signature reason is inserted first, confirmed-probe reason is
+        # appended last -- heuristic reasons (ratio, ttl_spread) land in between
+        # in the order their signal sources were checked.
+        assert (detail.index(product) < detail.index('20/20')
+                < detail.index('inconsistent TTLs')
+                < detail.index('active confirmation probe'))
+
+    def test_two_hosts_each_flagged_by_different_single_signal_independently(self, nmap_dir):
+        (nmap_dir / 'discovery').mkdir(exist_ok=True)
+        (nmap_dir / 'discovery' / 'suspected_tarpits.txt').write_text('10.0.0.40,19,20\n')
+        (nmap_dir / 'discovery' / 'suspected_honeypots.txt').write_text(
+            '10.0.0.41,ttl_spread,64|128\n')
+        generate_findings(str(nmap_dir), 'Internal')
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        hp = {r['host']: r for r in records if r['title'] == 'Likely Honeypot / Decoy Host'}
+        assert set(hp) == {'10.0.0.40', '10.0.0.41'}
+        assert hp['10.0.0.40']['severity'] == 'LOW'
+        assert '19/20' in hp['10.0.0.40']['detail']
+        assert hp['10.0.0.41']['severity'] == 'LOW'
+        assert 'inconsistent TTLs' in hp['10.0.0.41']['detail']
 
 
 # ── _previous_results_exist / _delete_previous_results ───────────────────────
@@ -2359,6 +3026,70 @@ class TestFullPortScan:
         assert 'Hosts Found on Port U_53' not in result
         assert not (disc / 'suspected_tarpits.txt').exists()
 
+    def test_full_scan_flags_suspected_honeypot_port_profile(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        canary_ports = list(HONEYPOT_PORT_PROFILES['Thinkst Canary'])
+        fake_results = {p: {'10.0.0.9'} for p in canary_ports}
+        # Also seed a two-TTL-value XML in discovery/masscan_results/ so this
+        # test exercises the masscan_dir path passed to _flag_honeypot_signals
+        # at this call site, not just the in-memory port_profile signal.
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        ttl_xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4" addr="10.0.0.9"/>'
+            '<ports>'
+            '<port protocol="tcp" portid="22">'
+            '<state state="open" reason="syn-ack" reason_ttl="64"/></port>'
+            '<port protocol="tcp" portid="80">'
+            '<state state="open" reason="syn-ack" reason_ttl="128"/></port>'
+            '</ports></host></nmaprun>'
+        )
+        (disc / 'masscan_results' / 'port_probe.xml').write_text(ttl_xml)
+        with patch('spoonmap._run_masscan_batch', return_value=fake_results):
+            mass_scan('Full', ['1-65535'], '53', '10000', '/fake/targets.txt', '')
+        honeypot_file = tmp_path / 'discovery' / 'suspected_honeypots.txt'
+        assert honeypot_file.exists()
+        contents = honeypot_file.read_text()
+        assert '10.0.0.9,port_profile,Thinkst Canary' in contents
+        assert '10.0.0.9,ttl_spread,64|128' in contents
+
+    def test_full_scan_resume_flags_suspected_honeypot_ttl_spread(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        live_dir = disc / 'live_hosts'
+        live_dir.mkdir(parents=True)
+        targets = disc / 'resolved_targets.txt'
+        targets.write_text('10.0.0.0/24\n')
+        cached = disc / 'masscan_results' / 'portFull.xml'
+        cached.write_text('<nmaprun/>')
+        _write_target_stamp(cached, targets)
+        (live_dir / 'port22.txt').write_text('10.0.0.9\n')
+        (live_dir / 'port80.txt').write_text('10.0.0.9\n')
+        # The resume path reads TTL spread back from masscan_results' own XML,
+        # not from live_hosts/ — seed a probe-style file alongside the cache.
+        ttl_xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4" addr="10.0.0.9"/>'
+            '<ports>'
+            '<port protocol="tcp" portid="22">'
+            '<state state="open" reason="syn-ack" reason_ttl="64"/></port>'
+            '<port protocol="tcp" portid="80">'
+            '<state state="open" reason="syn-ack" reason_ttl="128"/></port>'
+            '</ports></host></nmaprun>'
+        )
+        (disc / 'masscan_results' / 'port_probe.xml').write_text(ttl_xml)
+
+        with patch('spoonmap._run_masscan_batch') as mock_batch:
+            mass_scan('Full', ['1-65535'], '53', '10000',
+                      str(targets), '', resume=True)
+
+        assert not mock_batch.called
+        honeypot_file = disc / 'suspected_honeypots.txt'
+        assert honeypot_file.exists()
+        assert '10.0.0.9,ttl_spread,64|128' in honeypot_file.read_text()
+
     def _setup_full_resume_cache(self, tmp_path, xml_text):
         spoonmap.output_path = str(tmp_path)
         disc = tmp_path / 'discovery'
@@ -2451,6 +3182,119 @@ class TestMassScanTarpitFlag:
             mass_scan('All', tcp_ports, '88', '1000',
                       '/fake/targets.txt', '', batch_size=len(tcp_ports))
         assert not (tmp_path / 'discovery' / 'suspected_tarpits.txt').exists()
+
+
+class TestMassScanHoneypotFlag:
+    """mass_scan() batch-path wiring of the suspected-honeypot check (non-Full scans)."""
+
+    def test_batch_scan_flags_suspected_honeypot_port_profile(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        canary_ports = list(HONEYPOT_PORT_PROFILES['Thinkst Canary'])
+        fast_response = {p: {'10.0.0.9'} for p in canary_ports}
+        # Also seed a two-TTL-value XML in discovery/masscan_results/ so this
+        # test exercises the masscan_dir path passed to _flag_honeypot_signals
+        # at this call site, not just the in-memory port_profile signal.
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        ttl_xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4" addr="10.0.0.9"/>'
+            '<ports>'
+            '<port protocol="tcp" portid="22">'
+            '<state state="open" reason="syn-ack" reason_ttl="64"/></port>'
+            '<port protocol="tcp" portid="80">'
+            '<state state="open" reason="syn-ack" reason_ttl="128"/></port>'
+            '</ports></host></nmaprun>'
+        )
+        (disc / 'masscan_results' / 'port_probe.xml').write_text(ttl_xml)
+        # 445 is a member of the Canary profile and is in SLOW_PORTS (always
+        # solo-scanned), which adds calls beyond a fixed fast/slow probe pair
+        # — return_value covers every call regardless of count.
+        with patch('spoonmap._run_masscan_batch', return_value=fast_response):
+            mass_scan('All', canary_ports, '88', '1000',
+                      '/fake/targets.txt', '', batch_size=len(canary_ports))
+        honeypot_file = tmp_path / 'discovery' / 'suspected_honeypots.txt'
+        assert honeypot_file.exists()
+        contents = honeypot_file.read_text()
+        assert '10.0.0.9,port_profile,Thinkst Canary' in contents
+        assert '10.0.0.9,ttl_spread,64|128' in contents
+
+    def test_batch_scan_no_honeypot_flag_for_unrelated_ports(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        tcp_ports = ['9001', '9002', '9003']
+        fast_response = {p: {'10.0.0.9'} for p in tcp_ports}
+        with patch('spoonmap._run_masscan_batch', side_effect=[fast_response, {}]):
+            mass_scan('All', tcp_ports, '88', '1000',
+                      '/fake/targets.txt', '', batch_size=len(tcp_ports))
+        # The file is now written unconditionally so a stale run's lines cannot
+        # keep inflating severity -- "no flag" means empty, not absent.
+        assert (tmp_path / 'discovery' / 'suspected_honeypots.txt').read_text() == ''
+
+
+class TestConfirmFlaggedHoneypotsWiring:
+    """mass_scan()'s three call sites must actually invoke
+    _confirm_flagged_honeypots() with honeypot_active_confirm threaded
+    through, for both True and False. Deleting any of the three calls, or
+    hardcoding False in place of the parameter, previously left the full
+    suite passing — nothing referenced _confirm_flagged_honeypots or
+    honeypot_active_confirm by name."""
+
+    def test_full_scan_batched_path_calls_confirm_with_flag(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        fake_results = {'22': {'10.0.0.1'}}
+        with patch('spoonmap._run_masscan_batch', return_value=fake_results), \
+             patch('spoonmap._confirm_flagged_honeypots') as mock_confirm:
+            mass_scan('Full', ['1-65535'], '88', '2000', '/fake/targets.txt', '',
+                      honeypot_active_confirm=True)
+        mock_confirm.assert_called_once()
+        args = mock_confirm.call_args[0]
+        assert args[1] is True  # honeypot_active_confirm threaded through
+        assert args[2] == ['1-65535']  # dest_ports
+
+    def test_full_scan_batched_path_passes_false_by_default(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        fake_results = {'22': {'10.0.0.1'}}
+        with patch('spoonmap._run_masscan_batch', return_value=fake_results), \
+             patch('spoonmap._confirm_flagged_honeypots') as mock_confirm:
+            mass_scan('Full', ['1-65535'], '88', '2000', '/fake/targets.txt', '')
+        mock_confirm.assert_called_once()
+        assert mock_confirm.call_args[0][1] is False
+
+    def test_full_scan_resume_path_calls_confirm_with_flag(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        (disc / 'live_hosts').mkdir(parents=True)
+        targets = disc / 'resolved_targets.txt'
+        targets.write_text('10.0.0.0/24\n')
+        cached = disc / 'masscan_results' / 'portFull.xml'
+        cached.write_text('<nmaprun/>')
+        _write_target_stamp(cached, targets)
+        (disc / 'live_hosts' / 'port22.txt').write_text('10.0.0.1\n')
+
+        with patch('spoonmap._run_masscan_batch') as mock_batch, \
+             patch('spoonmap._confirm_flagged_honeypots') as mock_confirm:
+            mass_scan('Full', ['1-65535'], '53', '10000', str(targets), '',
+                      resume=True, honeypot_active_confirm=True)
+
+        assert not mock_batch.called
+        mock_confirm.assert_called_once()
+        args = mock_confirm.call_args[0]
+        assert args[1] is True
+        assert args[2] == ['1-65535']
+
+    def test_batch_loop_path_calls_confirm_with_flag(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        tcp_ports = ['9001', '9002', '9003']
+        fast_response = {p: {'10.0.0.9'} for p in tcp_ports}
+        with patch('spoonmap._run_masscan_batch', side_effect=[fast_response, {}]), \
+             patch('spoonmap._confirm_flagged_honeypots') as mock_confirm:
+            mass_scan('All', tcp_ports, '88', '1000', '/fake/targets.txt', '',
+                      batch_size=len(tcp_ports), honeypot_active_confirm=True)
+        mock_confirm.assert_called_once()
+        args = mock_confirm.call_args[0]
+        assert args[1] is True
+        assert args[2] == tcp_ports
 
 
 # ── _load_config ──────────────────────────────────────────────────────────────
@@ -9010,6 +9854,654 @@ class TestReportSuspectedTarpits:
         assert [p.name for p in tmp_path.iterdir()] == ['suspected_tarpits.txt']
 
 
+class TestTtlSpreadByHost:
+    """Unit tests for _ttl_spread_by_host()."""
+
+    def _masscan_xml(self, ip, port, reason_ttl, protocol='tcp'):
+        return (
+            '<?xml version="1.0"?><nmaprun>'
+            f'<host><address addr="{ip}" addrtype="ipv4"/>'
+            f'<ports><port protocol="{protocol}" portid="{port}">'
+            f'<state state="open" reason="syn-ack" reason_ttl="{reason_ttl}"/>'
+            '</port></ports></host></nmaprun>'
+        )
+
+    def test_missing_dir_returns_empty(self, tmp_path):
+        assert _ttl_spread_by_host(str(tmp_path / 'nope')) == {}
+
+    def test_consistent_ttl_not_flagged(self, tmp_path):
+        (tmp_path / 'port22.xml').write_text(self._masscan_xml('10.0.0.1', '22', 64))
+        (tmp_path / 'port80.xml').write_text(self._masscan_xml('10.0.0.1', '80', 64))
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_inconsistent_ttl_flagged_sorted(self, tmp_path):
+        (tmp_path / 'port22.xml').write_text(self._masscan_xml('10.0.0.2', '22', 128))
+        (tmp_path / 'port80.xml').write_text(self._masscan_xml('10.0.0.2', '80', 64))
+        assert _ttl_spread_by_host(str(tmp_path)) == {'10.0.0.2': [64, 128]}
+
+    def test_single_port_never_flagged(self, tmp_path):
+        (tmp_path / 'port22.xml').write_text(self._masscan_xml('10.0.0.3', '22', 64))
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_udp_ports_ignored(self, tmp_path):
+        (tmp_path / 'port22.xml').write_text(self._masscan_xml('10.0.0.4', '22', 64))
+        (tmp_path / 'portU_53.xml').write_text(
+            self._masscan_xml('10.0.0.4', '53', 200, protocol='udp'))
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_malformed_xml_skipped(self, tmp_path):
+        (tmp_path / 'port80.xml').write_text('<nmaprun><host>')
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_host_without_ipv4_address_skipped(self, tmp_path):
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="00:11:22:33:44:55" addrtype="mac"/>'
+            '<ports><port protocol="tcp" portid="22">'
+            '<state state="open" reason="syn-ack" reason_ttl="64"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (tmp_path / 'port22.xml').write_text(xml)
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_non_numeric_ttl_skipped(self, tmp_path):
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.5" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="22">'
+            '<state state="open" reason="syn-ack" reason_ttl="not-a-number"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (tmp_path / 'port22.xml').write_text(xml)
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_host_without_ports_element_skipped(self, tmp_path):
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4" addr="10.0.0.6"/></host>'
+            '</nmaprun>'
+        )
+        (tmp_path / 'port22.xml').write_text(xml)
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_port_without_state_element_skipped(self, tmp_path):
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4" addr="10.0.0.7"/>'
+            '<ports><port protocol="tcp" portid="22"/></ports></host>'
+            '</nmaprun>'
+        )
+        (tmp_path / 'port22.xml').write_text(xml)
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_state_without_reason_ttl_skipped(self, tmp_path):
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4" addr="10.0.0.8"/>'
+            '<ports><port protocol="tcp" portid="22">'
+            '<state state="open" reason="syn-ack"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (tmp_path / 'port22.xml').write_text(xml)
+        assert _ttl_spread_by_host(str(tmp_path)) == {}
+
+    def test_multi_port_single_host_ignores_only_udp_port(self, tmp_path):
+        """nmap-style XML: one <host> holding every port in one <ports> block.
+
+        Masscan's own XML gives one <host> per open port, so the pre-fix code
+        (which only ever read the first <port> child) happened to work there.
+        _nmap_port_discovery() writes masscan_results/portDirect.xml in this
+        multi-port-per-host shape instead, and a UDP-first port there used to
+        make the function bail before looking at any of the host's other,
+        TCP, ports.
+        """
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4" addr="10.0.0.9"/>'
+            '<ports>'
+            '<port protocol="udp" portid="53">'
+            '<state state="open" reason="udp-response" reason_ttl="200"/></port>'
+            '<port protocol="tcp" portid="22">'
+            '<state state="open" reason="syn-ack" reason_ttl="64"/></port>'
+            '<port protocol="tcp" portid="80">'
+            '<state state="open" reason="syn-ack" reason_ttl="128"/></port>'
+            '</ports></host></nmaprun>'
+        )
+        (tmp_path / 'portDirect.xml').write_text(xml)
+        assert _ttl_spread_by_host(str(tmp_path)) == {'10.0.0.9': [64, 128]}
+
+
+class TestPortProfileMatch:
+    """Unit tests for _port_profile_match()."""
+
+    def test_exact_profile_match(self):
+        profile = next(iter(HONEYPOT_PORT_PROFILES.values()))
+        assert _port_profile_match(profile) is not None
+
+    def test_superset_still_matches(self):
+        profile = next(iter(HONEYPOT_PORT_PROFILES.values()))
+        assert _port_profile_match(profile | {'54321'}) is not None
+
+    def test_subset_does_not_match(self):
+        profile = next(iter(HONEYPOT_PORT_PROFILES.values()))
+        partial = set(list(profile)[:-1]) if len(profile) > 1 else set()
+        assert _port_profile_match(partial) is None
+
+    def test_unrelated_ports_no_match(self):
+        assert _port_profile_match({'12345'}) is None
+
+    def test_empty_ports_no_match(self):
+        assert _port_profile_match(set()) is None
+
+
+class TestFlagHoneypotSignals:
+    """Unit tests for _flag_honeypot_signals()."""
+
+    def _masscan_xml(self, ip, port, reason_ttl):
+        return (
+            '<?xml version="1.0"?><nmaprun>'
+            f'<host><address addr="{ip}" addrtype="ipv4"/>'
+            f'<ports><port protocol="tcp" portid="{port}">'
+            f'<state state="open" reason="syn-ack" reason_ttl="{reason_ttl}"/>'
+            '</port></ports></host></nmaprun>'
+        )
+
+    def test_ttl_spread_flagged(self, tmp_path):
+        (tmp_path / 'port22.xml').write_text(self._masscan_xml('10.0.0.1', '22', 64))
+        (tmp_path / 'port80.xml').write_text(self._masscan_xml('10.0.0.1', '80', 128))
+        port_ips = {'22': {'10.0.0.1'}, '80': {'10.0.0.1'}}
+        result = _flag_honeypot_signals(port_ips, str(tmp_path))
+        assert result['10.0.0.1']['ttl_spread'] == [64, 128]
+
+    def test_port_profile_flagged(self, tmp_path):
+        profile = next(iter(HONEYPOT_PORT_PROFILES.items()))
+        name, ports = profile
+        port_ips = {p: {'10.0.0.2'} for p in ports}
+        result = _flag_honeypot_signals(port_ips, str(tmp_path))
+        assert result['10.0.0.2']['port_profile'] == name
+
+    def test_udp_ports_excluded_from_profile_match(self, tmp_path):
+        port_ips = {'U:22': {'10.0.0.3'}, 'U:80': {'10.0.0.3'}}
+        result = _flag_honeypot_signals(port_ips, str(tmp_path))
+        assert '10.0.0.3' not in result
+
+    def test_no_signals_no_entry(self, tmp_path):
+        port_ips = {'22': {'10.0.0.4'}}
+        result = _flag_honeypot_signals(port_ips, str(tmp_path))
+        assert result == {}
+
+    def test_ttl_spread_oserror_degrades_to_no_ttl_signal(self, tmp_path):
+        """masscan_results/ left root-owned by an earlier sudo run and read
+        back by a later non-root --resume. This runs near the END of
+        mass_scan(), after every batch has completed, so an escaping OSError
+        would unwind mass_scan() and main() and discard a finished scan's whole
+        aggregation over an advisory heuristic."""
+        with patch('spoonmap._ttl_spread_by_host', side_effect=OSError('perm')):
+            result = _flag_honeypot_signals({'22': {'10.0.0.1'}}, str(tmp_path))
+        assert result == {}
+
+    def test_ttl_spread_oserror_keeps_port_profile_signal(self, tmp_path):
+        """Only the TTL half degrades: the port-profile half reads in-memory
+        data and must still be reported."""
+        name, ports = next(iter(HONEYPOT_PORT_PROFILES.items()))
+        port_ips = {p: {'10.0.0.2'} for p in ports}
+        with patch('spoonmap._ttl_spread_by_host', side_effect=OSError('perm')):
+            result = _flag_honeypot_signals(port_ips, str(tmp_path))
+        assert result['10.0.0.2'] == {'port_profile': name}
+
+    def test_unreadable_masscan_dir_does_not_raise(self, tmp_path):
+        """End-to-end version of the above with a real unreadable directory
+        rather than a patched helper (skipped as root, which ignores mode)."""
+        if os.geteuid() == 0:
+            pytest.skip('root bypasses directory permissions')
+        locked = tmp_path / 'masscan_results'
+        locked.mkdir()
+        locked.chmod(0o000)
+        try:
+            assert _flag_honeypot_signals({'22': {'10.0.0.1'}}, str(locked)) == {}
+        finally:
+            locked.chmod(0o755)
+
+    def test_both_signals_combine_for_same_host(self, tmp_path):
+        name, ports = next(iter(HONEYPOT_PORT_PROFILES.items()))
+        ports = list(ports)
+        (tmp_path / f'port{ports[0]}.xml').write_text(
+            self._masscan_xml('10.0.0.5', ports[0], 64))
+        (tmp_path / f'port{ports[1]}.xml').write_text(
+            self._masscan_xml('10.0.0.5', ports[1], 128))
+        port_ips = {p: {'10.0.0.5'} for p in ports}
+        result = _flag_honeypot_signals(port_ips, str(tmp_path))
+        assert result['10.0.0.5']['ttl_spread'] == [64, 128]
+        assert result['10.0.0.5']['port_profile'] == name
+
+
+class TestReportSuspectedHoneypots:
+    """Unit tests for _report_suspected_honeypots()."""
+
+    def test_writes_ttl_spread_line_and_warns(self, tmp_path, capsys):
+        flagged = {'10.0.0.1': {'ttl_spread': [64, 128]}}
+        _report_suspected_honeypots(flagged, str(tmp_path))
+        content = (tmp_path / 'suspected_honeypots.txt').read_text()
+        assert '10.0.0.1,ttl_spread,64|128' in content
+        out = capsys.readouterr().out
+        assert '10.0.0.1' in out
+
+    def test_writes_port_profile_line(self, tmp_path):
+        flagged = {'10.0.0.2': {'port_profile': 'Thinkst Canary'}}
+        _report_suspected_honeypots(flagged, str(tmp_path))
+        content = (tmp_path / 'suspected_honeypots.txt').read_text()
+        assert '10.0.0.2,port_profile,Thinkst Canary' in content
+
+    def test_both_signals_write_two_lines(self, tmp_path):
+        flagged = {'10.0.0.3': {'ttl_spread': [64, 128], 'port_profile': 'Artillery'}}
+        _report_suspected_honeypots(flagged, str(tmp_path))
+        content = (tmp_path / 'suspected_honeypots.txt').read_text()
+        assert content.count('10.0.0.3,') == 2
+
+    def test_empty_flagged_truncates_the_file(self, tmp_path):
+        """Deliberate divergence from _report_suspected_tarpits(), which still
+        early-returns on empty input. generate_findings() now COUNTS signals to
+        pick HIGH/MEDIUM/LOW, so a stale line from an earlier, broader run
+        inflates a later, narrower run's severity. Writing unconditionally is
+        the only thing that makes a signal which stopped firing stop scoring."""
+        stale = tmp_path / 'suspected_honeypots.txt'
+        stale.write_text('10.9.9.9,ttl_spread,64|128\n')
+        _report_suspected_honeypots({}, str(tmp_path))
+        assert stale.exists()
+        assert stale.read_text() == ''
+
+    def test_empty_flagged_prints_no_warning(self, tmp_path, capsys):
+        """Only the file write became unconditional; stdout stays quiet."""
+        _report_suspected_honeypots({}, str(tmp_path))
+        assert capsys.readouterr().out == ''
+
+
+class TestExpandScannedPorts:
+    """Unit tests for _expand_scanned_ports()."""
+
+    def test_individual_ports_become_ints(self):
+        assert _expand_scanned_ports(['80', '443']) == {80, 443}
+
+    def test_range_expands_to_every_covered_int(self):
+        assert _expand_scanned_ports(['49152-49155']) == {49152, 49153, 49154, 49155}
+
+    def test_full_scan_range_covers_entire_ephemeral_range(self):
+        expanded = _expand_scanned_ports(['1-65535'])
+        assert set(range(49152, 65536)) <= expanded
+
+    def test_mixed_individual_and_range_entries(self):
+        expanded = _expand_scanned_ports(['80', '49152-49153'])
+        assert expanded == {80, 49152, 49153}
+
+    @pytest.mark.parametrize('token', ['80-', 'http', '8O80', '80/tcp'])
+    def test_malformed_token_is_skipped_not_raised(self, token):
+        # dest_ports is unvalidated operator input (interactive Custom list
+        # or a raw config.json value) — a malformed token must be skipped,
+        # not raise, since this runs ahead of the honeypot-probe enabled
+        # check and an unhandled ValueError here would discard a completed
+        # scan's aggregation even when the probe feature is off.
+        assert _expand_scanned_ports([token]) == set()
+
+    def test_malformed_token_alongside_valid_entries_keeps_valid_ones(self):
+        expanded = _expand_scanned_ports(['80', 'http', '443'])
+        assert expanded == {80, 443}
+
+    def test_huge_range_span_is_skipped_not_materialized(self):
+        # A span above _EXPAND_SCANNED_PORTS_MAX_SPAN must not be expanded
+        # into a giant set — skip it instead of attempting to build one.
+        assert _expand_scanned_ports(['1-4294967295']) == set()
+
+    def test_range_span_at_cap_boundary_is_expanded(self):
+        # A span exactly at the cap is still a legitimate range and must
+        # expand normally.
+        expanded = _expand_scanned_ports(['1-100000'])
+        assert len(expanded) == 100000
+
+    def test_inverted_range_is_skipped(self):
+        assert _expand_scanned_ports(['100-1']) == set()
+
+
+class TestSelectConfirmProbePorts:
+    """Unit tests for _select_confirm_probe_ports()."""
+
+    def test_returns_requested_count(self):
+        ports = _select_confirm_probe_ports('10.0.0.1', [], count=3)
+        assert len(ports) == 3
+
+    def test_ports_are_in_ephemeral_range(self):
+        ports = _select_confirm_probe_ports('10.0.0.1', [], count=5)
+        assert all(49152 <= int(p) <= 65535 for p in ports)
+
+    def test_excludes_scanned_ports(self):
+        scanned = [str(p) for p in range(49152, 49152 + 100)]
+        ports = _select_confirm_probe_ports('10.0.0.1', scanned, count=3)
+        assert not (set(ports) & set(scanned))
+
+    def test_deterministic_for_same_ip(self):
+        a = _select_confirm_probe_ports('10.0.0.1', [], count=3)
+        b = _select_confirm_probe_ports('10.0.0.1', [], count=3)
+        assert a == b
+
+    def test_different_ips_can_differ(self):
+        a = _select_confirm_probe_ports('10.0.0.1', [], count=3)
+        b = _select_confirm_probe_ports('10.0.0.2', [], count=3)
+        assert a != b
+
+    def test_udp_scanned_ports_do_not_shrink_candidate_pool(self):
+        # 'U:49200'-style keys must not be compared against bare int ports.
+        # They're filtered out by _select_confirm_probe_ports() before
+        # reaching _expand_scanned_ports() (which would otherwise just
+        # skip the unparseable 'U:NNNN' token rather than raise).
+        scanned = [f'U:{p}' for p in range(49152, 49200)]
+        ports = _select_confirm_probe_ports('10.0.0.1', scanned, count=3)
+        assert len(ports) == 3
+
+    def test_malformed_token_alongside_valid_entries_still_yields_result(self):
+        # A garbage token mixed in with real dest_ports entries must not
+        # crash _select_confirm_probe_ports(); it's simply skipped as
+        # "not confirmed scanned", which can only shrink the pool.
+        scanned = ['80', '80-', 'http', '443']
+        ports = _select_confirm_probe_ports('10.0.0.1', scanned, count=3)
+        assert len(ports) == 3
+        assert not (set(ports) & {'80', '443'})
+
+    def test_full_scan_range_spec_excludes_entire_ephemeral_range(self):
+        # dest_ports=['1-65535'] (a Full scan) scanned every port, including
+        # all of 49152-65535 — a literal string comparison ('64835' not in
+        # {'1-65535'}) would never exclude any of them, so this must find
+        # zero candidates rather than treating the range as unscanned.
+        ports = _select_confirm_probe_ports('10.0.0.1', ['1-65535'], count=3)
+        assert ports == []
+
+    def test_custom_ephemeral_range_spec_excludes_only_that_range(self):
+        ports = _select_confirm_probe_ports('10.0.0.1', ['49152-65535'], count=3)
+        assert ports == []
+
+    def test_partial_range_spec_still_leaves_candidates(self):
+        # Only part of the ephemeral range was scanned; candidates should
+        # still be found outside it.
+        ports = _select_confirm_probe_ports('10.0.0.1', ['49152-60000'], count=3)
+        assert len(ports) == 3
+        assert all(60000 < int(p) <= 65535 for p in ports)
+
+    def test_individual_port_dest_ports_list_unaffected_by_range_fix(self):
+        # Regression guard: a normal (non-range) dest_ports list must behave
+        # exactly as before the range-expansion fix.
+        scanned = ['80', '443', '8080']
+        ports = _select_confirm_probe_ports('10.0.0.1', scanned, count=3)
+        assert len(ports) == 3
+        assert not (set(ports) & set(scanned))
+
+
+class TestActiveConfirmProbe:
+    """Unit tests for _active_confirm_probe()."""
+
+    def test_returns_true_when_any_port_connects(self):
+        def connector(addr, timeout):
+            if addr[1] == 50000:
+                raise OSError('refused')
+            return contextlib.nullcontext()
+        assert _active_confirm_probe('10.0.0.1', ['50000', '50001'], connector=connector) is True
+
+    def test_returns_false_when_nothing_connects(self):
+        def connector(addr, timeout):
+            raise OSError('refused')
+        assert _active_confirm_probe('10.0.0.1', ['50000', '50001'], connector=connector) is False
+
+    def test_no_candidates_available_is_a_no_probe_no_confirm(self):
+        # What a Full scan actually produces end to end: _select_confirm_probe_ports()
+        # returns [] (nothing to probe), and _active_confirm_probe() on an empty
+        # list returns False without invoking the connector — the natural
+        # behaviour of an empty for-loop, not a guarded early-exit.
+        def connector(addr, timeout):
+            raise AssertionError('must not be called with no candidates')
+        probe_ports = _select_confirm_probe_ports('10.0.0.1', ['1-65535'], count=3)
+        assert probe_ports == []
+        assert _active_confirm_probe('10.0.0.1', probe_ports, connector=connector) is False
+
+
+class TestMaybeConfirmHoneypot:
+    """Unit tests for _maybe_confirm_honeypot()."""
+
+    def test_disabled_never_probes(self):
+        def connector(addr, timeout):
+            raise AssertionError('must not be called when disabled')
+        result = _maybe_confirm_honeypot(False, '10.0.0.1', ['50000'], connector=connector)
+        assert result is False
+
+    def test_enabled_runs_probe(self):
+        def connector(addr, timeout):
+            return contextlib.nullcontext()
+        result = _maybe_confirm_honeypot(True, '10.0.0.1', ['50000'], connector=connector)
+        assert result is True
+
+
+class TestReportConfirmedHoneypots:
+    """Unit tests for _report_confirmed_honeypots()."""
+
+    def test_writes_file_and_warns(self, tmp_path, capsys):
+        _report_confirmed_honeypots({'10.0.0.1'}, str(tmp_path))
+        content = (tmp_path / 'confirmed_honeypots.txt').read_text()
+        assert content.strip() == '10.0.0.1'
+        assert '10.0.0.1' in capsys.readouterr().out
+
+    def test_empty_confirmed_truncates_the_file(self, tmp_path):
+        """A stale confirmation line pins generate_findings() at HIGH forever
+        AND makes the deliverable assert 'host answered on a port never scanned
+        open' for a probe that never ran -- exactly what happens when an
+        operator turns honeypot_active_confirm back off."""
+        stale = tmp_path / 'confirmed_honeypots.txt'
+        stale.write_text('10.9.9.9\n')
+        _report_confirmed_honeypots(set(), str(tmp_path))
+        assert stale.exists()
+        assert stale.read_text() == ''
+
+    def test_empty_confirmed_prints_no_warning(self, tmp_path, capsys):
+        _report_confirmed_honeypots(set(), str(tmp_path))
+        assert capsys.readouterr().out == ''
+
+    def test_multiple_hosts_sorted(self, tmp_path):
+        _report_confirmed_honeypots({'10.0.0.10', '10.0.0.2'}, str(tmp_path))
+        content = (tmp_path / 'confirmed_honeypots.txt').read_text()
+        assert content.splitlines() == ['10.0.0.2', '10.0.0.10']
+
+
+class TestConfirmFlaggedHoneypots:
+    """Unit tests for _confirm_flagged_honeypots()."""
+
+    def test_empty_flagged_confirms_nothing_and_clears_stale_file(self, tmp_path):
+        stale = tmp_path / 'confirmed_honeypots.txt'
+        stale.write_text('10.9.9.9\n')
+        _confirm_flagged_honeypots({}, True, ['80'], str(tmp_path))
+        assert stale.read_text() == ''
+
+    def test_disabled_confirms_nothing_and_clears_stale_file(self, tmp_path):
+        stale = tmp_path / 'confirmed_honeypots.txt'
+        stale.write_text('10.9.9.9\n')
+        _confirm_flagged_honeypots({'10.0.0.9'}, False, ['80'], str(tmp_path))
+        assert stale.read_text() == ''
+
+    def test_disabled_skips_probe_port_selection_entirely(self, tmp_path):
+        """The enabled check must happen before the per-host loop, not only
+        inside _maybe_confirm_honeypot(): _select_confirm_probe_ports() builds
+        and samples a ~16k-element candidate set per host, and enabled=False is
+        the default and overwhelmingly common case."""
+        with patch('spoonmap._select_confirm_probe_ports') as mock_select:
+            _confirm_flagged_honeypots({'10.0.0.9', '10.0.0.10'}, False, ['80'],
+                                       str(tmp_path))
+        assert not mock_select.called
+
+    def test_enabled_does_select_probe_ports(self, tmp_path):
+        """Counterpart to the above: the early return must not swallow the
+        enabled path."""
+        with patch('spoonmap._select_confirm_probe_ports',
+                   return_value=['50000']) as mock_select:
+            _confirm_flagged_honeypots({'10.0.0.9'}, True, ['80'], str(tmp_path),
+                                       connector=lambda addr, timeout: (_ for _ in ()).throw(
+                                           OSError('refused')))
+        assert mock_select.called
+
+    def test_enabled_with_injected_connector_confirms_and_persists(self, tmp_path):
+        # Exercises the enabled=True orchestrator path end to end with a fake
+        # connector instead of a real socket connection: select probe ports,
+        # probe, collect the confirmed IP, and persist it.
+        def connector(addr, timeout):
+            if addr[0] == '10.0.0.9':
+                return contextlib.nullcontext()
+            raise OSError('refused')
+        _confirm_flagged_honeypots({'10.0.0.9', '10.0.0.10'}, True, ['80'],
+                                    str(tmp_path), connector=connector)
+        content = (tmp_path / 'confirmed_honeypots.txt').read_text()
+        assert '10.0.0.9' in content
+        assert '10.0.0.10' not in content
+
+    def test_enabled_with_no_confirming_connector_writes_empty_file(self, tmp_path):
+        def connector(addr, timeout):
+            raise OSError('refused')
+        _confirm_flagged_honeypots({'10.0.0.9'}, True, ['80'],
+                                    str(tmp_path), connector=connector)
+        assert (tmp_path / 'confirmed_honeypots.txt').read_text() == ''
+
+
+class TestScopeFilteredFlags:
+    """Unit tests for _scope_filtered_flags().
+
+    The Stage 2 active probe is the only honeypot signal that SENDS PACKETS,
+    and honeypot_flags is built from data that outlives the current
+    authorisation: full_results/port_ips are unioned with cached
+    live_hosts/portN.txt files a narrowed ranges.txt deliberately never prunes,
+    and _ttl_spread_by_host() walks every XML still sitting in
+    masscan_results/. Scanning outside the current authorisation is worse than
+    under-scanning, so out-of-scope hosts must not reach the probe.
+    """
+
+    def _scope(self, tmp_path, text='10.0.0.0/24\n'):
+        f = tmp_path / 'scope.txt'
+        f.write_text(text)
+        return spoonmap._merge_ranges(_parse_target_ranges(str(f)))
+
+    def test_out_of_scope_host_dropped(self, tmp_path):
+        scope = self._scope(tmp_path)
+        flagged = {'10.0.0.5': {'port_profile': 'X'},
+                   '192.168.1.5': {'port_profile': 'X'}}
+        assert _scope_filtered_flags(flagged, scope) == {
+            '10.0.0.5': {'port_profile': 'X'}}
+
+    def test_all_in_scope_passes_through_unchanged(self, tmp_path):
+        scope = self._scope(tmp_path)
+        flagged = {'10.0.0.5': {'ttl_spread': [64, 128]}}
+        assert _scope_filtered_flags(flagged, scope) == flagged
+
+    def test_empty_scope_is_permissive(self):
+        """Mirrors _report_out_of_scope_retained(): an absent or unparseable
+        target_file leaves no authorisation record to compare against, so
+        nothing is claimed either way rather than silently disabling a feature
+        the operator explicitly turned on."""
+        flagged = {'192.168.1.5': {'port_profile': 'X'}}
+        assert _scope_filtered_flags(flagged, []) == flagged
+
+    def test_unparseable_host_string_is_dropped(self, tmp_path):
+        """_ip_in_ranges() fails closed on anything that is not plain IPv4
+        (a hostname, an IPv6 literal, a truncated resume line)."""
+        scope = self._scope(tmp_path)
+        flagged = {'not-an-ip': {'port_profile': 'X'}}
+        assert _scope_filtered_flags(flagged, scope) == {}
+
+    def test_empty_flagged_stays_empty(self, tmp_path):
+        scope = self._scope(tmp_path)
+        assert _scope_filtered_flags({}, scope) == {}
+
+
+class TestConfirmProbeScopeFiltering:
+    """mass_scan()'s three _confirm_flagged_honeypots() call sites must
+    scope-filter honeypot_flags first. Before this, the probe ran on the raw
+    dict — ahead of _report_out_of_scope_retained(), which runs immediately
+    after at each of the same three sites and had already established these
+    IPs can come from a prior, wider engagement."""
+
+    _CANARY = sorted(HONEYPOT_PORT_PROFILES['Thinkst Canary'])
+
+    def _targets(self, tmp_path, text='10.0.0.0/24\n'):
+        f = tmp_path / 'ranges.txt'
+        f.write_text(text)
+        return str(f)
+
+    def test_batch_loop_path_drops_out_of_scope_host(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        target_file = self._targets(tmp_path)
+        # 10.0.0.9 is in scope; 192.168.50.9 is a leftover from a wider run.
+        response = {p: {'10.0.0.9', '192.168.50.9'} for p in self._CANARY}
+        with patch('spoonmap._run_masscan_batch', return_value=response), \
+             patch('spoonmap._confirm_flagged_honeypots') as mock_confirm:
+            mass_scan('All', self._CANARY, '88', '1000', target_file, '',
+                      batch_size=len(self._CANARY), honeypot_active_confirm=True)
+        passed = mock_confirm.call_args[0][0]
+        assert set(passed) == {'10.0.0.9'}
+
+    def test_full_scan_batched_path_drops_out_of_scope_host(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        target_file = self._targets(tmp_path)
+        response = {p: {'10.0.0.9', '192.168.50.9'} for p in self._CANARY}
+        with patch('spoonmap._run_masscan_batch', return_value=response), \
+             patch('spoonmap._confirm_flagged_honeypots') as mock_confirm:
+            mass_scan('Full', ['1-65535'], '53', '10000', target_file, '',
+                      honeypot_active_confirm=True)
+        passed = mock_confirm.call_args[0][0]
+        assert set(passed) == {'10.0.0.9'}
+
+    def test_full_scan_resume_path_drops_out_of_scope_host(self, tmp_path):
+        spoonmap.output_path = str(tmp_path)
+        disc = tmp_path / 'discovery'
+        (disc / 'masscan_results').mkdir(parents=True)
+        live_dir = disc / 'live_hosts'
+        live_dir.mkdir(parents=True)
+        targets = disc / 'resolved_targets.txt'
+        targets.write_text('10.0.0.0/24\n')
+        cached = disc / 'masscan_results' / 'portFull.xml'
+        cached.write_text('<nmaprun/>')
+        _write_target_stamp(cached, targets)
+        # This path reads results straight back off disk, so it is the most
+        # exposed to a live_hosts/ directory left over from a wider scope.
+        for port in self._CANARY:
+            (live_dir / f'port{port}.txt').write_text('10.0.0.9\n192.168.50.9\n')
+        with patch('spoonmap._run_masscan_batch') as mock_batch, \
+             patch('spoonmap._confirm_flagged_honeypots') as mock_confirm:
+            mass_scan('Full', ['1-65535'], '53', '10000', str(targets), '',
+                      resume=True, honeypot_active_confirm=True)
+        assert not mock_batch.called
+        passed = mock_confirm.call_args[0][0]
+        assert set(passed) == {'10.0.0.9'}
+
+    def test_out_of_scope_host_never_reaches_confirmed_file(self, tmp_path):
+        """Unpatched end to end: with a connector that would confirm ANY host,
+        the out-of-scope one must still be absent from confirmed_honeypots.txt
+        — i.e. no packet was ever sent to it."""
+        spoonmap.output_path = str(tmp_path)
+        target_file = self._targets(tmp_path)
+        response = {p: {'10.0.0.9', '192.168.50.9'} for p in self._CANARY}
+        probed = []
+
+        def connector(addr, timeout):
+            probed.append(addr[0])
+            return contextlib.nullcontext()
+
+        real_confirm = spoonmap._confirm_flagged_honeypots
+
+        def confirm_with_connector(flagged, enabled, dest_ports, disc, **kw):
+            return real_confirm(flagged, enabled, dest_ports, disc,
+                                connector=connector)
+
+        with patch('spoonmap._run_masscan_batch', return_value=response), \
+             patch('spoonmap._confirm_flagged_honeypots',
+                   side_effect=confirm_with_connector):
+            mass_scan('All', self._CANARY, '88', '1000', target_file, '',
+                      batch_size=len(self._CANARY), honeypot_active_confirm=True)
+        confirmed = (tmp_path / 'discovery' / 'confirmed_honeypots.txt').read_text()
+        assert '10.0.0.9' in confirmed
+        assert '192.168.50.9' not in confirmed
+        assert '192.168.50.9' not in probed
+
+
 # ── TestSMBCoupling ────────────────────────────────────────────────────────────
 
 class TestSMBCoupling:
@@ -12807,6 +14299,41 @@ class TestUpdateCheckIsOptIn:
         configs; this key is no exception."""
         cfg = _config_dict(check_for_updates='True')
         assert _load_config(cfg, '/t')['check_for_updates'] is True
+
+
+class TestHoneypotActiveConfirmIsOptIn:
+    """The active honeypot confirmation probe is off unless explicitly enabled.
+
+    Mirrors TestUpdateCheckIsOptIn: an unrequested probe against a suspected
+    client-deployed decoy is exactly the kind of action that must be opt-in.
+    """
+
+    def test_load_config_defaults_the_key_to_false(self):
+        cfg = _config_dict()
+        assert 'honeypot_active_confirm' not in cfg
+        assert _load_config(cfg, '/t')['honeypot_active_confirm'] is False
+
+    def test_load_config_respects_explicit_true(self):
+        cfg = _config_dict(honeypot_active_confirm=True)
+        assert _load_config(cfg, '/t')['honeypot_active_confirm'] is True
+
+    def test_build_interactive_config_defaults_to_false(self):
+        config = _build_interactive_config(
+            'All', [], 'All', True, True, 'Internal', '2000', '/t/targets.txt',
+            '/t/out', None, 5, 5, 5_000_000, True,
+        )
+        assert config['honeypot_active_confirm'] is False
+
+    def test_build_interactive_config_written_explicitly(self):
+        config = _build_interactive_config(
+            'All', [], 'All', True, True, 'Internal', '2000', '/t/targets.txt',
+            '/t/out', None, 5, 5, 5_000_000, True,
+            honeypot_active_confirm=True,
+        )
+        assert config['honeypot_active_confirm'] is True
+
+    def test_field_order_includes_the_key(self):
+        assert 'honeypot_active_confirm' in _CONFIG_FIELD_ORDER
 
 
 class TestCheckForUpdates:

@@ -25,6 +25,7 @@ import threading
 import time
 import queue
 from queue import Queue
+import random
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as etree
@@ -1918,7 +1919,320 @@ def _report_suspected_tarpits(suspected, disc):
     _atomic_write(tarpit_file, ''.join(lines))
 
 
-def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file, batch_size=1, resume=False, discovery_file=None, target_scan='Internal'):
+def _ttl_spread_by_host(masscan_dir):
+    """Return {ip: sorted distinct reason_ttl values} for hosts whose open
+    TCP ports report more than one distinct TTL in masscan's own XML output.
+
+    One host has one TCP/IP stack; every open port on a real host reports the
+    same TTL. More than one value across a host's ports is characteristic of
+    several emulated listeners behind one address (honeyd, T-Pot's per-service
+    containers) rather than a single machine. NAT/load-balancing can also
+    produce this pattern, so this signal alone is deliberately never enough to
+    reach HIGH severity -- see _honeypot_severity().
+    """
+    ttls_by_ip = {}
+    if not os.path.exists(masscan_dir):
+        return {}
+    for fname in sorted(os.listdir(masscan_dir)):
+        if not fname.endswith('.xml'):
+            continue
+        try:
+            root = etree.parse(os.path.join(masscan_dir, fname))
+        except etree.ParseError:
+            continue
+        for host in root.findall('host'):
+            addr_elem = host.find("address[@addrtype='ipv4']")
+            ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
+            if not ip:
+                continue
+            ports_elem = host.find('ports')
+            if ports_elem is None:
+                continue
+            for port_elem in ports_elem.findall('port'):
+                if port_elem.attrib.get('protocol') == 'udp':
+                    continue
+                state_elem = port_elem.find('state')
+                if state_elem is None:
+                    continue
+                ttl_text = state_elem.attrib.get('reason_ttl')
+                if ttl_text is None:
+                    continue
+                try:
+                    ttl = int(ttl_text)
+                except ValueError:
+                    continue
+                ttls_by_ip.setdefault(ip, set()).add(ttl)
+    return {ip: sorted(ttls) for ip, ttls in ttls_by_ip.items() if len(ttls) > 1}
+
+
+def _port_profile_match(open_ports):
+    """Return the matching product name when open_ports is a superset of a
+    known honeypot deployment's default port profile, else None."""
+    port_set = set(open_ports)
+    for name, profile in HONEYPOT_PORT_PROFILES.items():
+        if profile <= port_set:
+            return name
+    return None
+
+
+def _flag_honeypot_signals(port_ips, masscan_dir):
+    """Return {ip: {'ttl_spread': [...], 'port_profile': name}} for hosts
+    matching either the TTL-inconsistency or known-port-profile heuristic.
+
+    TTL spread is read back from masscan_dir's XML files (reason_ttl is not
+    threaded through port_ips's in-memory {port_key: {ips}} shape); port
+    profile matching reuses port_ips directly since it already has the
+    per-host open-port set this needs, at zero extra I/O.
+    """
+    flagged = {}
+
+    # masscan_results/ can be unreadable for reasons that have nothing to do
+    # with this signal -- most commonly a directory left root-owned by an
+    # earlier sudo run and read back by a later non-root --resume. This runs
+    # near the end of mass_scan(), after every batch has completed, so an
+    # OSError escaping here would unwind mass_scan() and main() and discard a
+    # finished scan's entire aggregation over an advisory heuristic. Degrade to
+    # no TTL-spread signal instead; the port-profile half below reads only
+    # in-memory data and is unaffected.
+    try:
+        ttl_spread = _ttl_spread_by_host(masscan_dir)
+    except OSError:
+        ttl_spread = {}
+    for ip, ttls in ttl_spread.items():
+        flagged.setdefault(ip, {})['ttl_spread'] = ttls
+
+    hosts_ports = {}
+    for port_key, ips in port_ips.items():
+        if port_key.startswith('U:'):
+            continue
+        for ip in ips:
+            hosts_ports.setdefault(ip, set()).add(port_key)
+    for ip, ports in hosts_ports.items():
+        match = _port_profile_match(ports)
+        if match:
+            flagged.setdefault(ip, {})['port_profile'] = match
+
+    return flagged
+
+
+def _scope_filtered_flags(flagged, scope_ranges):
+    """Return *flagged* with every out-of-scope host removed.
+
+    _flag_honeypot_signals() draws on data that can outlive the current
+    authorisation: port_ips/full_results are unioned with cached
+    ``live_hosts/portN.txt`` files that a narrowed ``ranges.txt`` deliberately
+    never prunes, and _ttl_spread_by_host() walks every XML file still sitting
+    in ``masscan_results/`` from an even wider set of earlier runs.  That is
+    harmless for the Stage 1 signals, which only read and disclose -- but the
+    Stage 2 active confirmation probe *sends packets*, so it must never be
+    handed a host this engagement is not authorised to touch.  Filter here, at
+    the call site, ahead of _confirm_flagged_honeypots().
+
+    An empty *scope_ranges* is permissive and returns *flagged* unchanged,
+    matching _report_out_of_scope_retained(): an absent or unparseable
+    target_file means there is no authorisation record to compare against, so
+    nothing is claimed either way rather than silently disabling a feature the
+    operator turned on.
+    """
+    if not scope_ranges:
+        return flagged
+    return {ip: signals for ip, signals in flagged.items()
+            if _ip_in_ranges(ip, scope_ranges)}
+
+
+def _report_suspected_honeypots(flagged, disc):
+    """Persist TTL-spread/port-profile flagged hosts to
+    disc/suspected_honeypots.txt and warn on stdout.
+
+    One line per (ip, signal) pair -- a host can carry both signals -- so the
+    format mirrors _report_suspected_tarpits() but is not a straight port:
+    'ip,ttl_spread,64|128' or 'ip,port_profile,Thinkst Canary'.
+
+    The file is written unconditionally, so an empty result truncates it.  This
+    diverges from _report_suspected_tarpits(), which still returns early and
+    leaves a stale file in place -- deliberately, because generate_findings()
+    now *counts* signals to pick HIGH/MEDIUM/LOW.  A leftover line from an
+    earlier, broader run used to be a merely redundant reason string; it now
+    inflates a later, narrower run's severity, and nothing else on disk would
+    show why.  Truncating is the only way a signal that stopped firing stops
+    being scored.
+    """
+    honeypot_file = os.path.join(disc, 'suspected_honeypots.txt')
+    lines = []
+    for ip in sorted(flagged, key=_ip_sort_key):
+        signals = flagged[ip]
+        if 'ttl_spread' in signals:
+            ttl_str = '|'.join(str(t) for t in signals['ttl_spread'])
+            lines.append(f'{ip},ttl_spread,{ttl_str}\n')
+            print(_COLOR_ERROR
+                  + f'Warning: {ip} returned inconsistent TTLs ({ttl_str}) across '
+                  + 'scanned ports — possible multiple emulated services behind one '
+                  + 'address.'
+                  + _COLOR_RESET)
+        if 'port_profile' in signals:
+            product = signals['port_profile']
+            lines.append(f'{ip},port_profile,{product}\n')
+            print(_COLOR_ERROR
+                  + f'Warning: {ip}\'s open ports match a candidate port profile for '
+                  + f'{product} (unverified against current upstream defaults) — '
+                  + 'possible decoy host.'
+                  + _COLOR_RESET)
+    _atomic_write(honeypot_file, ''.join(lines))
+
+
+_EXPAND_SCANNED_PORTS_MAX_SPAN = 100_000
+
+
+def _expand_scanned_ports(scanned_ports):
+    """Expand a dest_ports-style list (individual port strings and/or
+    'N-M' range strings) into the set of integer ports it covers.
+
+    dest_ports can hold range specs like '1-65535' (Full scan) or
+    '49152-65535' (a custom scan covering the ephemeral range) alongside
+    plain port numbers. Comparing those range strings against candidate
+    ports as strings (e.g. '64835' not in {'1-65535'}) is always True since
+    the range is never expanded — this expands it into real integers so
+    membership tests are correct.
+
+    dest_ports is unvalidated operator input — a hand-typed Custom port
+    list or a raw config.json value — so a malformed token ('80-', 'http',
+    '8O80', '80/tcp') is skipped rather than raising: this function runs
+    ahead of _maybe_confirm_honeypot()'s enabled-flag check, so an
+    unhandled ValueError here would abort mass_scan()/main() and discard a
+    completed scan's aggregation even when the active-probe feature is
+    off. Skipping a bad token only shrinks the "confirmed scanned" set,
+    which can only narrow the probe candidate pool, never widen it or
+    reintroduce the range-string false-positive this function fixes.
+
+    A range whose span exceeds _EXPAND_SCANNED_PORTS_MAX_SPAN (100,000 —
+    far more than any real scan needs, since the full port space is only
+    65535) is skipped rather than expanded, so a token like
+    '1-4294967295' can't materialize a multi-billion-element set.
+    """
+    expanded = set()
+    for p in scanned_ports:
+        if '-' in p:
+            start, end = p.split('-', 1)
+            try:
+                start_i, end_i = int(start), int(end)
+            except ValueError:
+                continue
+            if end_i < start_i or (end_i - start_i + 1) > _EXPAND_SCANNED_PORTS_MAX_SPAN:
+                continue
+            expanded.update(range(start_i, end_i + 1))
+        else:
+            try:
+                expanded.add(int(p))
+            except ValueError:
+                continue
+    return expanded
+
+
+def _select_confirm_probe_ports(ip, scanned_ports, count=3):
+    """Return `count` deterministic high ports, seeded from ip, that were
+    never part of this run's scanned port set.
+
+    Deterministic (seeded from the target IP, not global randomness) so the
+    probe is reproducible and testable without mocking random state. Ports
+    are drawn from the ephemeral range (49152-65535) specifically because a
+    legitimate host is unlikely to run a fixed service there, so an answer
+    is a strong tell rather than a false positive from a real service the
+    scan happened not to cover.
+
+    random.Random(ip) is deliberate, not a bandit B311 concern despite the
+    rule flagging it: this seeds decorrelated-but-reproducible probe port
+    selection per target IP, not a security or cryptographic use of
+    randomness — see .bandit-baseline.json.
+    """
+    scanned = _expand_scanned_ports(p for p in scanned_ports if not p.startswith('U:'))
+    rng = random.Random(ip)
+    candidates = [p for p in range(49152, 65536) if p not in scanned]
+    return [str(p) for p in rng.sample(candidates, min(count, len(candidates)))]
+
+
+def _active_confirm_probe(ip, probe_ports, timeout=2, connector=None):
+    """Return True if a raw TCP connect succeeds on any of probe_ports.
+
+    A real host has no reason to answer on an unscanned, unrelated ephemeral
+    port; a decoy that accepts every connection will. connector defaults to
+    socket.create_connection and is injectable for testing.
+    """
+    connect = connector or socket.create_connection
+    for port in probe_ports:
+        try:
+            with connect((ip, int(port)), timeout=timeout):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _maybe_confirm_honeypot(enabled, ip, probe_ports, connector=None):
+    """Run the active confirmation probe only if the operator opted in.
+
+    Mirrors _maybe_check_for_updates(): a thin, directly-testable gate so
+    "does a default run ever send an unrequested probe" is a real test, not
+    something buried inside mass_scan().
+    """
+    if not enabled:
+        return False
+    return _active_confirm_probe(ip, probe_ports, connector=connector)
+
+
+def _report_confirmed_honeypots(confirmed_ips, disc):
+    """Persist actively-confirmed decoy hosts to disc/confirmed_honeypots.txt
+    and warn on stdout.
+
+    Written unconditionally, so an empty result truncates it -- same reasoning
+    as _report_suspected_honeypots(), and more acute here: a stale line pins
+    generate_findings() at HIGH *and* makes the deliverable assert "active
+    confirmation probe: host answered ..." for a probe that did not run this
+    time at all, which is exactly what happens when an operator turns
+    honeypot_active_confirm back off.
+    """
+    confirmed_file = os.path.join(disc, 'confirmed_honeypots.txt')
+    lines = []
+    for ip in sorted(confirmed_ips, key=_ip_sort_key):
+        lines.append(f'{ip}\n')
+        print(_COLOR_ERROR
+              + f'Warning: {ip} answered a connection on a port never scanned open '
+              + 'during this run — confirmed decoy/honeypot host.'
+              + _COLOR_RESET)
+    _atomic_write(confirmed_file, ''.join(lines))
+
+
+def _confirm_flagged_honeypots(flagged, enabled, dest_ports, disc, connector=None):
+    """Run the active probe (if enabled) against every host
+    _flag_honeypot_signals() flagged, and persist whichever ones answer.
+
+    connector is threaded through to _maybe_confirm_honeypot() /
+    _active_confirm_probe() and is injectable for testing, so the
+    enabled=True path can be exercised with a fake connector instead of a
+    real socket connection or internals-patching.
+
+    The enabled check happens *here*, not only inside _maybe_confirm_honeypot():
+    _select_confirm_probe_ports() builds and samples a ~16k-element candidate
+    set per host, and enabled=False is the default and overwhelmingly common
+    case, so doing that work only to discard it was pure waste on every scan
+    that flagged anything.  _report_confirmed_honeypots() is still called on
+    that path -- with an empty set, which truncates any stale
+    confirmed_honeypots.txt.  Skipping it would leave a previous run's
+    confirmations feeding generate_findings()'s severity math after the
+    operator turned the probe back off, which is the precise scenario that file
+    truncation exists to prevent.
+    """
+    if not flagged or not enabled:
+        _report_confirmed_honeypots(set(), disc)
+        return
+    confirmed = set()
+    for ip in flagged:
+        probe_ports = _select_confirm_probe_ports(ip, dest_ports)
+        if _maybe_confirm_honeypot(enabled, ip, probe_ports, connector=connector):
+            confirmed.add(ip)
+    _report_confirmed_honeypots(confirmed, disc)
+
+
+def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file, batch_size=1, resume=False, discovery_file=None, target_scan='Internal', honeypot_active_confirm=False):
     status_summary = '\nSummary'
 
     if not os.path.exists(f'{_disc(output_path)}/masscan_results'):
@@ -1996,6 +2310,13 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                         status_summary += status_update
                         print(_COLOR_PROGRESS + status_update + _COLOR_RESET)
             _report_suspected_tarpits(_flag_suspected_tarpits(full_results, 65535), disc)
+            honeypot_flags = _flag_honeypot_signals(full_results, f'{disc}/masscan_results')
+            _report_suspected_honeypots(honeypot_flags, disc)
+            # Scope-filter before the probe: this is the only honeypot signal
+            # that sends packets, and honeypot_flags can carry hosts from a
+            # prior, wider engagement (see _scope_filtered_flags).
+            _confirm_flagged_honeypots(_scope_filtered_flags(honeypot_flags, scope_ranges),
+                                       honeypot_active_confirm, dest_ports, disc)
             # This path's results are read straight back off disk, so it is the
             # most exposed to a live_hosts/ directory left over from a wider scope.
             _report_out_of_scope_retained(full_results, scope_ranges, target_file)
@@ -2048,6 +2369,11 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             status_summary += status_update
             print(_COLOR_PROGRESS + status_update + _COLOR_RESET)
         _report_suspected_tarpits(_flag_suspected_tarpits(full_results, 65535), disc)
+        honeypot_flags = _flag_honeypot_signals(full_results, f'{disc}/masscan_results')
+        _report_suspected_honeypots(honeypot_flags, disc)
+        # Scope-filter before the probe -- see _scope_filtered_flags().
+        _confirm_flagged_honeypots(_scope_filtered_flags(honeypot_flags, scope_ranges),
+                                   honeypot_active_confirm, dest_ports, disc)
         # Retaining cached hosts means this path can now carry a host from a
         # previous, wider engagement scope, exactly as the resume path can, so it
         # owes the operator the same disclosure.
@@ -2322,6 +2648,11 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             _print_completion_status('Masscan', batch_idx + 1, total_batches, scan_start_time)
 
     _report_suspected_tarpits(_flag_suspected_tarpits(port_ips, len(tcp_ports)), disc)
+    honeypot_flags = _flag_honeypot_signals(port_ips, f'{disc}/masscan_results')
+    _report_suspected_honeypots(honeypot_flags, disc)
+    # Scope-filter before the probe -- see _scope_filtered_flags().
+    _confirm_flagged_honeypots(_scope_filtered_flags(honeypot_flags, scope_ranges),
+                               honeypot_active_confirm, dest_ports, disc)
 
     # ── SMB port coupling ─────────────────────────────────────────────────────
     smb_in_scope = [p for p in _SMB_COUPLED_PORTS if p in set(dest_ports)]
@@ -2956,6 +3287,39 @@ HONEYPOT_MIN_PORTS_SCANNED = 10      # need enough sample size to trust the rati
 HONEYPOT_OPEN_PORT_FRACTION = 0.9    # fraction of scanned TCP ports found open on one host
 HONEYPOT_MIN_UNMATCHED_PORTS = 3     # open ports with an unidentified (servicefp) response
 
+def _honeypot_severity(signals, named_match=False, confirmed=False):
+    """Return 'HIGH'/'MEDIUM'/'LOW', or None when nothing is flagged.
+
+    HIGH requires near-certainty: a named-product signature match or an
+    active probe confirmation. Two or more independent heuristic signals
+    ('ratio', 'unmatched_fp', 'silent', 'ttl_spread', 'port_profile')
+    together are MEDIUM; any single heuristic signal alone is LOW. This
+    structurally keeps TTL spread -- which NAT/load-balancing can also
+    produce -- from ever reaching HIGH on its own: it can only ever be one
+    signal among the set, never named_match or confirmed.
+    """
+    if named_match or confirmed:
+        return 'HIGH'
+    if len(signals) >= 2:
+        return 'MEDIUM'
+    if len(signals) == 1:
+        return 'LOW'
+    return None
+
+# Port sets characteristic of known deception/decoy tooling default
+# deployments. Superset match, not exact: an operator-customised deployment
+# (an extra port, or unrelated services sharing the box) should still match
+# on its known baseline.
+#
+# NOTE: these are placeholders pending verification against current upstream
+# defaults before shipping -- both projects' default port lists can change
+# between releases and installs are commonly customised. Verify against each
+# project's current documentation/config before relying on this in a report.
+HONEYPOT_PORT_PROFILES = {
+    'Thinkst Canary': frozenset(['21', '22', '23', '80', '443', '445', '3389']),
+    'Artillery':       frozenset(['21', '22', '23', '25', '80', '443', '3306', '3389', '8080']),
+}
+
 # Scripts run on EXTERNAL scans only
 EXTERNAL_PORT_SCRIPTS = {
     '21':    'ftp-anon',
@@ -3478,19 +3842,17 @@ def _classify_sql(hostname, ms_sql_output='', azure_output=''):
     return False, None, year
 
 
-def _count_unmatched_service_ports(output_path):
-    """Return {ip: count} of open TCP ports whose nmap -sV probe captured data
-    that matched none of nmap's service signatures.
+def _iter_open_tcp_ports(output_path):
+    """Yield (ip, service_elem) for every open TCP port in nmap_results/*.xml.
 
-    nmap only sets the service element's servicefp attribute when it connected,
-    read data back, and failed to identify it against any known protocol —
-    a strong tell for decoy tools (e.g. Artillery) that hand back a random
-    string on every full connect instead of speaking a real protocol.
+    service_elem is None when nmap recorded no <service> element at all.
+    Shared by _count_unmatched_service_ports() and _count_silent_open_ports()
+    so the XML-walk defensiveness (skip a host with no addr, skip malformed
+    XML, skip UDP files) lives in one place instead of being duplicated.
     """
     nmap_dir = f'{output_path}/nmap_results'
-    counts = {}
     if not os.path.exists(nmap_dir):
-        return counts
+        return
     for fname in sorted(os.listdir(nmap_dir)):
         if not fname.endswith('.xml') or fname.startswith('portU_'):
             continue
@@ -3511,10 +3873,138 @@ def _count_unmatched_service_ports(output_path):
                 state_elem = port_elem.find('state')
                 if state_elem is not None and state_elem.attrib.get('state') != 'open':
                     continue
-                service_elem = port_elem.find('service')
-                if service_elem is not None and service_elem.attrib.get('servicefp'):
-                    counts[ip] = counts.get(ip, 0) + 1
+                yield ip, port_elem.find('service')
+
+
+def _count_unmatched_service_ports(output_path):
+    """Return {ip: count} of open TCP ports whose nmap -sV probe captured data
+    that matched none of nmap's service signatures.
+
+    nmap only sets the service element's servicefp attribute when it connected,
+    read data back, and failed to identify it against any known protocol —
+    a strong tell for decoy tools (e.g. Artillery) that hand back a random
+    string on every full connect instead of speaking a real protocol.
+    """
+    counts = {}
+    for ip, service_elem in _iter_open_tcp_ports(output_path):
+        if service_elem is not None and service_elem.attrib.get('servicefp'):
+            counts[ip] = counts.get(ip, 0) + 1
     return counts
+
+
+def _count_silent_open_ports(output_path):
+    """Return {ip: count} of open TCP ports where nmap's -sV probe got
+    nothing at all back — no service name, no product, no servicefp.
+
+    Complements _count_unmatched_service_ports(), which only counts ports
+    where nmap connected and read *some* data that failed to match a
+    signature (servicefp set). A tarpit that holds the connection open and
+    sends nothing back scores zero on that check but is exactly what this
+    one is for.
+    """
+    counts = {}
+    for ip, service_elem in _iter_open_tcp_ports(output_path):
+        if service_elem is None:
+            counts[ip] = counts.get(ip, 0) + 1
+            continue
+        attrib = service_elem.attrib
+        if not attrib.get('name') and not attrib.get('product') and not attrib.get('servicefp'):
+            counts[ip] = counts.get(ip, 0) + 1
+    return counts
+
+
+# Well-known *default, unconfigured* banners of common honeypot/decoy
+# products, matched against the concatenated product/version/extrainfo text
+# nmap's -sV already captures.
+#
+# DELIBERATELY EMPTY. This ships with no generic banner signatures. Two
+# candidates (Cowrie/Kippo and Dionaea) were carried here during development
+# and both were verified *incorrect* against nmap's actual output in final
+# review, so they were removed rather than patched in place:
+#
+#   - Cowrie/Kippo: the needle used a hyphen ('OpenSSH 6.0p1 Debian-4+deb7u2'),
+#     but nmap's own nmap-service-probes match template for that banner renders
+#     it with a space ('... Debian 4+deb7u2'), so it could never fire. The
+#     superficial fix -- swap the hyphen for a space -- is strictly worse:
+#     nmap applies that same space-insertion to *every* genuine Debian OpenSSH
+#     host, so the "fixed" signature would report HIGH-severity honeypot on one
+#     of the most common SSH banners on the internet.
+#   - Dionaea: the needle ('Welcome to the ftp service') is an unrecognised
+#     banner, which nmap records in the service element's `servicefp`
+#     attribute. _named_honeypot_matches() reads only product/version/extrainfo,
+#     so no such string can ever reach the matcher.
+#
+# The mechanism below (this tuple, _honeypot_signature_match(),
+# _named_honeypot_matches()) is kept as the extensibility point so a future
+# verified signature is a one-line addition rather than a re-thread of the
+# whole path. Add an entry here ONLY after confirming it against real `-sV`
+# output from the product in question -- not against a synthetic test fixture,
+# which is exactly what let both removed entries look correct for so long.
+# The one named-product match this release does ship is the independently
+# source-verified Heralding VNC tell in _vnc_heralding_match(), which does not
+# use this table at all.
+HONEYPOT_SIGNATURES = ()
+
+
+def _honeypot_signature_match(text):
+    """Return the matching product name when text contains a known
+    default/unconfigured honeypot banner, else None."""
+    for needle, product in HONEYPOT_SIGNATURES:
+        if needle in text:
+            return product
+    return None
+
+
+def _named_honeypot_matches(output_path):
+    """Return {ip: product_name} for hosts whose -sV service banner matches
+    a known default honeypot signature. First match wins per host."""
+    matches = {}
+    for ip, service_elem in _iter_open_tcp_ports(output_path):
+        if ip in matches or service_elem is None:
+            continue
+        attrib = service_elem.attrib
+        text = ' '.join(filter(None, (
+            attrib.get('product'), attrib.get('version'), attrib.get('extrainfo'))))
+        if not text:
+            continue
+        product = _honeypot_signature_match(text)
+        if product:
+            matches[ip] = product
+    return matches
+
+
+def _vnc_heralding_match(output_path):
+    """Return {ip: 'Heralding VNC Honeypot'} for hosts whose vnc-info output
+    matches Heralding's VNC capability: it hardcodes RFB protocol version 3.7
+    and closes the connection before ever sending a security-type list,
+    unlike any real RFB implementation (which always completes that
+    exchange, even on legacy 3.7 servers). Verified against upstream source
+    (johnnykv/heralding, heralding/capabilities/vnc.py)."""
+    matches = {}
+    nse_dir = f'{output_path}/nse_results'
+    if not os.path.exists(nse_dir):
+        return matches
+    for fname in sorted(os.listdir(nse_dir)):
+        if not fname.endswith('.xml') or fname.startswith('portU_'):
+            continue
+        try:
+            root = etree.parse(f'{nse_dir}/{fname}')
+        except etree.ParseError:
+            continue
+        for host in root.findall('host'):
+            addr_elem = host.find("address[@addrtype='ipv4']")
+            ip = addr_elem.attrib.get('addr') if addr_elem is not None else None
+            if not ip or ip in matches:
+                continue
+            for port_elem in host.findall('.//port'):
+                script_elem = port_elem.find("script[@id='vnc-info']")
+                if script_elem is None:
+                    continue
+                out = script_elem.attrib.get('output', '')
+                if '3.7' in out and 'Security types' not in out:
+                    matches[ip] = 'Heralding VNC Honeypot'
+                break
+    return matches
 
 
 def generate_findings(output_path, target_scan, snmp_any_validated=None):
@@ -3594,9 +4084,16 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                 if ip:
                     printer_ips.add(ip)
 
-    # ── suspected honeypot / tarpit hosts ─────────────────────────────────────
-    tarpit_hosts = {}   # {ip: (open_count, total_scanned)}
-    tarpit_file = f'{_disc(output_path)}/suspected_tarpits.txt'
+    # ── suspected honeypot / decoy hosts ──────────────────────────────────────
+    disc = _disc(output_path)
+    signals_by_ip = {}   # {ip: {signal_name, ...}}
+    reasons_by_ip = {}   # {ip: [human-readable reason, ...]}
+
+    def _add_signal(ip, name, reason):
+        signals_by_ip.setdefault(ip, set()).add(name)
+        reasons_by_ip.setdefault(ip, []).append(reason)
+
+    tarpit_file = f'{disc}/suspected_tarpits.txt'
     if os.path.exists(tarpit_file):
         # _report_suspected_tarpits() writes this file line by line, not
         # atomically, so an interrupt or a full disk can leave a partial final
@@ -3612,29 +4109,102 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                     if len(parts) == 3:
                         ip, open_count, total = parts
                         try:
-                            tarpit_hosts[ip] = (int(open_count), int(total))
+                            oc, total_i = int(open_count), int(total)
                         except ValueError:
                             continue
+                        _add_signal(ip, 'ratio',
+                                    f'{oc}/{total_i} scanned TCP ports responded open')
         except OSError:
-            tarpit_hosts = {}
+            pass
 
-    unmatched_counts = _count_unmatched_service_ports(output_path)  # {ip: count}
-    unmatched_flagged = {ip for ip, count in unmatched_counts.items()
-                         if count >= HONEYPOT_MIN_UNMATCHED_PORTS}
+    # A directory-walk failure here (e.g. nmap_results/ left root-owned by an
+    # earlier sudo run, then read by a later non-root --resume) must degrade
+    # this one signal source to "no data", never take down the findings phase
+    # -- same guarantee the file readers above already have.
+    try:
+        unmatched_counts = _count_unmatched_service_ports(output_path)
+    except OSError:
+        unmatched_counts = {}
+    for ip, count in unmatched_counts.items():
+        if count >= HONEYPOT_MIN_UNMATCHED_PORTS:
+            _add_signal(ip, 'unmatched_fp',
+                        f'{count} open ports returned data matching no known service signature')
 
-    for ip in sorted(set(tarpit_hosts) | unmatched_flagged):
-        reasons = []
-        if ip in tarpit_hosts:
-            open_count, total = tarpit_hosts[ip]
-            reasons.append(f'{open_count}/{total} scanned TCP ports responded open')
-        if ip in unmatched_flagged:
-            reasons.append(f'{unmatched_counts[ip]} open ports returned data matching '
-                            'no known service signature')
-        add('MEDIUM', ip, 'multiple', 'Likely Honeypot / Decoy Host',
+    try:
+        silent_counts = _count_silent_open_ports(output_path)
+    except OSError:
+        silent_counts = {}
+    for ip, count in silent_counts.items():
+        if count >= HONEYPOT_MIN_UNMATCHED_PORTS:
+            _add_signal(ip, 'silent',
+                        f'{count} open ports accepted a connection and returned no data at all')
+
+    honeypot_file = f'{disc}/suspected_honeypots.txt'
+    if os.path.exists(honeypot_file):
+        try:
+            with open(honeypot_file) as fh:
+                for line in fh:
+                    parts = line.strip().split(',', 2)
+                    if len(parts) == 3:
+                        ip, sig_type, value = parts
+                        if sig_type == 'ttl_spread':
+                            _add_signal(ip, 'ttl_spread',
+                                        f'TCP responses observed with inconsistent TTLs '
+                                        f'({value}) across scanned ports on one host')
+                        elif sig_type == 'port_profile':
+                            # The caveat is load-bearing: HONEYPOT_PORT_PROFILES
+                            # is still an unverified placeholder table, and this
+                            # string lands verbatim in an engagement deliverable.
+                            _add_signal(ip, 'port_profile',
+                                        f'open port set matches a candidate port '
+                                        f'profile for {value} (unverified against '
+                                        f'current upstream defaults)')
+        except OSError:
+            pass
+
+    try:
+        named_matches = _named_honeypot_matches(output_path)  # {ip: product_name}
+    except OSError:
+        named_matches = {}
+    try:
+        vnc_matches = _vnc_heralding_match(output_path)
+    except OSError:
+        vnc_matches = {}
+    named_matches.update(vnc_matches)  # merge in the vnc-info-based signal
+
+    confirmed_ips = set()
+    confirmed_file = f'{disc}/confirmed_honeypots.txt'
+    if os.path.exists(confirmed_file):
+        try:
+            with open(confirmed_file) as fh:
+                confirmed_ips = {line.strip() for line in fh if line.strip()}
+        except OSError:
+            pass
+
+    all_flagged_ips = set(signals_by_ip) | set(named_matches) | confirmed_ips
+    for ip in sorted(all_flagged_ips, key=_ip_sort_key):
+        signals = signals_by_ip.get(ip, set())
+        named_present = ip in named_matches
+        named = named_matches.get(ip)
+        confirmed = ip in confirmed_ips
+        severity = _honeypot_severity(signals, named_match=named_present, confirmed=confirmed)
+        if severity is None:
+            # Unreachable: every ip in all_flagged_ips is a member of
+            # signals_by_ip, named_matches, or confirmed_ips, and
+            # _honeypot_severity() returns non-None for any non-empty
+            # combination of those three inputs.
+            continue  # pragma: no cover
+        reasons = list(reasons_by_ip.get(ip, []))
+        if named_present:
+            reasons.insert(0, f'service fingerprint matches known honeypot product {named}')
+        if confirmed:
+            reasons.append('active confirmation probe: host answered on a port never '
+                            'scanned open, consistent with a decoy accepting all connections')
+        add(severity, ip, 'multiple', 'Likely Honeypot / Decoy Host',
             '; '.join(reasons) + '. Consistent with tarpit/decoy tooling (e.g. LaBrea, '
-            'portspoof, Artillery) rather than a genuine service host. Recommend '
-            'deprioritizing further enumeration of this host and manually validating '
-            'before trusting other findings collected from it.')
+            'portspoof, Cowrie, Dionaea, Artillery, Thinkst Canary) rather than a genuine '
+            'service host. Recommend deprioritizing further enumeration of this host and '
+            'manually validating before trusting other findings collected from it.')
 
     # ── parse every nmap XML result file ─────────────────────────────────────
     open_ports_by_host = {}  # {ip: [port_key, ...]} — for external exposure check
@@ -5465,6 +6035,21 @@ _CONFIG_DOCS = {
          'tool makes no network connection other than the scan itself unless you turn '
          'this on. Use --check-update for a one-off check without enabling it here.'),
     ],
+    'honeypot_active_confirm': [
+        ('__honeypot_active_confirm_note__',
+         'Optional. When true, SpooNMAP attempts a small number of raw TCP connects '
+         'against unscanned high ports on any host flagged by the TTL-spread or '
+         'port-profile signals, to confirm it. Hosts flagged only by the tarpit '
+         'open-port-ratio heuristic are not probed. Default false, and absent means '
+         'false: the tool sends no traffic beyond the scan itself unless you turn '
+         'this on. A confirmed host answered a port that was never part of this '
+         'scan, which is a strong tell that it accepts every connection rather than '
+         'running a real service. Limitations: hosts outside target_file are never '
+         'probed; on a Full (1-65535) scan there are almost no unscanned ports left '
+         'to probe, so it does little or nothing; and honeypot detection as a whole '
+         'only runs on the masscan path, not the direct-nmap path used for scans '
+         'below nmap_threshold.'),
+    ],
     'target_scan': [
         ('__target_scan_choices__',
          'External, Internal (case-insensitive; any other value stops the run '
@@ -5491,7 +6076,8 @@ _CONFIG_DOCS = {
 # Canonical key order for a written config.json, matching config.json.sample.
 _CONFIG_FIELD_ORDER = (
     'scan_categories', 'dest_ports', 'masscan_batch_size', 'banner_scan',
-    'script_scan', 'host_discovery', 'resume', 'check_for_updates', 'target_scan', 'max_rate',
+    'script_scan', 'host_discovery', 'resume', 'check_for_updates',
+    'honeypot_active_confirm', 'target_scan', 'max_rate',
     'nmap_threads', 'nmap_threshold', 'target_file', 'output_path',
     'exclusions_file',
 )
@@ -5501,7 +6087,7 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
                               script_scan, target_scan, max_rate, target_file,
                               output_path, exclusions_file, nmap_threads,
                               masscan_batch_size, nmap_threshold, host_discovery,
-                              check_for_updates=False):
+                              check_for_updates=False, honeypot_active_confirm=False):
     """Build a config.json-compatible dict from interactively collected options.
 
     The result round-trips through main()'s config loader: reloading it
@@ -5539,6 +6125,7 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
         'host_discovery': bool(host_discovery),
         'resume': False,
         'check_for_updates': bool(check_for_updates),
+        'honeypot_active_confirm': bool(honeypot_active_confirm),
         'target_scan': target_scan,
         'max_rate': str(max_rate),
         'nmap_threads': int(nmap_threads),
@@ -5863,6 +6450,10 @@ def _load_config(config_parser, dir_path, resume=False):
     # enable a launch-time network call; see _check_for_updates().
     check_for_updates = _config_bool(
         'check_for_updates', config_parser.get('check_for_updates', False), False)
+    # Same posture as check_for_updates: absent means off, and this is the
+    # only way to enable the active probe. See _maybe_confirm_honeypot().
+    honeypot_active_confirm = _config_bool(
+        'honeypot_active_confirm', config_parser.get('honeypot_active_confirm', False), False)
     config_generated = bool(config_parser.get(_CONFIG_GENERATED_KEY))
 
     # Resolve relative paths in config relative to the operator directory
@@ -5891,6 +6482,7 @@ def _load_config(config_parser, dir_path, resume=False):
         'host_discovery': host_discovery,
         'resume': resume,
         'check_for_updates': check_for_updates,
+        'honeypot_active_confirm': honeypot_active_confirm,
         'config_generated': config_generated,
     }
 
@@ -6112,6 +6704,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         nmap_threshold = 5_000_000  # Default work-unit threshold for tool selection
         host_discovery = None   # None = prompt user; True/False = set from config
         check_for_updates = False  # no interactive prompt; only set via config.json
+        honeypot_active_confirm = False  # no interactive prompt; only set via config.json
 
 
         # Get options from configuration file if it exists
@@ -6149,6 +6742,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             resume             = cfg['resume']
             config_generated   = cfg['config_generated']
             check_for_updates  = cfg['check_for_updates']
+            honeypot_active_confirm = cfg['honeypot_active_confirm']
 
             _maybe_check_for_updates(check_for_updates)
 
@@ -6457,7 +7051,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 scan_categories, dest_ports, scan_type, banner_scan, script_scan,
                 target_scan, max_rate, target_file, output_path, exclusions_file,
                 nmap_threads, masscan_batch_size, nmap_threshold, host_discovery,
-                check_for_updates,
+                check_for_updates, honeypot_active_confirm,
             )
             config_json_path = f'{dir_path}/config.json'
             if _write_interactive_config(config_json_path, interactive_config):
@@ -6542,6 +7136,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 exclusions_file, masscan_batch_size,
                 resume=resume, discovery_file=discovery_file,
                 target_scan=target_scan,
+                honeypot_active_confirm=honeypot_active_confirm,
             )
 
         # If service banners requested, send to nmap
