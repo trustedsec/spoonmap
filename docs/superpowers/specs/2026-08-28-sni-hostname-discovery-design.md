@@ -73,7 +73,7 @@ to find, and the walk is a no-op.
 
 ## Findings
 
-New INFO-severity finding in `generate_findings()`, alongside the existing
+New LOW-severity finding in `generate_findings()`, alongside the existing
 expired-certificate check (same `'ssl-cert' in scripts and target_scan ==
 'External'` gate at `spoonmap.py:3845`):
 
