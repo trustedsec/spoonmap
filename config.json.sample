@@ -18,6 +18,8 @@
     "resume" : false,
     "__check_for_updates_note__": "Optional. When true, SpooNMAP contacts api.github.com at startup to see whether a newer release exists. Default false, and absent means false: the tool makes no network connection other than the scan itself unless you turn this on. Use --check-update for a one-off check without enabling it here.",
     "check_for_updates": false,
+    "__honeypot_active_confirm_note__": "Optional. When true, SpooNMAP attempts a small number of raw TCP connects against unscanned high ports on any host flagged as a suspected honeypot, to confirm it. Default false, and absent means false: the tool sends no traffic beyond the scan itself unless you turn this on. A confirmed host answered a port that was never part of this scan, which is a strong tell that it accepts every connection rather than running a real service.",
+    "honeypot_active_confirm": false,
     "__target_scan_choices__" : "External, Internal (case-insensitive; any other value stops the run rather than scanning with the Internal-only checks silently skipped)",
     "target_scan" : "Internal",
     "__max_rate_external_recommendation__" : "Default = 20000 (full port scan capped at 10000)",

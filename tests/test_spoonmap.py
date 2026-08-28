@@ -13748,6 +13748,41 @@ class TestUpdateCheckIsOptIn:
         assert _load_config(cfg, '/t')['check_for_updates'] is True
 
 
+class TestHoneypotActiveConfirmIsOptIn:
+    """The active honeypot confirmation probe is off unless explicitly enabled.
+
+    Mirrors TestUpdateCheckIsOptIn: an unrequested probe against a suspected
+    client-deployed decoy is exactly the kind of action that must be opt-in.
+    """
+
+    def test_load_config_defaults_the_key_to_false(self):
+        cfg = _config_dict()
+        assert 'honeypot_active_confirm' not in cfg
+        assert _load_config(cfg, '/t')['honeypot_active_confirm'] is False
+
+    def test_load_config_respects_explicit_true(self):
+        cfg = _config_dict(honeypot_active_confirm=True)
+        assert _load_config(cfg, '/t')['honeypot_active_confirm'] is True
+
+    def test_build_interactive_config_defaults_to_false(self):
+        config = _build_interactive_config(
+            'All', [], 'All', True, True, 'Internal', '2000', '/t/targets.txt',
+            '/t/out', None, 5, 5, 5_000_000, True,
+        )
+        assert config['honeypot_active_confirm'] is False
+
+    def test_build_interactive_config_written_explicitly(self):
+        config = _build_interactive_config(
+            'All', [], 'All', True, True, 'Internal', '2000', '/t/targets.txt',
+            '/t/out', None, 5, 5, 5_000_000, True,
+            honeypot_active_confirm=True,
+        )
+        assert config['honeypot_active_confirm'] is True
+
+    def test_field_order_includes_the_key(self):
+        assert 'honeypot_active_confirm' in _CONFIG_FIELD_ORDER
+
+
 class TestCheckForUpdates:
     """The check itself: comparison, output, and total failure tolerance."""
 
