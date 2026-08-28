@@ -2023,6 +2023,10 @@ class TestHoneypotSignatureMatch:
         needle, product = HONEYPOT_SIGNATURES[0]
         assert _honeypot_signature_match(f'prefix {needle} suffix') == product
 
+    def test_dionaea_signature_matches(self):
+        needle, product = HONEYPOT_SIGNATURES[1]
+        assert _honeypot_signature_match(f'220 {needle}') == product
+
     def test_unrelated_text_no_match(self):
         assert _honeypot_signature_match('OpenSSH 9.6p1 Ubuntu') is None
 
@@ -2064,10 +2068,38 @@ class TestNamedHoneypotMatches:
         (nmap_results / 'port22.xml').write_text(xml)
         assert _named_honeypot_matches(str(tmp_path)) == {'10.0.0.1': product}
 
+    def test_signature_match_only_in_extrainfo(self, tmp_path):
+        """product/version alone don't contain the signature substring — only
+        extrainfo does. Confirms extrainfo is actually consulted, not just
+        accepted as a parameter that's never populated with the needle."""
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        needle, product = HONEYPOT_SIGNATURES[0]
+        xml = self._xml('10.0.0.9', '22', product='OpenSSH', version='9.6p1',
+                         extrainfo=needle)
+        (nmap_results / 'port22.xml').write_text(xml)
+        assert _named_honeypot_matches(str(tmp_path)) == {'10.0.0.9': product}
+
     def test_no_service_element_no_match(self, tmp_path):
         nmap_results = tmp_path / 'nmap_results'
         nmap_results.mkdir()
         (nmap_results / 'port22.xml').write_text(self._xml('10.0.0.2', '22'))
+        assert _named_honeypot_matches(str(tmp_path)) == {}
+
+    def test_service_element_with_no_attributes_no_match(self, tmp_path):
+        """A <service/> element with none of product/version/extrainfo set
+        joins to an empty string; must be skipped, not passed to the
+        signature matcher."""
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="10.0.0.10" addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="22">'
+            '<state state="open"/><service/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nmap_results / 'port22.xml').write_text(xml)
         assert _named_honeypot_matches(str(tmp_path)) == {}
 
     def test_unrelated_service_no_match(self, tmp_path):
@@ -2078,16 +2110,21 @@ class TestNamedHoneypotMatches:
         assert _named_honeypot_matches(str(tmp_path)) == {}
 
     def test_first_match_wins_per_host(self, tmp_path):
+        """Same host has two ports that would EACH independently match a
+        different signature. _iter_open_tcp_ports() walks nmap_results/*.xml
+        in sorted filename order, so 'port21.xml' (Dionaea) is encountered
+        before 'port22.xml' (Cowrie/Kippo) and must be the one that wins."""
         nmap_results = tmp_path / 'nmap_results'
         nmap_results.mkdir()
-        needle, product = HONEYPOT_SIGNATURES[0]
-        parts = needle.split(' ', 1)
-        xml = self._xml('10.0.0.4', '22', product=parts[0],
-                         version=parts[1] if len(parts) > 1 else '')
-        (nmap_results / 'port22.xml').write_text(xml)
-        xml2 = self._xml('10.0.0.4', '80', product='OpenSSH', version='9.6p1')
-        (nmap_results / 'port80.xml').write_text(xml2)
-        assert _named_honeypot_matches(str(tmp_path)) == {'10.0.0.4': product}
+        cowrie_needle, cowrie_product = HONEYPOT_SIGNATURES[0]
+        dionaea_needle, dionaea_product = HONEYPOT_SIGNATURES[1]
+        cowrie_parts = cowrie_needle.split(' ', 1)
+        xml21 = self._xml('10.0.0.4', '21', product=dionaea_needle)
+        (nmap_results / 'port21.xml').write_text(xml21)
+        xml22 = self._xml('10.0.0.4', '22', product=cowrie_parts[0],
+                           version=cowrie_parts[1] if len(cowrie_parts) > 1 else '')
+        (nmap_results / 'port22.xml').write_text(xml22)
+        assert _named_honeypot_matches(str(tmp_path)) == {'10.0.0.4': dionaea_product}
 
 
 class TestVncHeraldingMatch:
@@ -2136,6 +2173,53 @@ class TestVncHeraldingMatch:
             '<host><address addr="10.0.0.4" addrtype="ipv4"/>'
             '<ports><port protocol="tcp" portid="5900">'
             '<state state="open"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+    def test_udp_named_result_file_skipped(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = self._xml('10.0.0.5', '5900', 'Protocol version: 3.7')
+        (nse_results / 'portU_5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+    def test_malformed_xml_in_one_file_does_not_block_other_files(self, tmp_path):
+        """A truncated/killed-scan XML file must not raise past the guard and
+        abort the walk for every other result file."""
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        (nse_results / 'port5900.xml').write_text('<nmaprun><host>')
+        xml = self._xml('10.0.0.6', '5901', 'Protocol version: 3.7')
+        (nse_results / 'port5901.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {'10.0.0.6': 'Heralding VNC Honeypot'}
+
+    def test_address_without_addr_attribute_skipped(self, tmp_path):
+        """A bare attrib['addr'] would raise KeyError, which `except
+        etree.ParseError` does not catch."""
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addrtype="ipv4"/>'
+            '<ports><port protocol="tcp" portid="5900">'
+            '<state state="open"/>'
+            '<script id="vnc-info" output="Protocol version: 3.7"/>'
+            '</port></ports></host></nmaprun>'
+        )
+        (nse_results / 'port5900.xml').write_text(xml)
+        assert _vnc_heralding_match(str(tmp_path)) == {}
+
+    def test_mac_only_address_skipped(self, tmp_path):
+        nse_results = tmp_path / 'nse_results'
+        nse_results.mkdir()
+        xml = (
+            '<?xml version="1.0"?><nmaprun>'
+            '<host><address addr="AA:BB:CC:DD:EE:FF" addrtype="mac"/>'
+            '<ports><port protocol="tcp" portid="5900">'
+            '<state state="open"/>'
+            '<script id="vnc-info" output="Protocol version: 3.7"/>'
             '</port></ports></host></nmaprun>'
         )
         (nse_results / 'port5900.xml').write_text(xml)
