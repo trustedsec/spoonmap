@@ -6,6 +6,7 @@ import io
 import json
 import os
 import readline
+import shutil
 import subprocess
 import textwrap
 import threading
@@ -103,6 +104,29 @@ from spoonmap import (
     _scan_extra_sql_ports,
     _validate_snmp_any_community,
     _SMB_COUPLED_PORTS,
+    _build_nmap_overlay,
+    _config_scanner_profile,
+    _decode_probe_string,
+    _generate_scanner_tokens,
+    _locate_nmap_datadir,
+    _merge_script_args,
+    _overlay_dir,
+    _probe_length_field_ok,
+    _rewrite_literal,
+    _rewrite_rdp_lua,
+    _rewrite_service_probes,
+    _rewrite_shortport_ssl,
+    _rewrite_smb_lua,
+    _scan_profile_path,
+    _validate_scanner_token,
+    _verify_nmap_overlay,
+    _write_scan_profile_record,
+    _PROBE_TOKEN_POOL,
+    _SCANNER_PROFILE_TOKEN_KEYS,
+    _CLEANUP_ONLY_DIRS,
+    _CLEANUP_ONLY_FILES,
+    _RESULT_DIRS,
+    _RESULT_FILES,
     SERVICE_CATEGORIES,
     _calc_scan_wait,
     _cleanup_cmd,
@@ -2065,6 +2089,31 @@ class TestPreviousResults:
         (tmp_path / 'findings.txt').write_text('x')
         _delete_previous_results(str(tmp_path))
         assert _previous_results_exist(str(tmp_path)) is False
+
+    def test_overlay_dir_alone_is_not_previous_results(self, tmp_path):
+        # A run interrupted right after generating the nmap signature overlay
+        # but before any real scan output must not look like it has prior
+        # results to delete/append/resume -- see _CLEANUP_ONLY_DIRS.
+        d = tmp_path / '.nmap-overlay' / 'nselib'
+        d.mkdir(parents=True)
+        (tmp_path / '.nmap-overlay' / 'nmap-service-probes').write_text('Probe TCP x q||\n')
+        assert _previous_results_exist(str(tmp_path)) is False
+
+    def test_scan_profile_json_alone_is_not_previous_results(self, tmp_path):
+        (tmp_path / 'scan_profile.json').write_text('{}')
+        assert _previous_results_exist(str(tmp_path)) is False
+
+    def test_delete_removes_overlay_dir_and_scan_profile_json(self, tmp_path):
+        (tmp_path / '.nmap-overlay').mkdir()
+        (tmp_path / '.nmap-overlay' / 'nmap-service-probes').write_text('x')
+        (tmp_path / 'scan_profile.json').write_text('{}')
+        _delete_previous_results(str(tmp_path))
+        assert not (tmp_path / '.nmap-overlay').exists()
+        assert not (tmp_path / 'scan_profile.json').exists()
+
+    def test_cleanup_only_paths_are_disjoint_from_result_paths(self):
+        assert set(_CLEANUP_ONLY_DIRS).isdisjoint(_RESULT_DIRS)
+        assert set(_CLEANUP_ONLY_FILES).isdisjoint(_RESULT_FILES)
 
 
 # ── SERVICE_CATEGORIES docker ports ───────────────────────────────────────────
@@ -4091,6 +4140,22 @@ class TestValidateSnmpAnyCommunity:
         assert validated == {'10.0.0.5': True}
         cmd = mock_run.call_args[0][0]
         assert cmd[cmd.index('--source-port') + 1] == '88'  # Internal → 88
+
+    def test_extra_script_args_appended_to_snmp_brute_arg(self, tmp_path):
+        nmap_results = tmp_path / 'nmap_results'
+        nmap_results.mkdir()
+        (nmap_results / 'port161.xml').write_text(self._snmp_brute_xml('10.0.0.9', 5))
+
+        mock_result = MagicMock()
+        mock_result.stdout = 'Valid credentials'
+        with patch('spoonmap.subprocess.run', return_value=mock_result) as mock_run:
+            _validate_snmp_any_community(
+                str(tmp_path), 'Internal', extra_script_args="http.useragent='X'")
+
+        cmd = mock_run.call_args[0][0]
+        script_args = cmd[cmd.index('--script-args') + 1]
+        assert 'snmp-brute.communitiesdb=' in script_args
+        assert "http.useragent='X'" in script_args
 
     def test_external_scan_uses_source_port_53(self, tmp_path):
         nmap_results = tmp_path / 'nmap_results'
@@ -6457,6 +6522,27 @@ class TestInternalNseFindings:
 class TestBuildNmapCmd:
     """Unit tests for _build_nmap_cmd source-port behaviour."""
 
+    def test_no_datadir_flag_ever_appears(self):
+        # NMAPDIR (an env var, set once in main()) is the activation
+        # mechanism, never --datadir on any individual command -- one missed
+        # call site with --datadir would silently shadow the env var there.
+        for kwargs in ({}, {'script_scan': True}, {'script_only': True}):
+            cmd = _build_nmap_cmd('445', '/in.txt', '/out.xml', '88',
+                                  target_scan='Internal', **kwargs)
+            assert '--datadir' not in cmd
+
+    def test_script_only_extra_script_args_appended(self):
+        cmd = _build_nmap_cmd('21', '/in.txt', '/out.xml', '',
+                              script_only=True, target_scan='External',
+                              extra_script_args="http.useragent='X'")
+        assert '--script-args' in cmd
+        assert cmd[cmd.index('--script-args') + 1] == "http.useragent='X'"
+
+    def test_script_only_no_extra_script_args_by_default(self):
+        cmd = _build_nmap_cmd('21', '/in.txt', '/out.xml', '',
+                              script_only=True, target_scan='External')
+        assert '--script-args' not in cmd
+
     def test_smb_port_with_scripts_omits_source_port(self):
         """Port 445 + script_scan=True → no --source-port in command."""
         cmd = _build_nmap_cmd('445', '/in.txt', '/out.xml', '88',
@@ -7216,7 +7302,8 @@ class TestNmapWorker:
 
 
 def _fake_worker_drain(work_queue, completed_count, total_count, source_port, lock,
-                       interrupt_event, ip_to_hostname, script_scan, target_scan, start_time):
+                       interrupt_event, ip_to_hostname, script_scan, target_scan, start_time,
+                       extra_script_args=None):
     """Stand-in for nmap_worker() used by TestNmapScan — drains real queue
     items instantly instead of spawning subprocesses, so nmap_scan()'s own
     orchestration logic (queuing, resume-skip, join/poison-pill, thread
@@ -7395,7 +7482,8 @@ class TestNmapScan:
         captured_event = {}
 
         def fake_worker(work_queue, completed_count, total_count, source_port, lock,
-                        interrupt_event, ip_to_hostname, script_scan, target_scan, start_time):
+                        interrupt_event, ip_to_hostname, script_scan, target_scan, start_time,
+                        extra_script_args=None):
             captured_event['event'] = interrupt_event
             # Never drains the queue — join() below will block until we
             # interrupt it via the patched Queue.join raising KeyboardInterrupt.
@@ -7422,7 +7510,8 @@ class TestNmapScan:
         queued_files = []
 
         def fake_worker_capture(work_queue, completed_count, total_count, source_port, lock,
-                                interrupt_event, ip_to_hostname, script_scan, target_scan, start_time):
+                                interrupt_event, ip_to_hostname, script_scan, target_scan, start_time,
+                                extra_script_args=None):
             while True:
                 item = work_queue.get()
                 if item is None:
@@ -7450,7 +7539,8 @@ class TestNmapScan:
         queued_files = []
 
         def fake_worker_capture(work_queue, completed_count, total_count, source_port, lock,
-                                interrupt_event, ip_to_hostname, script_scan, target_scan, start_time):
+                                interrupt_event, ip_to_hostname, script_scan, target_scan, start_time,
+                                extra_script_args=None):
             while True:
                 item = work_queue.get()
                 if item is None:
@@ -7478,7 +7568,8 @@ class TestNmapScan:
         queued_files = []
 
         def fake_worker_capture(work_queue, completed_count, total_count, source_port, lock,
-                                interrupt_event, ip_to_hostname, script_scan, target_scan, start_time):
+                                interrupt_event, ip_to_hostname, script_scan, target_scan, start_time,
+                                extra_script_args=None):
             while True:
                 item = work_queue.get()
                 if item is None:
@@ -13035,3 +13126,740 @@ class TestParseReleaseTag:
     def test_comparison_is_numeric_not_lexical(self):
         assert (spoonmap._parse_release_tag('v0.10.0')
                 > spoonmap._parse_release_tag('v0.9.0'))
+
+
+# ── scanner_profile: nmap probe / NSE signature substitution ─────────────────
+
+_NMAP_INSTALLED = shutil.which('nmap') is not None
+
+
+class TestMergeScriptArgs:
+    def test_no_pairs_returns_none(self):
+        assert _merge_script_args() is None
+
+    def test_all_none_values_returns_none(self):
+        assert _merge_script_args(('a', None), ('b', None)) is None
+
+    def test_single_pair_is_quoted(self):
+        assert _merge_script_args(('http.useragent', 'Mozilla/5.0')) == \
+            "http.useragent='Mozilla/5.0'"
+
+    def test_multiple_pairs_joined_by_comma(self):
+        result = _merge_script_args(('a', '1'), ('b', '2'))
+        assert result == "a='1',b='2'"
+
+    def test_none_value_dropped_others_kept(self):
+        result = _merge_script_args(('a', '1'), ('b', None), ('c', '3'))
+        assert result == "a='1',c='3'"
+
+    def test_value_with_commas_and_parens_survives_quoted(self):
+        # This is the whole point of quoting: an unquoted UA would be split by
+        # nmap's own key=value,key=value grammar on these characters.
+        ua = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0, extra'
+        result = _merge_script_args(('http.useragent', ua))
+        assert result == f"http.useragent='{ua}'"
+
+    @pytest.mark.parametrize('bad_char', ["'", '\\', '{', '}'])
+    def test_unsafe_characters_raise(self, bad_char):
+        with pytest.raises(ValueError, match='disallowed character'):
+            _merge_script_args(('key', f'bad{bad_char}value'))
+
+
+class TestConfigScannerProfile:
+    def test_none_is_disabled(self):
+        assert _config_scanner_profile(None) is None
+
+    def test_false_is_disabled(self):
+        assert _config_scanner_profile(False) is None
+
+    @pytest.mark.parametrize('text', ['', 'off', 'Off', 'OFF', 'false'])
+    def test_off_spellings_are_disabled(self, text):
+        assert _config_scanner_profile(text) is None
+
+    @pytest.mark.parametrize('text', ['random', 'Random', 'RANDOM'])
+    def test_random_returns_empty_overrides_dict(self, text):
+        assert _config_scanner_profile(text) == {}
+
+    def test_unrecognised_string_exits(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _config_scanner_profile('sometimes')
+        assert exc.value.code == 1
+        assert 'scanner_profile' in capsys.readouterr().out
+
+    def test_unrecognised_type_exits(self):
+        with pytest.raises(SystemExit):
+            _config_scanner_profile(123)
+
+    def test_valid_dict_overrides_returned(self):
+        result = _config_scanner_profile({'probe_token': 'abcd'})
+        assert result == {'probe_token': 'abcd'}
+
+    def test_unknown_key_exits(self, capsys):
+        with pytest.raises(SystemExit):
+            _config_scanner_profile({'not_a_real_token': 'x'})
+        assert 'unknown key' in capsys.readouterr().out
+
+    def test_non_string_value_exits(self):
+        with pytest.raises(SystemExit):
+            _config_scanner_profile({'probe_token': 1234})
+
+    def test_empty_string_value_exits(self):
+        with pytest.raises(SystemExit):
+            _config_scanner_profile({'probe_token': ''})
+
+    def test_invalid_token_inside_dict_exits(self):
+        # probe_token must be exactly 4 letters -- this delegates to
+        # _validate_scanner_token(), exercised directly in TestValidateScannerToken.
+        with pytest.raises(SystemExit):
+            _config_scanner_profile({'probe_token': 'toolong'})
+
+
+class TestValidateScannerToken:
+    def test_valid_probe_token_passes(self):
+        _validate_scanner_token('probe_token', 'data')  # must not raise
+
+    @pytest.mark.parametrize('bad', ['abc', 'abcde', 'ab1d', 'ABC1'])
+    def test_invalid_probe_token_exits(self, bad):
+        with pytest.raises(SystemExit):
+            _validate_scanner_token('probe_token', bad)
+
+    def test_valid_tls_random_passes(self):
+        _validate_scanner_token('tls_random', 'A' * 28)  # must not raise
+
+    @pytest.mark.parametrize('bad', ['A' * 27, 'A' * 29, ''])
+    def test_invalid_tls_random_length_exits(self, bad):
+        with pytest.raises(SystemExit):
+            _validate_scanner_token('tls_random', bad)
+
+    @pytest.mark.parametrize('key', ['user_agent', 'smtp_domain'])
+    def test_script_arg_tokens_reject_unsafe_chars(self, key):
+        with pytest.raises(SystemExit):
+            _validate_scanner_token(key, "bad'value")
+
+    @pytest.mark.parametrize('key', ['user_agent', 'smtp_domain'])
+    def test_script_arg_tokens_allow_commas_and_parens(self, key):
+        _validate_scanner_token(key, 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
+
+    @pytest.mark.parametrize('key', ['rdp_cookie', 'workstation', 'native_os'])
+    @pytest.mark.parametrize('bad_char', ['"', '\\', '\n'])
+    def test_lua_string_tokens_reject_unsafe_chars(self, key, bad_char):
+        with pytest.raises(SystemExit):
+            _validate_scanner_token(key, f'bad{bad_char}value')
+
+    @pytest.mark.parametrize('key', ['rdp_cookie', 'workstation', 'native_os'])
+    def test_lua_string_tokens_allow_ordinary_text(self, key):
+        _validate_scanner_token(key, 'DESKTOP-4KJ2L1P')  # must not raise
+
+
+class TestGenerateScannerTokens:
+    def test_empty_overrides_fills_all_seven_keys(self):
+        tokens = _generate_scanner_tokens({})
+        assert set(tokens) == set(_SCANNER_PROFILE_TOKEN_KEYS)
+
+    def test_none_overrides_treated_as_empty(self):
+        tokens = _generate_scanner_tokens(None)
+        assert set(tokens) == set(_SCANNER_PROFILE_TOKEN_KEYS)
+
+    def test_probe_token_drawn_from_pool(self):
+        tokens = _generate_scanner_tokens({})
+        assert tokens['probe_token'] in _PROBE_TOKEN_POOL
+
+    def test_tls_random_is_28_alphanumeric_chars(self):
+        tokens = _generate_scanner_tokens({})
+        assert len(tokens['tls_random']) == 28
+        assert tokens['tls_random'].isalnum()
+
+    def test_override_wins_over_pool(self):
+        tokens = _generate_scanner_tokens({'probe_token': 'zzzz'})
+        assert tokens['probe_token'] == 'zzzz'
+
+    def test_partial_override_still_fills_the_rest(self):
+        tokens = _generate_scanner_tokens({'probe_token': 'zzzz'})
+        assert set(tokens) == set(_SCANNER_PROFILE_TOKEN_KEYS)
+        assert tokens['rdp_cookie']
+
+    def test_full_override_draws_nothing_from_pools(self):
+        full = {
+            'probe_token': 'zzzz', 'tls_random': 'A' * 28, 'rdp_cookie': 'x',
+            'workstation': 'x', 'native_os': 'x', 'user_agent': 'x', 'smtp_domain': 'x',
+        }
+        assert _generate_scanner_tokens(full) == full
+
+
+class TestDecodeProbeString:
+    def test_plain_ascii(self):
+        assert _decode_probe_string('abc') == b'abc'
+
+    @pytest.mark.parametrize('escape,expected', [
+        (r'\0', b'\x00'), (r'\a', b'\x07'), (r'\b', b'\x08'), (r'\f', b'\x0c'),
+        (r'\n', b'\x0a'), (r'\r', b'\x0d'), (r'\t', b'\x09'), (r'\v', b'\x0b'),
+        ('\\\\', b'\\'),
+    ])
+    def test_known_escapes(self, escape, expected):
+        assert _decode_probe_string(escape) == expected
+
+    def test_hex_escape(self):
+        assert _decode_probe_string(r'\x41') == b'A'
+
+    def test_mixed_literal_and_escapes(self):
+        assert _decode_probe_string(r'Cookie: mstshash=nmap\r\n') == \
+            b'Cookie: mstshash=nmap\r\n'
+
+    def test_real_terminalservercookie_payload_decodes_to_42_bytes(self):
+        payload = r'\x03\0\0*%\xe0\0\0\0\0\0Cookie: mstshash=nmap\r\n\x01\0\x08\0\x03\0\0\0'
+        assert len(_decode_probe_string(payload)) == 42
+
+    def test_trailing_backslash_raises(self):
+        with pytest.raises(ValueError, match='trailing backslash'):
+            _decode_probe_string('abc\\')
+
+    def test_unrecognised_escape_raises(self):
+        with pytest.raises(ValueError, match='unrecognised escape'):
+            _decode_probe_string(r'\q')
+
+    @pytest.mark.parametrize('bad', [r'\x4', r'\xzz', r'\x'])
+    def test_malformed_hex_escape_raises(self, bad):
+        with pytest.raises(ValueError, match='malformed'):
+            _decode_probe_string(bad)
+
+
+class TestProbeLengthFieldOk:
+    def test_terminalservercookie_matches(self):
+        decoded = _decode_probe_string(
+            r'\x03\0\0*%\xe0\0\0\0\0\0Cookie: mstshash=nmap\r\n\x01\0\x08\0\x03\0\0\0')
+        assert _probe_length_field_ok('TerminalServerCookie', decoded) is True
+
+    def test_terminalservercookie_corrupted_length_fails(self):
+        decoded = _decode_probe_string(r'\x03\0\0\x05nmap')  # header says 5, actual is 8
+        assert _probe_length_field_ok('TerminalServerCookie', decoded) is False
+
+    def test_informix_matches(self):
+        # 2-byte BE length prefix equal to the total decoded length (7 bytes:
+        # 2 header bytes + \x05 + 4-byte "nmap").
+        decoded = _decode_probe_string(r'\0\x07\x05nmap')
+        assert _probe_length_field_ok('informix', decoded) is True
+
+    def test_informix_corrupted_length_fails(self):
+        decoded = _decode_probe_string(r'\0\x63\x05nmap')
+        assert _probe_length_field_ok('informix', decoded) is False
+
+    def test_ibm_mqseries_matches(self):
+        # bytes[4:8] BE == total length (10 bytes).
+        decoded = _decode_probe_string(r'\0\0\0\0\0\0\0\x0a\0\0')
+        assert _probe_length_field_ok('ibm-mqseries', decoded) is True
+
+    def test_ibm_mqseries_corrupted_length_fails(self):
+        decoded = _decode_probe_string(r'\0\0\0\0\0\0\0\xff\0\0')
+        assert _probe_length_field_ok('ibm-mqseries', decoded) is False
+
+    def test_mqtt_matches(self):
+        # byte[1] == total length - 2 (6 bytes total, so byte[1] == 4).
+        decoded = _decode_probe_string(r'\x10\x04nmap')
+        assert _probe_length_field_ok('mqtt', decoded) is True
+
+    def test_mqtt_corrupted_length_fails(self):
+        decoded = _decode_probe_string(r'\x10\xffnmap')
+        assert _probe_length_field_ok('mqtt', decoded) is False
+
+    def test_unknown_probe_name_always_ok(self):
+        assert _probe_length_field_ok('SomeOtherProbe', b'anything') is True
+
+
+# Real nmap-service-probes lines this box's nmap install actually ships, used
+# to prove _rewrite_service_probes() against genuine, not synthetic, input.
+_REAL_RDP_PROBE_LINE = (
+    r'Probe TCP TerminalServerCookie q|\x03\0\0*%\xe0\0\0\0\0\0'
+    r'Cookie: mstshash=nmap\r\n\x01\0\x08\0\x03\0\0\0|'
+)
+_REAL_TLS_PROBE_LINE = (
+    r'Probe TCP TLSSessionReq q|\x16\x03\0\0\x69\x01\0\0\x65\x03\x03U\x1c\xa7\xe4'
+    r'random1random2random3random4\0\0\x0c\0/\0\x0a\0\x13\x009\0\x04\0\xff\x01\0\0'
+    r'\x30\0\x0d\0,\0*\0\x01\0\x03\0\x02\x06\x01\x06\x03\x06\x02\x02\x01\x02\x03\x02'
+    r'\x02\x03\x01\x03\x03\x03\x02\x04\x01\x04\x03\x04\x02\x01\x01\x01\x03\x01\x02'
+    r'\x05\x01\x05\x03\x05\x02|'
+)
+_CAPITAL_NMAP_PROBE_LINE = (
+    r'Probe TCP LibreOfficeImpressSCPair q|LO_SERVER_CLIENT_PAIR\nNmap\n0000\n\n|'
+)
+_COMMENT_LINE_WITH_NMAP = '# this comment mentions nmap and must survive untouched'
+_MATCH_LINE_WITH_NMAP = 'match http m|^nmap-detector| p/nmap web server/'
+
+_TEST_PROBE_TOKEN = 'data'
+_TEST_TLS_RANDOM = 'X' * 28
+
+
+class TestRewriteServiceProbes:
+    def _text(self):
+        return '\n'.join([
+            _COMMENT_LINE_WITH_NMAP,
+            _REAL_RDP_PROBE_LINE,
+            'rarity 7',
+            'ports 3388,3389',
+            _REAL_TLS_PROBE_LINE,
+            _MATCH_LINE_WITH_NMAP,
+            _CAPITAL_NMAP_PROBE_LINE,
+        ])
+
+    def test_total_substitution_count(self):
+        _, count = _rewrite_service_probes(self._text(), _TEST_PROBE_TOKEN, _TEST_TLS_RANDOM)
+        assert count == 3  # RDP cookie + TLS random + capitalized Nmap
+
+    def test_comment_and_match_lines_survive_untouched(self):
+        new_text, _ = _rewrite_service_probes(self._text(), _TEST_PROBE_TOKEN, _TEST_TLS_RANDOM)
+        assert _COMMENT_LINE_WITH_NMAP in new_text
+        assert _MATCH_LINE_WITH_NMAP in new_text
+
+    def test_rdp_cookie_replaced(self):
+        new_text, _ = _rewrite_service_probes(self._text(), _TEST_PROBE_TOKEN, _TEST_TLS_RANDOM)
+        assert 'mstshash=nmap' not in new_text
+        assert f'mstshash={_TEST_PROBE_TOKEN}' in new_text
+
+    def test_tls_random_replaced(self):
+        new_text, _ = _rewrite_service_probes(self._text(), _TEST_PROBE_TOKEN, _TEST_TLS_RANDOM)
+        assert 'random1random2random3random4' not in new_text
+        assert _TEST_TLS_RANDOM in new_text
+
+    def test_capitalized_nmap_replaced_with_capitalized_token(self):
+        new_text, _ = _rewrite_service_probes(self._text(), _TEST_PROBE_TOKEN, _TEST_TLS_RANDOM)
+        assert 'Nmap' not in new_text
+        assert _TEST_PROBE_TOKEN.capitalize() in new_text
+
+    def test_decoded_length_unchanged_for_rewritten_probes(self):
+        new_text, _ = _rewrite_service_probes(self._text(), _TEST_PROBE_TOKEN, _TEST_TLS_RANDOM)
+        old_rdp_payload = _REAL_RDP_PROBE_LINE.split('q|', 1)[1].rsplit('|', 1)[0]
+        new_rdp_line = [line for line in new_text.split('\n') if 'TerminalServerCookie' in line][0]
+        new_rdp_payload = new_rdp_line.split('q|', 1)[1].rsplit('|', 1)[0]
+        assert len(_decode_probe_string(old_rdp_payload)) == len(_decode_probe_string(new_rdp_payload))
+
+    def test_lines_without_nmap_are_untouched(self):
+        text = 'Probe TCP Foo q|hello world|\nrarity 1\nports 80'
+        new_text, count = _rewrite_service_probes(text, _TEST_PROBE_TOKEN, _TEST_TLS_RANDOM)
+        assert new_text == text
+        assert count == 0
+
+    def test_malformed_probe_line_raises(self):
+        text = 'Probe TCP BadFormatNoDelimiter'
+        with pytest.raises(ValueError, match='does not match the expected Probe-line format'):
+            _rewrite_service_probes(text, _TEST_PROBE_TOKEN, _TEST_TLS_RANDOM)
+
+    def test_unrecognised_escape_in_substituted_payload_raises(self):
+        text = r'Probe TCP Weird q|\qnmap|'
+        with pytest.raises(ValueError, match='unrecognised escape'):
+            _rewrite_service_probes(text, _TEST_PROBE_TOKEN, _TEST_TLS_RANDOM)
+
+    def test_corrupted_length_field_raises_before_substitution(self):
+        # Header claims length 5; actual decoded payload is 8 bytes -- this
+        # must be caught as "our own decode does not satisfy this probe's
+        # known length field", proving the guard fires on bad *input*, not
+        # only on a bad *substitution*.
+        text = r'Probe TCP TerminalServerCookie q|\x03\0\0\x05nmap|'
+        with pytest.raises(ValueError, match="known length field"):
+            _rewrite_service_probes(text, _TEST_PROBE_TOKEN, _TEST_TLS_RANDOM)
+
+    def test_wrong_length_token_raises_on_length_mismatch(self):
+        # _rewrite_service_probes() itself does not enforce probe_token's
+        # 4-letter constraint -- that is _validate_scanner_token()'s job at
+        # the config layer. This proves the length-for-length guard here
+        # still catches a caller bug that skipped that validation.
+        text = 'Probe TCP Foo q|nmap|'
+        with pytest.raises(ValueError, match='changed payload length'):
+            _rewrite_service_probes(text, 'ab', _TEST_TLS_RANDOM)
+
+    @pytest.mark.skipif(not _NMAP_INSTALLED, reason='nmap not installed')
+    def test_real_nmap_service_probes_file_rewrites_cleanly(self):
+        datadir = _locate_nmap_datadir()
+        assert datadir is not None
+        with open(os.path.join(datadir, 'nmap-service-probes'), encoding='utf-8') as fh:
+            real_text = fh.read()
+        new_text, count = _rewrite_service_probes(real_text, _TEST_PROBE_TOKEN, _TEST_TLS_RANDOM)
+        assert count == spoonmap._EXPECTED_SERVICE_PROBE_SUBSTITUTIONS
+        assert 'mstshash=nmap' not in new_text
+        assert 'random1random2random3random4' not in new_text
+
+
+class TestRewriteLiteral:
+    def test_exact_count_replaces(self):
+        new_text, count = _rewrite_literal('aXbXc', 'test', 'X', 'Y', 2)
+        assert new_text == 'aYbYc'
+        assert count == 2
+
+    def test_count_mismatch_raises(self):
+        with pytest.raises(ValueError, match='expected exactly 2'):
+            _rewrite_literal('aXbXcXd', 'test', 'X', 'Y', 2)
+
+    def test_zero_occurrences_with_expected_zero_is_a_noop(self):
+        new_text, count = _rewrite_literal('abc', 'test', 'ZZZ', 'Y', 0)
+        assert new_text == 'abc'
+        assert count == 0
+
+
+class TestRewriteRdpLua:
+    def test_stock_nmap_cookie_replaced(self):
+        text = 'local cookie = "mstshash=nmap"'
+        new_text, count = _rewrite_rdp_lua(text, 'jsmith')
+        assert new_text == 'local cookie = "mstshash=jsmith"'
+        assert count == 1
+
+    def test_hand_patched_cookie_also_replaced(self):
+        # An operator's own prior manual patch (e.g. "administrator") must be
+        # matched too -- the regex keys on the "mstshash=" prefix, not "nmap".
+        text = 'local cookie = "mstshash=administrator"'
+        new_text, count = _rewrite_rdp_lua(text, 'jsmith')
+        assert new_text == 'local cookie = "mstshash=jsmith"'
+        assert count == 1
+
+    def test_zero_occurrences_raises(self):
+        with pytest.raises(ValueError, match='expected exactly 1'):
+            _rewrite_rdp_lua('nothing to see here', 'jsmith')
+
+    def test_two_occurrences_raises(self):
+        text = 'local cookie = "mstshash=nmap"\nlocal cookie = "mstshash=nmap"'
+        with pytest.raises(ValueError, match='expected exactly 1'):
+            _rewrite_rdp_lua(text, 'jsmith')
+
+    @pytest.mark.skipif(not _NMAP_INSTALLED, reason='nmap not installed')
+    def test_real_rdp_lua_rewrites_cleanly(self):
+        datadir = _locate_nmap_datadir()
+        with open(os.path.join(datadir, 'nselib', 'rdp.lua'), encoding='utf-8') as fh:
+            real_text = fh.read()
+        new_text, count = _rewrite_rdp_lua(real_text, 'jsmith')
+        assert count == 1
+        assert 'mstshash=jsmith' in new_text
+
+
+class TestRewriteSmbLua:
+    def _text(self):
+        return (
+            '      "Nmap",                 -- OS\n'
+            '      "Native Lanman"         -- Native LAN Manager\n'
+            '        "Nmap",                -- OS\n'
+            '        "Native Lanman",       -- Native LAN Manager\n'
+            '-- * OS (I just send "Nmap")\n'
+        )
+
+    def test_substitution_count_is_four(self):
+        _, count = _rewrite_smb_lua(self._text(), 'Windows 10 Pro 19045')
+        assert count == 4
+
+    def test_wire_visible_occurrences_replaced(self):
+        new_text, _ = _rewrite_smb_lua(self._text(), 'Windows 10 Pro 19045')
+        assert '"Nmap",' not in new_text
+        assert '"Native Lanman"' not in new_text
+        assert new_text.count('"Windows 10 Pro 19045"') >= 4
+
+    def test_comment_occurrence_survives_untouched(self):
+        # "I just send \"Nmap\"" has no trailing comma -- the comma-anchored
+        # match must not touch it.
+        new_text, _ = _rewrite_smb_lua(self._text(), 'Windows 10 Pro 19045')
+        assert '(I just send "Nmap")' in new_text
+
+    def test_wrong_count_raises(self):
+        text = '"Nmap",\n"Native Lanman"\n'  # only 1 of each, not 2
+        with pytest.raises(ValueError, match='expected exactly 2'):
+            _rewrite_smb_lua(text, 'x')
+
+    @pytest.mark.skipif(not _NMAP_INSTALLED, reason='nmap not installed')
+    def test_real_smb_lua_rewrites_cleanly(self):
+        datadir = _locate_nmap_datadir()
+        with open(os.path.join(datadir, 'nselib', 'smb.lua'), encoding='utf-8') as fh:
+            real_text = fh.read()
+        new_text, count = _rewrite_smb_lua(real_text, 'Windows 10 Pro 19045')
+        assert count == 4
+        assert '"Nmap",' not in new_text
+
+
+class TestRewriteShortportSsl:
+    def _text(self):
+        return (
+            '"\\x16\\x03\\0\\0\\x69random1random2random3\\z\n'
+            '    random4\\0\\0\\x0c",\n'
+        )
+
+    def test_substitution_count_is_two(self):
+        _, count = _rewrite_shortport_ssl(self._text(), 'Y' * 28)
+        assert count == 2
+
+    def test_both_halves_replaced(self):
+        tls_random = 'Y' * 28
+        new_text, _ = _rewrite_shortport_ssl(self._text(), tls_random)
+        assert 'random1random2random3' not in new_text
+        assert 'random4' not in new_text
+        assert tls_random[:21] in new_text
+        assert tls_random[21:] in new_text
+
+    def test_naive_joined_replace_would_match_nothing(self):
+        # Pins the hazard this function exists to avoid: the literal is split
+        # by a Lua \z line continuation, so a plain replace() of the full
+        # 28-char joined string silently matches zero times.
+        text = self._text()
+        assert text.count('random1random2random3random4') == 0
+
+    def test_missing_first_half_raises(self):
+        text = '"\\x16random4"'
+        with pytest.raises(ValueError, match='expected exactly 1'):
+            _rewrite_shortport_ssl(text, 'Y' * 28)
+
+    def test_missing_second_half_raises(self):
+        text = '"\\x16random1random2random3"'
+        with pytest.raises(ValueError, match='expected exactly 1'):
+            _rewrite_shortport_ssl(text, 'Y' * 28)
+
+    @pytest.mark.skipif(not _NMAP_INSTALLED, reason='nmap not installed')
+    def test_real_shortport_lua_rewrites_cleanly(self):
+        datadir = _locate_nmap_datadir()
+        with open(os.path.join(datadir, 'nselib', 'shortport.lua'), encoding='utf-8') as fh:
+            real_text = fh.read()
+        new_text, count = _rewrite_shortport_ssl(real_text, 'Y' * 28)
+        assert count == 2
+        assert 'random1random2random3' not in new_text
+
+
+class TestLocateNmapDatadir:
+    @pytest.mark.skipif(not _NMAP_INSTALLED, reason='nmap not installed')
+    def test_finds_a_real_datadir(self):
+        result = _locate_nmap_datadir()
+        assert result is not None
+        assert os.path.isfile(os.path.join(result, 'nmap-service-probes'))
+
+    def test_returns_none_when_nothing_plausible_found(self):
+        with patch('spoonmap.shutil.which', return_value=None), \
+             patch('spoonmap.os.path.isfile', return_value=False):
+            assert _locate_nmap_datadir() is None
+
+
+@pytest.mark.skipif(not _NMAP_INSTALLED, reason='nmap not installed')
+class TestBuildNmapOverlay:
+    """Exercised against this box's real nmap data files, mirroring how
+    tests/test_nse_integration.py exercises real nmap behaviour rather than a
+    mock -- the guard this function exists for (a silent, byte-shifting
+    substitution) can only be trusted against genuine probe/nselib content."""
+
+    def _tokens(self):
+        return _generate_scanner_tokens({})
+
+    def test_returns_five_file_manifest(self, tmp_path):
+        datadir = _locate_nmap_datadir()
+        overlay_dir, manifest = _build_nmap_overlay(str(tmp_path), self._tokens(), datadir)
+        assert len(manifest) == 5
+        assert overlay_dir == _overlay_dir(str(tmp_path))
+
+    def test_manifest_substitution_counts(self, tmp_path):
+        datadir = _locate_nmap_datadir()
+        _, manifest = _build_nmap_overlay(str(tmp_path), self._tokens(), datadir)
+        by_path = {m['path']: m['substitutions'] for m in manifest}
+        assert by_path['nmap-service-probes'] == 12
+        assert by_path['nselib/rdp.lua'] == 1
+        assert by_path['nselib/smb.lua'] == 4
+        assert by_path['nselib/smbauth.lua'] == 1
+        assert by_path['nselib/shortport.lua'] == 2
+
+    def test_manifest_sha256_matches_written_file(self, tmp_path):
+        import hashlib
+        datadir = _locate_nmap_datadir()
+        overlay_dir, manifest = _build_nmap_overlay(str(tmp_path), self._tokens(), datadir)
+        for entry in manifest:
+            with open(os.path.join(overlay_dir, entry['path']), encoding='utf-8') as fh:
+                content = fh.read()
+            assert hashlib.sha256(content.encode()).hexdigest() == entry['sha256']
+
+    def test_probes_file_carries_no_stock_signature_strings(self, tmp_path):
+        datadir = _locate_nmap_datadir()
+        overlay_dir, _ = _build_nmap_overlay(str(tmp_path), self._tokens(), datadir)
+        with open(os.path.join(overlay_dir, 'nmap-service-probes'), encoding='utf-8') as fh:
+            text = fh.read()
+        assert 'mstshash=nmap' not in text
+        assert 'random1random2random3random4' not in text
+
+    def test_nselib_files_carry_no_stock_signature_strings(self, tmp_path):
+        # Checks the exact wire-visible literals each file is known to carry
+        # (see the audit in CLAUDE.md) -- not a blanket "nmap" absence, since
+        # `local nmap = require("nmap")` and the license URL are ordinary,
+        # never-sent Lua source that every nselib file legitimately contains.
+        datadir = _locate_nmap_datadir()
+        overlay_dir, _ = _build_nmap_overlay(str(tmp_path), self._tokens(), datadir)
+
+        def _read(name):
+            with open(os.path.join(overlay_dir, 'nselib', name), encoding='utf-8') as fh:
+                return fh.read()
+
+        assert 'mstshash=nmap' not in _read('rdp.lua')
+        assert '"Nmap",' not in _read('smb.lua')
+        assert '"Native Lanman"' not in _read('smb.lua')
+        assert 'utf8to16("nmap")' not in _read('smbauth.lua')
+        assert 'random1random2random3' not in _read('shortport.lua')
+
+    def test_missing_source_datadir_raises_oserror(self, tmp_path):
+        with pytest.raises(OSError):
+            _build_nmap_overlay(str(tmp_path), self._tokens(), str(tmp_path / 'nonexistent'))
+
+    def test_rebuild_overwrites_cleanly(self, tmp_path):
+        datadir = _locate_nmap_datadir()
+        _build_nmap_overlay(str(tmp_path), self._tokens(), datadir)
+        overlay_dir, manifest = _build_nmap_overlay(str(tmp_path), self._tokens(), datadir)
+        assert len(manifest) == 5  # second call succeeds and overwrites, not errors
+
+    def test_wrong_substitution_count_raises(self, tmp_path):
+        # A stand-in datadir whose nmap-service-probes carries none of the
+        # known signature strings -- simulates the probe set having changed
+        # upstream since this code was written against it.
+        fake_datadir = tmp_path / 'fake-datadir'
+        fake_datadir.mkdir()
+        (fake_datadir / 'nmap-service-probes').write_text('Probe TCP Foo q|hello world|\n')
+        with pytest.raises(ValueError, match='expected exactly 12 substitutions'):
+            _build_nmap_overlay(str(tmp_path / 'out'), self._tokens(), str(fake_datadir))
+
+
+@pytest.mark.skipif(not _NMAP_INSTALLED, reason='nmap not installed')
+class TestVerifyNmapOverlay:
+    def test_real_overlay_verifies_ok(self, tmp_path):
+        datadir = _locate_nmap_datadir()
+        tokens = _generate_scanner_tokens({})
+        overlay_dir, _ = _build_nmap_overlay(str(tmp_path), tokens, datadir)
+        ok, detail = _verify_nmap_overlay(overlay_dir)
+        assert ok is True
+        assert detail == ''
+
+    def test_empty_overlay_dir_fails_verification(self, tmp_path):
+        # Negative control: nmap's silent per-file fallback means an overlay
+        # directory with nothing written in it "verifies" as a normal scan
+        # from nmap's point of view -- this must be caught, not accepted.
+        empty_overlay = tmp_path / 'empty-overlay'
+        empty_overlay.mkdir()
+        ok, detail = _verify_nmap_overlay(str(empty_overlay))
+        assert ok is False
+        assert 'fell back' in detail or 'did not read' in detail
+
+    def test_malformed_script_args_fails_verification(self, tmp_path):
+        datadir = _locate_nmap_datadir()
+        tokens = _generate_scanner_tokens({})
+        overlay_dir, _ = _build_nmap_overlay(str(tmp_path), tokens, datadir)
+        ok, detail = _verify_nmap_overlay(overlay_dir, extra_script_args="http.useragent={bad")
+        assert ok is False
+        assert 'rejected' in detail
+
+    def test_subprocess_failure_is_reported_not_raised(self, tmp_path):
+        with patch('spoonmap.subprocess.run', side_effect=OSError('nmap not found')):
+            ok, detail = _verify_nmap_overlay(str(tmp_path))
+        assert ok is False
+        assert 'failed to run' in detail
+
+    @staticmethod
+    def _fake_fetchfile_success(overlay_dir):
+        mock = MagicMock()
+        mock.stdout = '\n'.join(
+            f'Fetchfile found {os.path.join(overlay_dir, "nselib", name)}'
+            for name in ('rdp.lua', 'smb.lua', 'smbauth.lua', 'shortport.lua'))
+        mock.stderr = ''
+        return mock
+
+    def test_second_probe_subprocess_failure_is_reported(self, tmp_path):
+        # The two probes (-d2 script-load, -d1 datafile-read) are independent
+        # subprocess.run() calls; the second must be guarded exactly like the
+        # first rather than left to raise out of _verify_nmap_overlay().
+        overlay_dir = str(tmp_path)
+        with patch('spoonmap.subprocess.run',
+                   side_effect=[self._fake_fetchfile_success(overlay_dir),
+                                OSError('nmap not found')]):
+            ok, detail = _verify_nmap_overlay(overlay_dir)
+        assert ok is False
+        assert 'failed to run' in detail
+
+    def test_probes_file_not_read_from_overlay_fails(self, tmp_path):
+        # First probe succeeds (scripts loaded from the overlay); second
+        # probe's real-datadir fallback text is returned instead of the
+        # overlay path -- must be caught, not treated as success.
+        overlay_dir = str(tmp_path)
+        second = MagicMock(
+            stdout='Read from /usr/local/share/nmap: nmap-service-probes.', stderr='')
+        with patch('spoonmap.subprocess.run',
+                   side_effect=[self._fake_fetchfile_success(overlay_dir), second]):
+            ok, detail = _verify_nmap_overlay(overlay_dir)
+        assert ok is False
+        assert 'did not read nmap-service-probes' in detail
+
+
+class TestScanProfileArtifact:
+    def test_scan_profile_path_joins_output_path(self):
+        assert _scan_profile_path('/out') == os.path.join('/out', 'scan_profile.json')
+
+    def test_write_creates_valid_json_with_expected_keys(self, tmp_path):
+        tokens = {'probe_token': 'data'}
+        _write_scan_profile_record(
+            str(tmp_path), tokens, [{'path': 'x', 'sha256': 'y', 'substitutions': 1}],
+            '/usr/local/share/nmap', "http.useragent='x'", '2026-01-01T00:00:00+00:00')
+        with open(_scan_profile_path(str(tmp_path))) as fh:
+            record = json.load(fh)
+        assert record['tokens'] == tokens
+        assert record['tool'] == 'spoonmap'
+        assert record['runs'] == ['2026-01-01T00:00:00+00:00']
+        assert record['source_nmap_datadir'] == '/usr/local/share/nmap'
+
+    def test_second_call_appends_to_runs(self, tmp_path):
+        _write_scan_profile_record(
+            str(tmp_path), {'a': '1'}, [], '/d', None, 'run-1')
+        _write_scan_profile_record(
+            str(tmp_path), {'a': '1'}, [], '/d', None, 'run-2')
+        with open(_scan_profile_path(str(tmp_path))) as fh:
+            record = json.load(fh)
+        assert record['runs'] == ['run-1', 'run-2']
+
+    def test_unwritable_path_does_not_raise(self, tmp_path):
+        bad_path = str(tmp_path / 'nonexistent_dir' / 'nested')
+        _write_scan_profile_record(bad_path, {}, [], '/d', None, 'run-1')  # must not raise
+
+    def test_preexisting_unparseable_file_is_replaced_not_fatal(self, tmp_path):
+        with open(_scan_profile_path(str(tmp_path)), 'w') as fh:
+            fh.write('not valid json{{{')
+        _write_scan_profile_record(str(tmp_path), {'a': '1'}, [], '/d', None, 'run-1')
+        with open(_scan_profile_path(str(tmp_path))) as fh:
+            record = json.load(fh)
+        assert record['runs'] == ['run-1']
+
+
+class TestLoadConfigScannerProfile:
+    def test_absent_key_is_disabled(self):
+        cfg = _load_config(_config_dict(), '/t')
+        assert cfg['scanner_profile'] is None
+
+    def test_false_is_disabled(self):
+        cfg = _load_config(_config_dict(scanner_profile=False), '/t')
+        assert cfg['scanner_profile'] is None
+
+    def test_random_string(self):
+        cfg = _load_config(_config_dict(scanner_profile='random'), '/t')
+        assert cfg['scanner_profile'] == {}
+
+    def test_valid_overrides_dict(self):
+        cfg = _load_config(
+            _config_dict(scanner_profile={'probe_token': 'abcd'}), '/t')
+        assert cfg['scanner_profile'] == {'probe_token': 'abcd'}
+
+    def test_invalid_type_exits(self):
+        with pytest.raises(SystemExit):
+            _load_config(_config_dict(scanner_profile=123), '/t')
+
+
+class TestBuildInteractiveConfigScannerProfile:
+    def _base_args(self):
+        return (['Web'], [], 'Web', True, False, 'Internal', '2000',
+                'r', 'o', None, 5, 5, 5_000_000, True)
+
+    def test_none_omits_key(self):
+        cfg = _build_interactive_config(*self._base_args())
+        assert 'scanner_profile' not in cfg
+
+    def test_random_string_included(self):
+        cfg = _build_interactive_config(*self._base_args(), scanner_profile='random')
+        assert cfg['scanner_profile'] == 'random'
+
+    def test_overrides_dict_included(self):
+        cfg = _build_interactive_config(
+            *self._base_args(), scanner_profile={'probe_token': 'abcd'})
+        assert cfg['scanner_profile'] == {'probe_token': 'abcd'}
+
+    def test_empty_dict_omits_key(self):
+        # {} is falsy -- 'random' mode is represented as the string 'random'
+        # when building an interactive config, never as an empty dict, so
+        # this only guards against a future caller passing {} by mistake.
+        cfg = _build_interactive_config(*self._base_args(), scanner_profile={})
+        assert 'scanner_profile' not in cfg

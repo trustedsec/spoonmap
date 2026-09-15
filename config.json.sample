@@ -28,5 +28,8 @@
     "nmap_threshold": 5000000,
     "target_file" : "ranges.txt",
     "output_path" : "./",
-    "exclusions_file" : "exclusions.txt"
+    "exclusions_file" : "exclusions.txt",
+    "__scanner_profile_choices__": "false/absent (default, disabled), \"random\", or an object pinning some of: probe_token, tls_random, rdp_cookie, workstation, native_os, user_agent, smtp_domain — any omitted key is drawn from a built-in pool",
+    "__scanner_profile_note__": "When set, nmap probes and SpooNMAP's bundled NSE scripts no longer send literal strings that identify the scanner (e.g. the RDP probe's \"mstshash=nmap\" cookie, or nmap's own NSE HTTP User-Agent) — see scan_profile.json in the output directory for exactly what was substituted, for engagement deconfliction. Does NOT affect TCP/IP stack fingerprinting, TLS/JA3 fingerprinting, or scan rate/shape; those are unrelated to string substitution.",
+    "scanner_profile" : false
 }

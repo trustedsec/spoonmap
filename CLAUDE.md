@@ -258,6 +258,159 @@ forward — that fallback only works when a config.json happens to still be on
 disk with the key already set, and silently drops it on a first-ever
 regeneration.
 
+## Scanner Signature Reduction (`scanner_profile`)
+
+Several nmap probes and a few of SpooNMAP's own bundled NSE scripts carry
+literal strings that identify the scanner to a client's IDS — most notably
+`nmap-service-probes`' `TerminalServerCookie` probe (`Cookie: mstshash=nmap`),
+sent by every `-sV` scan of 3388/3389 **independent of `script_scan`**, since a
+probe registered to the target port fires regardless of `--version-intensity`.
+Hand-patching `nselib/rdp.lua`'s own cookie (a documented workaround) never
+covered this, because that file backs the separate `rdp-ntlm-info` NSE script,
+not the banner-pass service probe. `scanner_profile` fixes both, plus the TLS
+ClientHello's `random1random2random3random4` filler (`TLSSessionReq` in
+`nmap-service-probes` and `shortport.lua`'s `LIKELY_SSL_SERVICES` probe list —
+split across a Lua `\z` line continuation, so a single joined-string replace
+silently matches zero times; handled as two independent 21+7 char
+substitutions, each asserted to occur exactly once), and the SMB Native
+OS/LanMan fields nmap reports as literal `"Nmap"`/`"Native Lanman"`.
+
+**Mechanism: an nmap `$NMAPDIR` overlay, not in-place patching.** `$NMAPDIR`
+(like `--datadir`) is a **per-file overlay with silent fallback**: a file
+present under it wins, one absent from it falls back to nmap's real data
+directory unnoticed — nmap never reports that as an error. `main()` sets
+`os.environ['NMAPDIR']` once, before any scanning begins; every nmap
+invocation (7 call sites across host discovery, port discovery, banner/NSE
+passes, and the extra SQL/SNMP probes) inherits it via subprocess
+environment inheritance, with **no per-call-site edits** — the alternative,
+passing `--datadir` at each site, has a failure mode of *one forgotten site
+silently sends the unmodified probe*, which is exactly the class of bug this
+repo's failure-mode discipline exists to prevent. Only the files that
+actually need a substitution are written (`nmap-service-probes` and four
+`nselib/*.lua` files); everything else nmap reads falls back to the real
+data directory untouched.
+
+**The overlay is rebuilt from the live nmap datadir every run, never
+patched in place and never cached across runs** — an nmap upgrade between
+engagements would otherwise leave a stale overlay silently shadowing the new
+data files. `_locate_nmap_datadir()` finds it relative to the `nmap` binary
+first (matching what a real `Fetchfile` trace resolves to), then common
+package-manager paths.
+
+**Byte-length safety is the load-bearing constraint**, not a nicety: several
+`nmap-service-probes` payloads hardcode a total length elsewhere in the same
+probe (`TerminalServerCookie`'s TPKT header bakes in 42 bytes), so `probe_token`
+is constrained to exactly 4 ASCII letters and `tls_random` to exactly 28
+characters. `_rewrite_service_probes()` never does a blind `str.replace()` —
+it parses each `Probe` line's structure, substitutes only inside the
+delimited `q|...|` payload (never a `match`/`softmatch`/comment/rarity/ports
+line, several of which also contain the literal word "nmap" elsewhere in this
+file), decodes the payload to the actual bytes nmap will send via
+`_decode_probe_string()` (nmap's own escape set only — any other backslash
+sequence raises, since its length can't be proven), and asserts the decoded
+length is unchanged. Four probes additionally carry a self-describing length
+field inside the payload (`TerminalServerCookie`, `informix`, `ibm-mqseries`,
+`mqtt`), checked via `_probe_length_field_ok()` both before and after
+substitution. A **substitution count assertion** (exactly 11 `nmap`/`Nmap`
+occurrences across 8 probes, plus 1 `TLSSessionReq` random — 12 total; each
+nselib file has its own expected count) means an nmap upgrade that changes
+the probe set aborts the overlay build loudly rather than silently writing a
+partially de-signatured — and therefore falsely-reassuring — result. Any
+guard failure raises and the overlay is not written at all; there is no
+partial-success case.
+
+**Verification interrogates a real nmap invocation, not the files SpooNMAP
+wrote.** Because `$NMAPDIR`'s fallback is silent, writing the overlay
+correctly is not proof nmap will read it — a path typo, a permissions issue,
+or an `NMAPDIR` clobbered by a wrapper script all fail exactly the same way:
+nothing, with nmap quietly using its real data files instead.
+`_verify_nmap_overlay()` runs two throwaway, unprivileged probes against
+`127.0.0.1` (nothing reaches any real target): `-sn -Pn --script
+rdp-ntlm-info,smb-os-discovery,http-title,smtp-commands` loads and
+`require()`s every selected script's nselib dependencies during
+initialisation, before any portrule runs, so it reaches all four rewritten
+`nselib/*.lua` files in ~60ms with zero packets sent; a second `-d1 -sV`
+probe against a closed port confirms `nmap-service-probes` was read from the
+overlay. Both run with `-d2`/`-d1` and grep nmap's own `Fetchfile
+found`/`Read from` debug trace for the overlay path specifically — proving
+the *consumer* read the file, not merely that the *producer* wrote it. A
+failed verification (or a `--script-args` nmap rejects) aborts the run via
+`sys.exit(1)`: an operator who enabled `scanner_profile` has made an
+engagement-level decision about what a client's IDS will see, and scanning
+under a false assumption of evasion is worse than not scanning.
+
+**Token composition**: 7 slots (`probe_token`, `tls_random`, `rdp_cookie`,
+`workstation`, `native_os`, `user_agent`, `smtp_domain`). `"random"` draws
+every token from a curated pool via `secrets.choice()` (not `random` —
+no reason for tokens to be predictable from a scan's start time); an object
+pins specific tokens and lets the rest fall through to the pool.
+`_config_scanner_profile()` follows `_config_target_scan()`'s doctrine: an
+unrecognised value **exits rather than warns**, because an operator who set
+this believes their scan no longer carries `mstshash=nmap` — silently
+falling back to disabled would mean the engagement went out unmodified while
+the operator believed otherwise. `probe_token` and `tls_random` are
+length-validated at the config layer too (`_validate_scanner_token()`),
+before ever reaching the rewriter.
+
+`user_agent`/`smtp_domain` reach nmap via `--script-args http.useragent=…`
+(the stock NSE default is nmap's own `Mozilla/5.0 (compatible; Nmap
+Scripting Engine; …)` string — no file patch needed, since it's already
+`stdnse.get_script_args()`-overridable) and `smtp.domain=…`
+(replacing `smtp.lua`'s `nmap.scanme.org` default). Composed through
+`_merge_script_args()`, the first site in this codebase to build a
+`--script-args` value from more than one source: every value is single-quoted
+(an unquoted User-Agent's `,`/`;`/`(`/`)` would otherwise be parsed as
+separate args by nmap's own grammar) and a value containing `'`, `\`, `{`, or
+`}` is rejected outright — `{` specifically produces `NSE: failed to
+initialize the script engine`, silently aborting the entire script pass for
+that port rather than just that one argument.
+
+**Own-goal fixes, applied unconditionally (not gated behind
+`scanner_profile`):** `nse/delve-debugger.nse` sent `"clientID":"spoonmap"` in
+its DAP probe — logged verbatim into the target's own Delve session log for
+zero benefit; now sends `"vscode"`. Seven of the eight bundled raw-socket
+HTTP-probing NSE scripts (all but `wsus-detect.nse`) sent HTTP/1.0 requests
+with **no `User-Agent` header at all** — itself a distinguishing scanner tell,
+and a request some WAFs/app servers simply refuse or serve differently. All
+eight also sent `Host: host.ip` rather than `host.targetname`, throwing away
+the hostname resolution this tool already does "for SNI/vhost" (see Key
+Implementation Details) and missing every name-based vhost. Both are
+correctness defects independent of evasion, so they're unconditional; each
+script now reads `stdnse.get_script_args('http.useragent')` first with a
+protocol-appropriate fallback (a generic modern browser string; `wsus-detect`
+keeps impersonating `Windows-Update-Agent`, since that is deliberately
+protocol-correct there), so `scanner_profile`'s `user_agent` token
+automatically reaches the bundled scripts too through the same
+`--script-args` knob — one setting, not eight separately-defaulted ones that
+would each be a fresh signature if forgotten.
+
+**Deconfliction record**: every activation writes/updates
+`<output_path>/scan_profile.json` — the tokens used, the source nmap datadir
+and version, a sha256 + substitution count per overlay file, the composed
+`--script-args`, and an append-only `runs` timestamp list — so an operator can
+answer a client's "was that scan traffic you?" months later. `--resume` and
+`[a]ppend` (which also keeps prior output) reuse the tokens already recorded
+there rather than drawing a fresh set, so one engagement's output directory
+never mixes two different signature profiles; `[d]elete` removes the record
+(see below) and the next run draws fresh. `scan_profile.json` and the overlay
+directory (`<output_path>/.nmap-overlay/`) are generated *before* scanning
+starts, not as a scan result, so both are excluded from
+`_previous_results_exist()` via `_CLEANUP_ONLY_DIRS`/`_CLEANUP_ONLY_FILES` — a
+run interrupted right after generating them but before any real output must
+not make an ordinary first run look like it has prior results to
+delete/append/resume. `_delete_previous_results()` still removes both on
+`[d]elete` or `--cleanup`, so neither outlives the results it describes.
+
+**What this does not do**, stated explicitly so it is never oversold:
+`nmap -sS`'s TCP/IP stack fingerprint (SYN option ordering, fixed MSS,
+IP ID/ISN generation) is untouched; masscan's own hand-rolled stack and SYN
+cookie sequence-number encoding are untouched (masscan is never invoked with
+`--banners`, so its one string lever is moot here); TLS/JA3 fingerprinting is
+untouched beyond the `Random` field, since JA3 keys on cipher-suite/extension
+ordering, not `Random`; and scan shape/volume (`-T4`, `-Pn` on everything,
+`--version-intensity 0`, fixed port sets) is untouched — touching 10 ports on
+every host in a /16 is itself a signature no string substitution addresses.
+
 ## Architecture
 
 ### Host Discovery (Internal)

@@ -9,14 +9,17 @@ import collections
 import contextlib
 import datetime
 import glob as _glob
+import hashlib
 import ipaddress
 import json
 import os
 from pathlib import Path
 import re
 import resource
+import secrets
 import shutil
 import socket
+import string
 import subprocess
 import sys
 import tempfile
@@ -1546,6 +1549,16 @@ _RESULT_FILES = ('all_live_hosts.txt', 'spoonmap_output.xml',
                  'spoonmap_output.json', 'spoonmap_output.gnmap',
                  'findings.txt', 'findings.md', 'findings.json')
 
+# The nmap data overlay and its deconfliction record (see
+# _build_nmap_overlay()) are written *before* the scan itself runs, not as a
+# scan result — so they must never feed _previous_results_exist(): a run
+# interrupted right after generating them but before any real output would
+# otherwise make an ordinary first run look like it has prior results to
+# delete/append/resume. _delete_previous_results() still removes both on
+# [d]elete or --cleanup, so they never outlive the results they describe.
+_CLEANUP_ONLY_DIRS  = ('.nmap-overlay',)
+_CLEANUP_ONLY_FILES = ('scan_profile.json',)
+
 
 def _previous_results_exist(output_path):
     """Return True if any prior scan output is present under output_path."""
@@ -1561,11 +1574,11 @@ def _previous_results_exist(output_path):
 
 def _delete_previous_results(output_path):
     """Remove all prior scan output under output_path."""
-    for d in _RESULT_DIRS:
+    for d in _RESULT_DIRS + _CLEANUP_ONLY_DIRS:
         p = os.path.join(output_path, d)
         if os.path.isdir(p):
             shutil.rmtree(p)
-    for f in _RESULT_FILES:
+    for f in _RESULT_FILES + _CLEANUP_ONLY_FILES:
         p = os.path.join(output_path, f)
         if os.path.exists(p):
             os.remove(p)
@@ -2383,8 +2396,40 @@ def create_hostname_target_file(ip_file, hostname_file, ip_to_hostname):
             hostname = ip_to_hostname.get(ip, ip)
             outf.write(f'{hostname}\n')
 
+# Characters that break nmap's --script-args parser or its own single-quoting.
+# '{' in particular fails silently-ish: nmap prints "failed to initialize the
+# script engine" and the whole script pass aborts rather than just the one arg.
+_SCRIPT_ARG_UNSAFE_CHARS = frozenset("'\\{}")
+
+
+def _merge_script_args(*pairs):
+    """Compose a --script-args value from (key, value) pairs.
+
+    Every later value must round-trip through nmap's own argument parser
+    unmodified, so each is wrapped in single quotes (a real User-Agent or SMTP
+    domain can contain ',', ';', '(', ')', all of which nmap's unquoted
+    key=value,key=value grammar would otherwise split on) and any value
+    containing a character that breaks that quoting is rejected rather than
+    silently mangled. Pairs whose value is None are dropped; returns None (not
+    an empty string) when nothing remains, so callers can keep the existing
+    ``*(['--script-args', args] if args else [])`` idiom.
+    """
+    parts = []
+    for key, value in pairs:
+        if value is None:
+            continue
+        bad = _SCRIPT_ARG_UNSAFE_CHARS.intersection(value)
+        if bad:
+            raise ValueError(
+                f'script-arg {key!r} contains disallowed character(s) '
+                f'{"".join(sorted(bad))!r}: {value!r}')
+        parts.append(f"{key}='{value}'")
+    return ','.join(parts) if parts else None
+
+
 def _build_nmap_cmd(dest_port, input_file, output_file, source_port,
-                    script_scan=False, target_scan='Internal', script_only=False):
+                    script_scan=False, target_scan='Internal', script_only=False,
+                    extra_script_args=None):
     """Return the nmap command list for a single port scan.
 
     --source-port is omitted for SMB ports when scripts are active: nmap runs all
@@ -2413,6 +2458,8 @@ def _build_nmap_cmd(dest_port, input_file, output_file, source_port,
             if 'vulners' in scripts:
                 cmd += ['-sV']
             cmd += ['--script', scripts, '--script-timeout', '30s', '--host-timeout', host_timeout]
+            if extra_script_args:
+                cmd += ['--script-args', extra_script_args]
             if is_udp:
                 cmd += ['--max-retries', '1']
         return cmd
@@ -2494,7 +2541,7 @@ def _quarantine_failed_output(output_file):
 
 def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 interrupt_event, ip_to_hostname, script_scan=False,
-                target_scan='Internal', start_time=None):
+                target_scan='Internal', start_time=None, extra_script_args=None):
     """Worker thread function to process NMAP scans from queue"""
 
     def _report_nmap_failure(pass_label, dest_port, proc, stderr_output, output_file):
@@ -2669,7 +2716,7 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                         nse_cmd = _build_nmap_cmd(
                             dest_port, input_file, nse_output, source_port,
                             script_scan=True, target_scan=target_scan,
-                            script_only=True,
+                            script_only=True, extra_script_args=extra_script_args,
                         )
                         _discard_coverage_record(nse_output)
                         nse_process = subprocess.Popen(
@@ -2725,7 +2772,7 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                     work_queue.task_done()
 
 def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
-              script_scan=False, target_scan='Internal'):
+              script_scan=False, target_scan='Internal', extra_script_args=None):
     """
     Perform NMAP scans using multiple threads for efficiency
 
@@ -2735,6 +2782,9 @@ def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
         ip_to_hostname: Dictionary mapping IPs to hostnames (default: None)
         script_scan: Whether to run NSE scripts (default: False)
         target_scan: 'External' or 'Internal' (default: 'Internal')
+        extra_script_args: --script-args value merged into every NSE pass
+            (default: None), e.g. the scanner_profile http.useragent/smtp.domain
+            overrides composed by _merge_script_args().
     """
     if ip_to_hostname is None:
         ip_to_hostname = {}
@@ -2813,7 +2863,7 @@ def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
                 target=nmap_worker,
                 args=(work_queue, completed_count, total_count, source_port, lock,
                       interrupt_event, ip_to_hostname, script_scan, target_scan,
-                      start_time)
+                      start_time, extra_script_args)
             )
             thread.daemon = True
             thread.start()
@@ -3279,7 +3329,7 @@ def _scan_extra_sql_ports(output_path, source_port):
                 restore_terminal_state(term_state)
 
 
-def _validate_snmp_any_community(nmap_dir, scan_type):
+def _validate_snmp_any_community(nmap_dir, scan_type, extra_script_args=None):
     """Return dict {ip: True} for hosts confirmed to accept any SNMP community string."""
     import uuid as _uuid
     _ACCEPTS_ANY_THRESHOLD = 5
@@ -3315,11 +3365,17 @@ def _validate_snmp_any_community(nmap_dir, scan_type):
                     tmp_path = f.name
                 try:
                     src_port = '88' if scan_type == 'Internal' else '53'
+                    script_args = f'snmp-brute.communitiesdb={tmp_path}'
+                    if extra_script_args:
+                        # extra_script_args (e.g. http.useragent/smtp.domain) arrives
+                        # pre-quoted from _merge_script_args() — appended, not re-merged,
+                        # so this call's own snmp-brute arg survives unconditionally.
+                        script_args += ',' + extra_script_args
                     cmd = [
                         'nmap', '-sU', '-p', '161',
                         '--source-port', src_port,
                         '--script', 'snmp-brute',
-                        '--script-args', f'snmp-brute.communitiesdb={tmp_path}',
+                        '--script-args', script_args,
                         '--script-timeout', '30s',
                         ip,
                     ]
@@ -5486,6 +5542,20 @@ _CONFIG_DOCS = {
          'scan, or ~5000 hosts × 1000 targeted ports). Lower to ~500000 for high-rate '
          'external setups (100k+ pps).'),
     ],
+    'scanner_profile': [
+        ('__scanner_profile_choices__',
+         'false/absent (default, disabled), "random", or an object pinning some of: '
+         'probe_token, tls_random, rdp_cookie, workstation, native_os, user_agent, '
+         'smtp_domain — any omitted key is drawn from a built-in pool'),
+        ('__scanner_profile_note__',
+         'When set, nmap probes and SpooNMAP\'s bundled NSE scripts no longer send '
+         'literal strings that identify the scanner (e.g. the RDP probe\'s '
+         '"mstshash=nmap" cookie, or nmap\'s own NSE HTTP User-Agent) — see '
+         'scan_profile.json in the output directory for exactly what was substituted, '
+         'for engagement deconfliction. Does NOT affect TCP/IP stack fingerprinting, '
+         'TLS/JA3 fingerprinting, or scan rate/shape; those are unrelated to string '
+         'substitution.'),
+    ],
 }
 
 # Canonical key order for a written config.json, matching config.json.sample.
@@ -5493,7 +5563,7 @@ _CONFIG_FIELD_ORDER = (
     'scan_categories', 'dest_ports', 'masscan_batch_size', 'banner_scan',
     'script_scan', 'host_discovery', 'resume', 'check_for_updates', 'target_scan', 'max_rate',
     'nmap_threads', 'nmap_threshold', 'target_file', 'output_path',
-    'exclusions_file',
+    'exclusions_file', 'scanner_profile',
 )
 
 
@@ -5501,7 +5571,7 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
                               script_scan, target_scan, max_rate, target_file,
                               output_path, exclusions_file, nmap_threads,
                               masscan_batch_size, nmap_threshold, host_discovery,
-                              check_for_updates=False):
+                              check_for_updates=False, scanner_profile=None):
     """Build a config.json-compatible dict from interactively collected options.
 
     The result round-trips through main()'s config loader: reloading it
@@ -5532,6 +5602,13 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
     way config.json.sample does.  Doc entries appear only for fields actually
     written, so a custom-port config carries the ``dest_ports`` note and not the
     ``scan_categories`` one.
+
+    ``scanner_profile`` follows the same never-omit-except-when-off rule as
+    every other field here: it is written whenever not None/falsy (either the
+    string ``'random'`` or a dict of token overrides, exactly as loaded), and
+    left out of ``values`` entirely when disabled so a regenerated config.json
+    reads identically to one that never had it — not a `false` cluttering an
+    otherwise-default file.
     """
     values = {
         'banner_scan': bool(banner_scan),
@@ -5552,6 +5629,8 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
         values['dest_ports'] = list(dest_ports)
     elif scan_categories is not None:
         values['scan_categories'] = scan_categories
+    if scanner_profile:
+        values['scanner_profile'] = scanner_profile
 
     config = {_CONFIG_GENERATED_KEY: _CONFIG_GENERATED_NOTE}
     for key in _CONFIG_FIELD_ORDER:
@@ -5789,6 +5868,632 @@ def _config_target_scan(value):
     sys.exit(1)
 
 
+# --- scanner_profile: nmap probe / NSE signature substitution ----------------
+#
+# scanner_profile lets an operator swap out the small set of literal strings
+# nmap and SpooNMAP's bundled NSE scripts send on the wire that trivially
+# identify the scanner to a client's IDS — e.g. the RDP probe's literal
+# "Cookie: mstshash=nmap" or the stock nmap NSE HTTP User-Agent. This section
+# is config parsing/validation and token generation only; the tokens are
+# substituted into an nmap data-directory overlay by _build_nmap_overlay()
+# and activated via $NMAPDIR — see that function for the mechanism.
+
+_SCANNER_PROFILE_TOKEN_KEYS = (
+    'probe_token', 'tls_random', 'rdp_cookie', 'workstation',
+    'native_os', 'user_agent', 'smtp_domain',
+)
+
+# Curated four-letter words, not random letters: a random 4-gram substituted
+# into "Cookie: mstshash=nmap" is itself an anomaly, while a real word reads
+# as an ordinary identifier. probe_token MUST stay exactly 4 ASCII letters —
+# several nmap-service-probes payloads hardcode a total byte length around it
+# (e.g. TerminalServerCookie's TPKT header bakes in a length of 42), so a
+# shorter or longer replacement would corrupt the probe rather than just
+# relabel it.
+_PROBE_TOKEN_POOL = (
+    'data', 'disc', 'isvc', 'netd', 'port', 'chek', 'apid', 'cfgd',
+    'isup', 'wsvc', 'iisd', 'pinf', 'sysd', 'cldp', 'edge', 'gwsv',
+    'link', 'mntr', 'node', 'pxsv', 'qery', 'rely', 'stat', 'tsvc',
+    'uapi', 'vdev', 'webd', 'xcfg', 'ypsv', 'zoid',
+)
+
+# mstshash= value for the RDP probe cookie — a plausible domain username.
+_RDP_COOKIE_POOL = (
+    'jsmith', 'msmith', 'administrator', 'svc-backup', 'helpdesk',
+    'kwilliams', 'rjohnson', 'svc-monitor', 'tbrown', 'itsupport',
+)
+
+_WORKSTATION_POOL = (
+    'DESKTOP-4KJ2L1P', 'DESKTOP-QW82XN1', 'LAPTOP-9F3K2MD', 'WIN10-CORP04',
+    'CORP-WKS0042', 'CORP-WKS0117', 'HELPDESK-PC03', 'FINANCE-LT21',
+    'DESKTOP-8HTZ6RQ', 'WORKSTATION17',
+)
+
+_NATIVE_OS_POOL = (
+    'Windows 10 Pro 19045', 'Windows 10 Enterprise 19045',
+    'Windows 11 Pro 22631', 'Windows Server 2019 Standard 17763',
+    'Windows Server 2022 Standard 20348',
+)
+
+_USER_AGENT_POOL = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 '
+    '(KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 '
+    'Firefox/125.0',
+)
+
+_SMTP_DOMAIN_POOL = (
+    'mail.corp-internal.local', 'relay.contoso-mail.local', 'smtp.corpnet.local',
+)
+
+# Characters that would break out of the Lua double-quoted string literal a
+# free-form token is substituted into inside the nmap data overlay (see
+# _build_nmap_overlay()): '"' ends the string early, a trailing '\' escapes
+# the closing quote, and a literal newline can't appear inside one at all.
+_LUA_STRING_UNSAFE_CHARS = frozenset('"\\\n')
+
+
+def _config_scanner_profile(value):
+    """Coerce config.json's *scanner_profile* to None or a dict of token overrides.
+
+    Absent, None, False, '' and 'off' all mean disabled — the tool's default,
+    byte-for-byte identical to today's behaviour. 'random' means every token
+    is drawn from the pools in _generate_scanner_tokens(). A dict pins
+    specific tokens (validated here via _validate_scanner_token) and leaves
+    the rest to the pools.
+
+    Unlike _config_bool, an unrecognised value exits rather than warning and
+    falling back to disabled: an operator who set this believes their scan no
+    longer carries "mstshash=nmap" and the stock nmap NSE User-Agent on the
+    wire. Silently ignoring a typo'd value would mean the engagement went out
+    exactly as before while the operator believed otherwise — the same class
+    of silent failure _config_target_scan treats as this tool's worst case.
+    """
+    if value is None or value is False:
+        return None
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ('', 'off', 'false'):
+            return None
+        if text == 'random':
+            return {}
+        print(_COLOR_ERROR + f'ERROR: config.json: scanner_profile = {value!r} is not '
+                             "'random', an object of token overrides, or false/absent."
+                             + _COLOR_RESET)
+        sys.exit(1)
+    if isinstance(value, dict):
+        unknown = sorted(set(value) - set(_SCANNER_PROFILE_TOKEN_KEYS))
+        if unknown:
+            print(_COLOR_ERROR + 'ERROR: config.json: scanner_profile has unknown '
+                                 f'key(s): {", ".join(unknown)}. Valid keys: '
+                                 + ', '.join(_SCANNER_PROFILE_TOKEN_KEYS) + _COLOR_RESET)
+            sys.exit(1)
+        overrides = {}
+        for key, token in value.items():
+            if not isinstance(token, str) or not token:
+                print(_COLOR_ERROR + f'ERROR: config.json: scanner_profile.{key} must be '
+                                     'a non-empty string.' + _COLOR_RESET)
+                sys.exit(1)
+            _validate_scanner_token(key, token)
+            overrides[key] = token
+        return overrides
+    print(_COLOR_ERROR + f'ERROR: config.json: scanner_profile = {value!r} is not '
+                         "'random', an object of token overrides, or false/absent."
+                         + _COLOR_RESET)
+    sys.exit(1)
+
+
+def _validate_scanner_token(key, token):
+    """Exit if *token* cannot safely be substituted into the *key* slot.
+
+    probe_token and tls_random fill fixed-width slots inside nmap's own
+    binary probe definitions (see _build_nmap_overlay()); any other length
+    would corrupt a probe whose total length is hardcoded elsewhere in the
+    same payload. user_agent/smtp_domain are substituted into an nmap
+    --script-args value and share _merge_script_args()'s unsafe-character
+    set. The remaining keys are substituted into a Lua string literal in the
+    generated overlay.
+    """
+    if key == 'probe_token':
+        if len(token) != 4 or not token.isalpha() or not token.isascii():
+            print(_COLOR_ERROR + 'ERROR: config.json: scanner_profile.probe_token '
+                                 f'{token!r} must be exactly 4 ASCII letters.'
+                                 + _COLOR_RESET)
+            sys.exit(1)
+        return
+    if key == 'tls_random':
+        if len(token) != 28 or not token.isascii() or not token.isprintable():
+            print(_COLOR_ERROR + 'ERROR: config.json: scanner_profile.tls_random must '
+                                 f'be exactly 28 printable ASCII characters (got '
+                                 f'{len(token)}).' + _COLOR_RESET)
+            sys.exit(1)
+        return
+    if key in ('user_agent', 'smtp_domain'):
+        bad = _SCRIPT_ARG_UNSAFE_CHARS.intersection(token)
+        if bad:
+            print(_COLOR_ERROR + f'ERROR: config.json: scanner_profile.{key} contains '
+                                 f'disallowed character(s) {"".join(sorted(bad))!r}.'
+                                 + _COLOR_RESET)
+            sys.exit(1)
+        return
+    # rdp_cookie, workstation, native_os — embedded into a Lua string literal.
+    bad = _LUA_STRING_UNSAFE_CHARS.intersection(token)
+    if bad:
+        print(_COLOR_ERROR + f'ERROR: config.json: scanner_profile.{key} contains '
+                             f'disallowed character(s) {"".join(sorted(bad))!r}.'
+                             + _COLOR_RESET)
+        sys.exit(1)
+
+
+def _generate_scanner_tokens(overrides):
+    """Return a full 7-key token dict: *overrides* wins, the rest drawn from pools.
+
+    *overrides* is whatever _config_scanner_profile() returned for a dict-form
+    scanner_profile (already validated); an empty dict (the 'random' form)
+    draws every token. Uses secrets.choice rather than the random module: not
+    a security boundary, just no reason for tokens to be predictable from a
+    scan's start time.
+    """
+    overrides = overrides or {}
+    tokens = dict(overrides)
+    if 'probe_token' not in tokens:
+        tokens['probe_token'] = secrets.choice(_PROBE_TOKEN_POOL)
+    if 'tls_random' not in tokens:
+        alphabet = string.ascii_letters + string.digits
+        tokens['tls_random'] = ''.join(secrets.choice(alphabet) for _ in range(28))
+    if 'rdp_cookie' not in tokens:
+        tokens['rdp_cookie'] = secrets.choice(_RDP_COOKIE_POOL)
+    if 'workstation' not in tokens:
+        tokens['workstation'] = secrets.choice(_WORKSTATION_POOL)
+    if 'native_os' not in tokens:
+        tokens['native_os'] = secrets.choice(_NATIVE_OS_POOL)
+    if 'user_agent' not in tokens:
+        tokens['user_agent'] = secrets.choice(_USER_AGENT_POOL)
+    if 'smtp_domain' not in tokens:
+        tokens['smtp_domain'] = secrets.choice(_SMTP_DOMAIN_POOL)
+    return tokens
+
+
+# --- nmap data-directory overlay ---------------------------------------------
+#
+# nmap's own $NMAPDIR / --datadir search is a per-file overlay with silent
+# fallback: a file present under the overlay directory wins, one absent from
+# it falls back to nmap's real data directory unnoticed. That means a missing
+# or unreadable overlay file is not an error nmap will ever report — it is
+# indistinguishable from "no evasion requested" to everything except the scan
+# traffic itself. So this generator treats every rewrite as all-or-nothing:
+# an unparseable source file, a substitution count that doesn't match what
+# was verified against a real nmap install, or a length-changing substitution
+# all raise rather than writing a partial overlay, and the caller in main()
+# aborts the run rather than scan under a false assumption of evasion.
+#
+# Only the files that actually need a substitution are written. Everything
+# else nmap reads (nselib/*, scripts/*, script.db, ...) is absent from the
+# overlay and therefore falls back to the real data directory untouched —
+# see the module docstring-level note above; this is deliberate, not partial
+# coverage, and is what keeps the overlay small and independent of the nmap
+# version installed.
+
+_OVERLAY_DIRNAME = '.nmap-overlay'
+
+# nmap's own escape set for nmap-service-probes q|...| payloads. Any other
+# backslash escape is not decodable with a known byte length, so
+# _decode_probe_string() raises on one rather than guessing.
+_PROBE_ESCAPES = {
+    '0': '\x00', 'a': '\x07', 'b': '\x08', 'f': '\x0c',
+    'n': '\x0a', 'r': '\x0d', 't': '\x09', 'v': '\x0b', '\\': '\\',
+}
+
+# Matches a Probe line's structure without touching match/softmatch/rarity/
+# ports/comment lines: group 3 is the q|...| delimiter (nearly always '|',
+# but nmap allows any character), group 4 is the raw, still-escaped payload
+# between the delimiters, group 5 is anything after the closing delimiter
+# (empty for every probe this rewrites, but nmap's grammar allows it).
+_PROBE_LINE_RE = re.compile(r'^Probe\s+(\S+)\s+(\S+)\s+q(.)(.*?)\3(\s.*)?$')
+
+# The literal ASCII string in nmap's TLSSessionReq probe (nmap-service-probes)
+# and in shortport.lua's SSL probe list — both send a ClientHello.Random field
+# that spells out its own origin.
+_TLS_RANDOM_LITERAL = 'random1random2random3random4'
+
+# nmap-service-probes payloads known to carry the tool's name are always
+# exactly 11 occurrences across 8 probes (verified against a real install);
+# TLSSessionReq's Random field is a 12th substitution. A different count means
+# the probe file has drifted from what this code was written against.
+_EXPECTED_SERVICE_PROBE_SUBSTITUTIONS = 12
+
+
+def _decode_probe_string(s):
+    """Decode an nmap-service-probes q|...| payload to the bytes nmap sends.
+
+    Recognises exactly nmap's escape set (\\0 \\a \\b \\f \\n \\r \\t \\v \\\\
+    and \\xHH); any other backslash escape raises ValueError rather than
+    guessing its length. This is used to prove a substitution did not change
+    the number of bytes nmap puts on the wire — see _rewrite_service_probes().
+    """
+    out = bytearray()
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == '\\':
+            if i + 1 >= n:
+                raise ValueError(f'trailing backslash in probe payload: {s!r}')
+            esc = s[i + 1]
+            if esc in _PROBE_ESCAPES:
+                out.append(ord(_PROBE_ESCAPES[esc]))
+                i += 2
+                continue
+            if esc == 'x':
+                hex_digits = s[i + 2:i + 4]
+                if len(hex_digits) != 2 or any(ch not in string.hexdigits for ch in hex_digits):
+                    raise ValueError(f'malformed \\x escape in probe payload: {s!r}')
+                out.append(int(hex_digits, 16))
+                i += 4
+                continue
+            raise ValueError(f'unrecognised escape \\{esc} in probe payload: {s!r}')
+        out.extend(c.encode('utf-8'))
+        i += 1
+    return bytes(out)
+
+
+def _probe_length_field_ok(name, decoded):
+    """Check *decoded*'s self-describing length field against its own byte count.
+
+    Four probes carry a field inside the payload that states the payload's
+    own total length; checked both before and after substitution (see
+    _rewrite_service_probes()) so a substitution that shifted a length-critical
+    field is caught rather than shipped. Any other probe name has no such
+    field and always passes.
+    """
+    if name == 'TerminalServerCookie':
+        return len(decoded) >= 4 and int.from_bytes(decoded[2:4], 'big') == len(decoded)
+    if name == 'informix':
+        return len(decoded) >= 2 and int.from_bytes(decoded[0:2], 'big') == len(decoded)
+    if name == 'ibm-mqseries':
+        return len(decoded) >= 8 and int.from_bytes(decoded[4:8], 'big') == len(decoded)
+    if name == 'mqtt':
+        return len(decoded) >= 2 and decoded[1] == len(decoded) - 2
+    return True
+
+
+def _rewrite_service_probes(text, probe_token, tls_random):
+    """Return (new_text, substitution_count) with nmap's self-identifying probe
+    payloads replaced, or raise if a substitution cannot be proven safe.
+
+    Only rewrites bytes inside a Probe line's q|...| payload — a
+    match/softmatch/comment/rarity/ports line containing "nmap" (several do,
+    elsewhere in this file) passes through unchanged, because the line-level
+    check below only recognises the ``Probe `` prefix. Every rewritten payload
+    is decoded to the bytes nmap will actually send and checked length-for-
+    length against the original, and the four probes with a self-describing
+    length field (see _probe_length_field_ok()) are checked both before and
+    after. Raises ValueError — never writes a partial result — on a
+    non-matching Probe line, an undecodable escape, a length change, or a
+    broken length field.
+    """
+    lines = text.split('\n')
+    out_lines = []
+    total_subs = 0
+    for lineno, line in enumerate(lines, 1):
+        if not line.startswith('Probe '):
+            out_lines.append(line)
+            continue
+        m = _PROBE_LINE_RE.match(line)
+        if not m:
+            raise ValueError(
+                f'nmap-service-probes line {lineno} starts with "Probe " but does '
+                f'not match the expected Probe-line format — refusing to guess: '
+                f'{line!r}')
+        proto, name, delim, payload, trailing = m.groups()
+        trailing = trailing or ''
+
+        new_payload = payload
+        subs_here = payload.count('nmap') + payload.count('Nmap')
+        if subs_here:
+            new_payload = payload.replace('nmap', probe_token).replace(
+                'Nmap', probe_token.capitalize())
+        if _TLS_RANDOM_LITERAL in payload:
+            new_payload = new_payload.replace(_TLS_RANDOM_LITERAL, tls_random)
+            subs_here += 1
+
+        if subs_here:
+            try:
+                before = _decode_probe_string(payload)
+                after = _decode_probe_string(new_payload)
+            except ValueError as exc:
+                raise ValueError(
+                    f'nmap-service-probes line {lineno} ({name}): {exc}') from exc
+            if len(before) != len(after):
+                raise ValueError(
+                    f'nmap-service-probes line {lineno} ({name}): substitution '
+                    f'changed payload length {len(before)} -> {len(after)} bytes, '
+                    'refusing to write a malformed probe')
+            if not _probe_length_field_ok(name, before):
+                raise ValueError(
+                    f'nmap-service-probes line {lineno} ({name}): decoded payload '
+                    'does not satisfy this probe\'s known length field — the probe '
+                    'has likely changed upstream; refusing to guess')
+            if not _probe_length_field_ok(name, after):
+                raise ValueError(
+                    f'nmap-service-probes line {lineno} ({name}): substitution '
+                    'broke this probe\'s self-describing length field')
+            total_subs += subs_here
+
+        out_lines.append(f'Probe {proto} {name} q{delim}{new_payload}{delim}{trailing}')
+    return '\n'.join(out_lines), total_subs
+
+
+def _rewrite_literal(text, path_label, old, new, expected_count):
+    """Replace *old* with *new* in *text*, requiring exactly *expected_count* hits.
+
+    Returns (new_text, expected_count). A plain substring replace is safe for
+    these nselib substitutions (unlike nmap-service-probes) because none of
+    them sit inside a length-prefixed binary payload — but the count is still
+    asserted, so a value nmap has since renamed or removed aborts the overlay
+    build instead of silently substituting zero times.
+    """
+    count = text.count(old)
+    if count != expected_count:
+        raise ValueError(
+            f'{path_label}: expected exactly {expected_count} occurrence(s) of '
+            f'{old!r}, found {count} — refusing to guess')
+    return text.replace(old, new), expected_count
+
+
+# Matches nselib/rdp.lua's `local cookie = "mstshash=..."` assignment,
+# capturing the mstshash value so the token is substituted for whatever value
+# is currently there — the stock "nmap", or an operator's own prior hand
+# patch (e.g. "administrator") — rather than requiring it to still say "nmap".
+_RDP_COOKIE_RE = re.compile(r'(local cookie = "mstshash=)([^"]*)(")')
+
+
+def _rewrite_rdp_lua(text, rdp_cookie):
+    """Return (new_text, 1) with rdp.lua's mstshash cookie value replaced."""
+    count = len(_RDP_COOKIE_RE.findall(text))
+    if count != 1:
+        raise ValueError(
+            'nselib/rdp.lua: expected exactly 1 `local cookie = "mstshash=..."` '
+            f'assignment, found {count} — refusing to guess')
+    new_text = _RDP_COOKIE_RE.sub(
+        lambda m: m.group(1) + rdp_cookie + m.group(3), text, count=1)
+    return new_text, 1
+
+
+def _rewrite_smb_lua(text, native_os):
+    """Return (new_text, 4) with smb.lua's Native OS / Native LanMan strings replaced.
+
+    Both fields (2 occurrences each, in the SMBv1 and NTLM SessionSetup code
+    paths) are set to the same *native_os* value — a real Windows host's own
+    Native OS and Native LanMan strings commonly look alike, so this does not
+    itself stand out the way the literal "Nmap"/"Native Lanman" pair does.
+
+    Matches ``"Nmap",`` — with the trailing comma of the table entry — rather
+    than bare ``"Nmap"``: the file also carries that literal inside a comment
+    ("I just send \"Nmap\"") with no trailing comma, which a bare match would
+    also rewrite and then find one occurrence more than expected.
+    """
+    new_text, n1 = _rewrite_literal(text, 'nselib/smb.lua', '"Nmap",',
+                                    f'"{native_os}",', 2)
+    new_text, n2 = _rewrite_literal(new_text, 'nselib/smb.lua', '"Native Lanman"',
+                                    f'"{native_os}"', 2)
+    return new_text, n1 + n2
+
+
+def _rewrite_shortport_ssl(text, tls_random):
+    """Return (new_text, 2) with shortport.lua's SSL-probe TLS Random rewritten.
+
+    The 28-char literal is split by a Lua ``\\z`` line continuation
+    (``random1random2random3\\z\\n    random4``), so a single search-and-replace
+    of the joined 28-char string silently matches zero times and "succeeds"
+    having changed nothing. This performs the two halves — 21 and 7
+    characters — as independent substitutions, each asserted to occur exactly
+    once.
+    """
+    first, second = tls_random[:21], tls_random[21:]
+    new_text, n1 = _rewrite_literal(text, 'nselib/shortport.lua',
+                                    'random1random2random3', first, 1)
+    new_text, n2 = _rewrite_literal(new_text, 'nselib/shortport.lua',
+                                    'random4', second, 1)
+    return new_text, n1 + n2
+
+
+def _locate_nmap_datadir():
+    """Best-effort locate nmap's own data directory (nmap-service-probes, nselib/).
+
+    Mirrors nmap's own search order closely enough for this purpose: relative
+    to the nmap binary first — the path a real ``Fetchfile`` trace resolves to
+    on every platform this was checked against (Linux and macOS, matching this
+    repo's CI matrix) — then the common package-manager install locations.
+    Returns None if nothing plausible is found; the caller must treat that as
+    "scanner_profile cannot be honoured" rather than guessing further.
+    """
+    candidates = []
+    nmap_bin = shutil.which('nmap')
+    if nmap_bin:
+        bin_dir = os.path.dirname(os.path.realpath(nmap_bin))
+        candidates.append(os.path.join(bin_dir, '..', 'share', 'nmap'))
+    candidates += ['/usr/local/share/nmap', '/usr/share/nmap',
+                   '/opt/homebrew/share/nmap']
+    for candidate in candidates:
+        if os.path.isfile(os.path.join(candidate, 'nmap-service-probes')):
+            return os.path.normpath(candidate)
+    return None
+
+
+def _overlay_dir(output_path):
+    return os.path.join(output_path, _OVERLAY_DIRNAME)
+
+
+def _build_nmap_overlay(output_path, tokens, nmap_datadir):
+    """Write the $NMAPDIR overlay substituting scanner-identifying strings.
+
+    Rebuilt from *nmap_datadir* on every call — never patched in place and
+    never reused across runs — so an nmap upgrade between engagements can't
+    leave a stale overlay silently shadowing the new data files. *tokens* is
+    the full 7-key dict from _generate_scanner_tokens(). *nmap_datadir* is
+    normally _locate_nmap_datadir()'s result, passed in explicitly so this
+    function stays a pure transform for testing.
+
+    Returns (overlay_dir, manifest), where manifest is a list of
+    ``{'path', 'sha256', 'substitutions'}`` dicts — the basis of
+    scan_profile.json's deconfliction record. Raises OSError if a source file
+    cannot be read, or ValueError if a rewrite guard trips; both are meant to
+    abort the run rather than scan with a partially-built overlay — see the
+    activation point in main().
+    """
+    overlay_dir = _overlay_dir(output_path)
+    nselib_dir = os.path.join(overlay_dir, 'nselib')
+    os.makedirs(nselib_dir, exist_ok=True)
+
+    manifest = []
+
+    probes_src = os.path.join(nmap_datadir, 'nmap-service-probes')
+    with open(probes_src, encoding='utf-8') as fh:
+        probes_text = fh.read()
+    new_probes, probe_subs = _rewrite_service_probes(
+        probes_text, tokens['probe_token'], tokens['tls_random'])
+    if probe_subs != _EXPECTED_SERVICE_PROBE_SUBSTITUTIONS:
+        raise ValueError(
+            f'nmap-service-probes: expected exactly '
+            f'{_EXPECTED_SERVICE_PROBE_SUBSTITUTIONS} substitutions, made '
+            f'{probe_subs} — the probe set has likely changed upstream; '
+            'refusing to write a partially de-signatured overlay')
+    _atomic_write(os.path.join(overlay_dir, 'nmap-service-probes'), new_probes)
+    manifest.append({'path': 'nmap-service-probes',
+                     'sha256': hashlib.sha256(new_probes.encode()).hexdigest(),
+                     'substitutions': probe_subs})
+
+    def _write_nselib(name, rewriter):
+        src = os.path.join(nmap_datadir, 'nselib', name)
+        with open(src, encoding='utf-8') as fh:
+            text = fh.read()
+        new_text, subs = rewriter(text)
+        _atomic_write(os.path.join(nselib_dir, name), new_text)
+        manifest.append({'path': f'nselib/{name}',
+                         'sha256': hashlib.sha256(new_text.encode()).hexdigest(),
+                         'substitutions': subs})
+
+    _write_nselib('rdp.lua', lambda t: _rewrite_rdp_lua(t, tokens['rdp_cookie']))
+    _write_nselib('smb.lua', lambda t: _rewrite_smb_lua(t, tokens['native_os']))
+    _write_nselib('smbauth.lua', lambda t: _rewrite_literal(
+        t, 'nselib/smbauth.lua', 'utf8to16("nmap")',
+        f'utf8to16("{tokens["workstation"]}")', 1))
+    _write_nselib('shortport.lua', lambda t: _rewrite_shortport_ssl(
+        t, tokens['tls_random']))
+
+    return overlay_dir, manifest
+
+
+# Scripts whose nselib dependency chain reaches every file the overlay
+# rewrites (rdp.lua, smb.lua, smbauth.lua, shortport.lua) — verified against a
+# real nmap install rather than assumed from source reading.  Chosen to send
+# zero packets to any real target: -sn -Pn loads and `require()`s every named
+# script's dependencies during initialisation without ever reaching a
+# portrule, so this never touches the engagement network.
+_OVERLAY_VERIFY_SCRIPTS = 'rdp-ntlm-info,smb-os-discovery,http-title,smtp-commands'
+_OVERLAY_VERIFY_NSELIB_FILES = ('rdp.lua', 'smb.lua', 'smbauth.lua', 'shortport.lua')
+
+
+def _verify_nmap_overlay(overlay_dir, extra_script_args=None):
+    """Interrogate a real nmap invocation to prove the overlay is actually read.
+
+    $NMAPDIR/--datadir fall back to nmap's real data directory silently for
+    any file absent from the overlay, unreadable, or shadowed by something
+    else on the search path — nmap never reports that as an error, so having
+    written the overlay correctly is not proof it will be used. This runs two
+    throwaway, unprivileged probes against 127.0.0.1 — nothing is sent to any
+    real target — with NMAPDIR already exported, and greps nmap's own debug
+    trace for confirmation that each overlay file was actually read from
+    *overlay_dir* rather than nmap's real data directory.
+
+    Returns (ok, detail): detail is empty on success, or a short string
+    identifying what failed — printed by the caller in main(), which aborts
+    the run rather than scanning under a false assumption of evasion.
+    """
+    env = dict(os.environ)
+    env['NMAPDIR'] = overlay_dir
+
+    cmd = ['nmap', '-d2', '-sn', '-Pn', '--script', _OVERLAY_VERIFY_SCRIPTS]
+    if extra_script_args:
+        cmd += ['--script-args', extra_script_args]
+    cmd += ['127.0.0.1']
+    try:
+        result = subprocess.run(cmd, env=env, capture_output=True,
+                                text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return False, f'overlay verification probe failed to run: {exc}'
+
+    output = result.stdout + result.stderr
+    if 'failed to initialize the script engine' in output:
+        return False, 'nmap rejected the composed --script-args'
+
+    for name in _OVERLAY_VERIFY_NSELIB_FILES:
+        marker = f'Fetchfile found {os.path.join(overlay_dir, "nselib", name)}'
+        if marker not in output:
+            return False, (f'nmap did not read nselib/{name} from the overlay '
+                           '— it silently fell back to the real nmap data directory')
+
+    try:
+        result2 = subprocess.run(
+            ['nmap', '-d1', '-sV', '-p', '1', '127.0.0.1'],
+            env=env, capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return False, f'overlay verification probe failed to run: {exc}'
+    if f'Read from {overlay_dir}: nmap-service-probes.' not in (result2.stdout + result2.stderr):
+        return False, ('nmap did not read nmap-service-probes from the overlay '
+                       '— it silently fell back to the real nmap data directory')
+
+    return True, ''
+
+
+def _scan_profile_path(output_path):
+    return os.path.join(output_path, 'scan_profile.json')
+
+
+def _write_scan_profile_record(output_path, tokens, manifest, nmap_datadir,
+                               script_args, run_timestamp):
+    """Write/update scan_profile.json — the engagement deconfliction record.
+
+    Read-modify-append: an existing record's ``runs`` list is preserved and
+    extended rather than the file being overwritten wholesale, mirroring
+    _write_interactive_config()'s merge behaviour — a resumed engagement's
+    earlier run timestamps must not be lost just because the tokens (read back
+    unchanged; see the caller in main()) are identical.
+
+    *run_timestamp* is passed in rather than read from ``datetime.now()`` here
+    so this function has no wall-clock dependency of its own; the caller
+    supplies whatever it considers "now".
+    """
+    path = _scan_profile_path(output_path)
+    try:
+        with open(path, encoding='utf-8') as fh:
+            existing = json.load(fh)
+    except (OSError, ValueError):
+        existing = None
+    runs = list(existing.get('runs', [])) if isinstance(existing, dict) else []
+    runs.append(run_timestamp)
+
+    record = {
+        'generated_utc': run_timestamp,
+        'tool': 'spoonmap',
+        'version': _tool_version(),
+        'note': ('Strings below were substituted into nmap probes and bundled '
+                'NSE scripts to reduce scanner fingerprinting. Network traffic '
+                'bearing them originated from this authorised engagement. This '
+                'does NOT affect TCP/IP stack fingerprinting, TLS/JA3 '
+                'fingerprinting, or scan rate/shape.'),
+        'tokens': tokens,
+        'source_nmap_datadir': nmap_datadir,
+        'overlay_dir': _overlay_dir(output_path),
+        'overlay_files': manifest,
+        'script_args': script_args,
+        'runs': runs,
+    }
+    _write_artifact(path, json.dumps(record, indent=2) + '\n')
+
+
 def _load_config(config_parser, dir_path, resume=False):
     """Derive every scan setting from an already-parsed config.json dict.
 
@@ -5863,6 +6568,11 @@ def _load_config(config_parser, dir_path, resume=False):
     # enable a launch-time network call; see _check_for_updates().
     check_for_updates = _config_bool(
         'check_for_updates', config_parser.get('check_for_updates', False), False)
+    # None = disabled (default); {} = 'random' (draw every token from the
+    # pools); non-empty dict = those tokens pinned, the rest from the pools.
+    # Token generation itself happens in main(), not here, so this stays
+    # deterministic for testing.
+    scanner_profile = _config_scanner_profile(config_parser.get('scanner_profile'))
     config_generated = bool(config_parser.get(_CONFIG_GENERATED_KEY))
 
     # Resolve relative paths in config relative to the operator directory
@@ -5891,6 +6601,7 @@ def _load_config(config_parser, dir_path, resume=False):
         'host_discovery': host_discovery,
         'resume': resume,
         'check_for_updates': check_for_updates,
+        'scanner_profile': scanner_profile,
         'config_generated': config_generated,
     }
 
@@ -6112,6 +6823,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         nmap_threshold = 5_000_000  # Default work-unit threshold for tool selection
         host_discovery = None   # None = prompt user; True/False = set from config
         check_for_updates = False  # no interactive prompt; only set via config.json
+        scanner_profile = None  # no interactive prompt; only set via config.json
 
 
         # Get options from configuration file if it exists
@@ -6149,6 +6861,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             resume             = cfg['resume']
             config_generated   = cfg['config_generated']
             check_for_updates  = cfg['check_for_updates']
+            scanner_profile    = cfg['scanner_profile']
 
             _maybe_check_for_updates(check_for_updates)
 
@@ -6433,6 +7146,8 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         print(f'Masscan Batch Size: {masscan_batch_size}')
         print(f'NMAP Work-Unit Threshold: {nmap_threshold:,}')
         print(f'Host Discovery:  {host_discovery}')
+        print(f'Scanner Signature Profile: '
+              f'{"enabled (see scan_profile.json once generated)" if scanner_profile is not None else "disabled"}')
 
         target_count = _count_hosts_in_file(target_file)
         if target_count is not None:
@@ -6457,7 +7172,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 scan_categories, dest_ports, scan_type, banner_scan, script_scan,
                 target_scan, max_rate, target_file, output_path, exclusions_file,
                 nmap_threads, masscan_batch_size, nmap_threshold, host_discovery,
-                check_for_updates,
+                check_for_updates, scanner_profile,
             )
             config_json_path = f'{dir_path}/config.json'
             if _write_interactive_config(config_json_path, interactive_config):
@@ -6474,6 +7189,88 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         # so the new one still needs checking.
         if checked_output_path is None or output_path != checked_output_path:
             resume, _ = _handle_previous_results(output_path, resume)
+
+        # Build and activate the nmap signature-substitution overlay before any
+        # scanning begins, so every nmap invocation for the rest of this run —
+        # discovery, port scans, banner grabs, NSE — inherits it via $NMAPDIR.
+        # See _build_nmap_overlay()/_verify_nmap_overlay() for the mechanism and
+        # why a failure here aborts the run rather than scanning unmodified.
+        extra_script_args = None
+        if scanner_profile is not None:
+            # Reuse tokens from an existing scan_profile.json whenever one is
+            # present and complete — not gated on --resume specifically: an
+            # [a]ppend run keeps prior output too, and appending new hosts'
+            # results under a second, different token set would make
+            # scan_profile.json describe only the more recent half of what is
+            # actually on disk. [d]elete already removed the file (see
+            # _CLEANUP_ONLY_FILES), so a fresh set is drawn naturally there,
+            # and the same is true for this output directory's first run.
+            try:
+                with open(_scan_profile_path(output_path), encoding='utf-8') as fh:
+                    existing_profile = json.load(fh)
+            except (OSError, ValueError):
+                existing_profile = None
+            if (isinstance(existing_profile, dict)
+                    and set(_SCANNER_PROFILE_TOKEN_KEYS)
+                        <= set(existing_profile.get('tokens', {}))):
+                scanner_tokens = existing_profile['tokens']
+                print(_COLOR_INFO
+                      + 'Scanner signature profile: reusing tokens from '
+                      + f'{_scan_profile_path(output_path)}' + _COLOR_RESET)
+            else:
+                scanner_tokens = _generate_scanner_tokens(scanner_profile)
+
+            nmap_datadir = _locate_nmap_datadir()
+            if nmap_datadir is None:
+                print(_COLOR_ERROR
+                      + "ERROR: scanner_profile is set but nmap's data directory "
+                      + 'could not be located — cannot build the signature-'
+                      + 'substitution overlay.' + _COLOR_RESET)
+                sys.exit(1)
+
+            try:
+                overlay_dir, overlay_manifest = _build_nmap_overlay(
+                    output_path, scanner_tokens, nmap_datadir)
+            except (OSError, ValueError) as exc:
+                print(_COLOR_ERROR
+                      + 'ERROR: could not build the nmap signature-substitution '
+                      + f'overlay: {exc}' + _COLOR_RESET)
+                sys.exit(1)
+
+            extra_script_args = _merge_script_args(
+                ('http.useragent', scanner_tokens['user_agent']),
+                ('smtp.domain', scanner_tokens['smtp_domain']),
+            )
+
+            verify_ok, verify_detail = _verify_nmap_overlay(overlay_dir, extra_script_args)
+            if not verify_ok:
+                print(_COLOR_ERROR
+                      + 'ERROR: scanner_profile overlay verification failed: '
+                      + verify_detail + _COLOR_RESET)
+                print(_COLOR_ERROR
+                      + 'Refusing to scan: nmap would silently fall back to its real '
+                      + 'data files and send unmodified scanner-identifying probes.'
+                      + _COLOR_RESET)
+                sys.exit(1)
+
+            prior_nmapdir = os.environ.get('NMAPDIR')
+            if prior_nmapdir:
+                print(_COLOR_INFO
+                      + f'Overriding pre-existing NMAPDIR={prior_nmapdir!r} for this run.'
+                      + _COLOR_RESET)
+            os.environ['NMAPDIR'] = overlay_dir
+
+            run_timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            _write_scan_profile_record(
+                output_path, scanner_tokens, overlay_manifest, nmap_datadir,
+                extra_script_args, run_timestamp)
+
+            print(_COLOR_RESULT
+                  + f'Scanner signature profile active — overlay: {overlay_dir}'
+                  + _COLOR_RESET)
+            print(_COLOR_RESULT
+                  + f'  See {_scan_profile_path(output_path)} for exactly what was '
+                  + 'substituted (engagement deconfliction).' + _COLOR_RESET)
 
         scan_start_time = time.time()
 
@@ -6546,7 +7343,8 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
 
         # If service banners requested, send to nmap
         if banner_scan or script_scan:
-            nmap_scan(source_port, nmap_threads, ip_to_hostname, script_scan, target_scan)
+            nmap_scan(source_port, nmap_threads, ip_to_hostname, script_scan, target_scan,
+                     extra_script_args)
             udp_confirmed = _filter_udp_live_hosts(output_path)
             for port_key, count in udp_confirmed.items():
                 lines = status_summary.split('\n')
@@ -6565,7 +7363,8 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
 
             snmp_any_validated = {}
             if script_scan:
-                snmp_any_validated = _validate_snmp_any_community(output_path, target_scan)
+                snmp_any_validated = _validate_snmp_any_community(
+                    output_path, target_scan, extra_script_args)
 
         # Combine all live hosts into one file
         disc = _disc(output_path)
