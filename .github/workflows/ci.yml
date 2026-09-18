@@ -74,7 +74,7 @@ jobs:
         run: python3 -c "import shutil, sys; sys.exit(0 if shutil.which('nmap') else 1)"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
         with:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
@@ -116,7 +116,7 @@ jobs:
         run: python3 -c "import shutil, sys; sys.exit(0 if shutil.which('nmap') else 1)"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
         with:
           enable-cache: true
 
@@ -139,7 +139,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
         with:
           python-version: '3.12'
           enable-cache: true
@@ -174,7 +174,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
         with:
           python-version: '3.12'
           enable-cache: true
@@ -205,7 +205,7 @@ jobs:
         run: python3 -c "import shutil, sys; sys.exit(0 if shutil.which('nmap') else 1)"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
         with:
           python-version: '3.12'
           # setup-uv's post-run cache prune runs as the `runner` user, but
@@ -338,7 +338,7 @@ jobs:
       # root-owned-cache/runner-owned-prune conflict, and caching speeds up
       # repeated `uvx` tool installs across runs.
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
         with:
           python-version: '3.12'
           enable-cache: true
@@ -375,7 +375,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
         with:
           python-version: '3.12'
           enable-cache: true
