@@ -307,11 +307,39 @@ git update-index --no-skip-worktree ranges.txt
 | `nmap_threshold` | Integer | Work-unit threshold for tool selection (default: 5,000,000 — see below); prompted under "Tune advanced settings" |
 | `resume` | `"True"` / `"False"` | Skip completed port discovery on restart (default: False) |
 | `check_for_updates` | `"True"` / `"False"` | Contact api.github.com at startup to check for a newer release. Off unless set; see `--check-update` for a one-off check (default: False) |
+| `scanner_profile` | `false`, `"random"`, or an object | Substitutes strings that identify nmap/SpooNMAP in probe traffic (e.g. the RDP probe's `mstshash=nmap` cookie). Off unless set — see below |
+| `honeypot_active_confirm` | `"True"` / `"False"` | Actively confirm suspected decoy hosts with a few raw TCP connects to unscanned high ports. Off unless set; only probes in-scope hosts flagged by the TTL-spread or port-profile signals, and only on the masscan scan path (default: False) |
 | `__generated_by_prompts__` | String | Present only in a config the prompts wrote. While it is present, **[d]elete**/**[a]ppend** re-ask the options using this file's values as defaults; remove it to keep them fixed |
 
 Keys beginning and ending with `__` are documentation and are ignored by the loader, so you can annotate the file freely — a re-prompted run preserves them.
 
 The three concurrency and tool-selection keys above are not asked about individually. The prompts end with a single **"Tune advanced settings?"** question (default: No); answering yes asks for all three, pre-filled with their current values.
+
+### scanner_profile: reducing scanner fingerprinting
+
+Some of nmap's own probes, and a few of SpooNMAP's bundled NSE scripts, carry literal strings that identify the scanner — most notably the RDP service probe's `Cookie: mstshash=nmap` (sent by every `-sV` scan of 3389, independent of `script_scan`), the TLS ClientHello's `random1random2random3random4` filler, and the SMB Native OS/LanMan fields nmap reports as `"Nmap"`/`"Native Lanman"`. Setting `scanner_profile` builds a small nmap [`$NMAPDIR`](https://nmap.org/book/data-files.html) overlay that substitutes those strings before the scan starts, without touching your system's nmap install:
+
+```jsonc
+"scanner_profile": "random"
+```
+
+draws a full set of plausible replacement values (a username, a Windows hostname, a browser User-Agent, …) fresh for each engagement. To pin specific values instead — or override only some of them — provide an object:
+
+```jsonc
+"scanner_profile": {
+  "probe_token": "isvc",
+  "rdp_cookie": "jsmith",
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ..."
+}
+```
+
+Any key you omit is still drawn from the built-in pool. `probe_token` (exactly 4 letters) and `tls_random` (exactly 28 characters) are length-constrained because they fill fixed-width slots inside nmap's own probe definitions; the rest are free-form.
+
+Every run writes `scan_profile.json` next to your other output, recording exactly which strings were substituted — keep it for engagement deconfliction ("was that scan traffic us?"). A `--resume`'d or `[a]ppend`'d run reuses the same tokens already on disk rather than drawing a new set.
+
+**What this does not do:** it has no effect on TCP/IP stack fingerprinting (nmap's `-sS` SYN characteristics), TLS/JA3 fingerprinting (only the ClientHello `Random` field changes, not cipher/extension ordering), or scan rate and shape. It substitutes strings inside probe payloads, nothing else.
+
+If the substitution can't be verified as actually taking effect — including because nmap's data directory can't be located — the run aborts rather than scanning under a false assumption of evasion.
 
 ### max_rate guidance
 Rates that are too high can create a denial-of-service condition — use caution.
@@ -527,6 +555,7 @@ After scanning, `generate_findings()` parses all nmap XML results and produces s
 | HIGH | IKE Aggressive Mode with Pre-Shared Key (U:500, confirmed by `ike-version`) |
 | HIGH | RealVNC Authentication Bypass (CVE-2006-2369) (5900/5901, confirmed by `realvnc-auth-bypass`) |
 | HIGH | Service Exposed Externally (databases, RDP, SMB, SNMP, WebLogic, VNC, WSUS 8530/8531, etc. — external scan only) |
+| HIGH | Likely Honeypot / Decoy Host — named product match (Heralding VNC) or an active confirmation-probe answer |
 | MEDIUM | SMBv1 protocol enabled |
 | MEDIUM | Weak SSH algorithms (deprecated ciphers/MACs/KEX) |
 | MEDIUM | Java RMI registry exposed |
@@ -536,6 +565,8 @@ After scanning, `generate_findings()` parses all nmap XML results and produces s
 | MEDIUM | OpenAI-Compatible LLM API Unauthenticated (1234/1337/3000/8000, custom NSE — internal scan) |
 | MEDIUM | Gradio LLM Web UI Accessible (7860, custom NSE — internal scan) |
 | MEDIUM | KoboldCpp LLM API Unauthenticated (5001, custom NSE — internal scan) |
+| MEDIUM | Likely Honeypot / Decoy Host — two or more heuristic signals on one host |
+| LOW | Likely Honeypot / Decoy Host — exactly one heuristic signal (tarpit open-port ratio, TTL spread, port profile, unmatched fingerprints, or silent open ports) |
 | LOW | Anonymous FTP login (default LOW — review the share; escalate if it exposes sensitive data or is writable) |
 | LOW | FTP exposed externally (plaintext protocol — credentials/data in cleartext; use FTPS/SFTP) |
 | LOW | Telnet exposed externally (plaintext protocol — credentials/data in cleartext; use SSH) |

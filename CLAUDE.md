@@ -79,9 +79,11 @@ is exact-pinned in the `dev` group too (same reasoning as ruff — a bare `uvx
 --from` pin on bandit itself let its transitive dependencies float). `ruff
 format` is deliberately **not** adopted — reformatting the module and the
 11k-line test file would bury every future diff, and `E501` alone flags 288
-existing lines. The bandit baseline holds 32 reviewed findings (list-form
+existing lines. The bandit baseline holds 36 reviewed findings (list-form
 `subprocess` calls, `xml.etree` parsing of masscan/nmap output we invoked
-ourselves), so only a *new* finding fails; regenerate it deliberately and
+ourselves, and one deterministic-but-non-cryptographic `random.Random` seed
+for honeypot probe-port selection), so only a *new* finding fails; regenerate
+it deliberately and
 justify additions in the commit message rather than adding inline `# nosec`
 suppressions. `workflow-lint` runs `actionlint` (YAML/expression errors) and
 `zizmor` (Actions-specific security auditing — unpinned actions, script
@@ -258,6 +260,159 @@ forward — that fallback only works when a config.json happens to still be on
 disk with the key already set, and silently drops it on a first-ever
 regeneration.
 
+## Scanner Signature Reduction (`scanner_profile`)
+
+Several nmap probes and a few of SpooNMAP's own bundled NSE scripts carry
+literal strings that identify the scanner to a client's IDS — most notably
+`nmap-service-probes`' `TerminalServerCookie` probe (`Cookie: mstshash=nmap`),
+sent by every `-sV` scan of 3388/3389 **independent of `script_scan`**, since a
+probe registered to the target port fires regardless of `--version-intensity`.
+Hand-patching `nselib/rdp.lua`'s own cookie (a documented workaround) never
+covered this, because that file backs the separate `rdp-ntlm-info` NSE script,
+not the banner-pass service probe. `scanner_profile` fixes both, plus the TLS
+ClientHello's `random1random2random3random4` filler (`TLSSessionReq` in
+`nmap-service-probes` and `shortport.lua`'s `LIKELY_SSL_SERVICES` probe list —
+split across a Lua `\z` line continuation, so a single joined-string replace
+silently matches zero times; handled as two independent 21+7 char
+substitutions, each asserted to occur exactly once), and the SMB Native
+OS/LanMan fields nmap reports as literal `"Nmap"`/`"Native Lanman"`.
+
+**Mechanism: an nmap `$NMAPDIR` overlay, not in-place patching.** `$NMAPDIR`
+(like `--datadir`) is a **per-file overlay with silent fallback**: a file
+present under it wins, one absent from it falls back to nmap's real data
+directory unnoticed — nmap never reports that as an error. `main()` sets
+`os.environ['NMAPDIR']` once, before any scanning begins; every nmap
+invocation (7 call sites across host discovery, port discovery, banner/NSE
+passes, and the extra SQL/SNMP probes) inherits it via subprocess
+environment inheritance, with **no per-call-site edits** — the alternative,
+passing `--datadir` at each site, has a failure mode of *one forgotten site
+silently sends the unmodified probe*, which is exactly the class of bug this
+repo's failure-mode discipline exists to prevent. Only the files that
+actually need a substitution are written (`nmap-service-probes` and four
+`nselib/*.lua` files); everything else nmap reads falls back to the real
+data directory untouched.
+
+**The overlay is rebuilt from the live nmap datadir every run, never
+patched in place and never cached across runs** — an nmap upgrade between
+engagements would otherwise leave a stale overlay silently shadowing the new
+data files. `_locate_nmap_datadir()` finds it relative to the `nmap` binary
+first (matching what a real `Fetchfile` trace resolves to), then common
+package-manager paths.
+
+**Byte-length safety is the load-bearing constraint**, not a nicety: several
+`nmap-service-probes` payloads hardcode a total length elsewhere in the same
+probe (`TerminalServerCookie`'s TPKT header bakes in 42 bytes), so `probe_token`
+is constrained to exactly 4 ASCII letters and `tls_random` to exactly 28
+characters. `_rewrite_service_probes()` never does a blind `str.replace()` —
+it parses each `Probe` line's structure, substitutes only inside the
+delimited `q|...|` payload (never a `match`/`softmatch`/comment/rarity/ports
+line, several of which also contain the literal word "nmap" elsewhere in this
+file), decodes the payload to the actual bytes nmap will send via
+`_decode_probe_string()` (nmap's own escape set only — any other backslash
+sequence raises, since its length can't be proven), and asserts the decoded
+length is unchanged. Four probes additionally carry a self-describing length
+field inside the payload (`TerminalServerCookie`, `informix`, `ibm-mqseries`,
+`mqtt`), checked via `_probe_length_field_ok()` both before and after
+substitution. A **substitution count assertion** (exactly 11 `nmap`/`Nmap`
+occurrences across 8 probes, plus 1 `TLSSessionReq` random — 12 total; each
+nselib file has its own expected count) means an nmap upgrade that changes
+the probe set aborts the overlay build loudly rather than silently writing a
+partially de-signatured — and therefore falsely-reassuring — result. Any
+guard failure raises and the overlay is not written at all; there is no
+partial-success case.
+
+**Verification interrogates a real nmap invocation, not the files SpooNMAP
+wrote.** Because `$NMAPDIR`'s fallback is silent, writing the overlay
+correctly is not proof nmap will read it — a path typo, a permissions issue,
+or an `NMAPDIR` clobbered by a wrapper script all fail exactly the same way:
+nothing, with nmap quietly using its real data files instead.
+`_verify_nmap_overlay()` runs two throwaway, unprivileged probes against
+`127.0.0.1` (nothing reaches any real target): `-sn -Pn --script
+rdp-ntlm-info,smb-os-discovery,http-title,smtp-commands` loads and
+`require()`s every selected script's nselib dependencies during
+initialisation, before any portrule runs, so it reaches all four rewritten
+`nselib/*.lua` files in ~60ms with zero packets sent; a second `-d1 -sV`
+probe against a closed port confirms `nmap-service-probes` was read from the
+overlay. Both run with `-d2`/`-d1` and grep nmap's own `Fetchfile
+found`/`Read from` debug trace for the overlay path specifically — proving
+the *consumer* read the file, not merely that the *producer* wrote it. A
+failed verification (or a `--script-args` nmap rejects) aborts the run via
+`sys.exit(1)`: an operator who enabled `scanner_profile` has made an
+engagement-level decision about what a client's IDS will see, and scanning
+under a false assumption of evasion is worse than not scanning.
+
+**Token composition**: 7 slots (`probe_token`, `tls_random`, `rdp_cookie`,
+`workstation`, `native_os`, `user_agent`, `smtp_domain`). `"random"` draws
+every token from a curated pool via `secrets.choice()` (not `random` —
+no reason for tokens to be predictable from a scan's start time); an object
+pins specific tokens and lets the rest fall through to the pool.
+`_config_scanner_profile()` follows `_config_target_scan()`'s doctrine: an
+unrecognised value **exits rather than warns**, because an operator who set
+this believes their scan no longer carries `mstshash=nmap` — silently
+falling back to disabled would mean the engagement went out unmodified while
+the operator believed otherwise. `probe_token` and `tls_random` are
+length-validated at the config layer too (`_validate_scanner_token()`),
+before ever reaching the rewriter.
+
+`user_agent`/`smtp_domain` reach nmap via `--script-args http.useragent=…`
+(the stock NSE default is nmap's own `Mozilla/5.0 (compatible; Nmap
+Scripting Engine; …)` string — no file patch needed, since it's already
+`stdnse.get_script_args()`-overridable) and `smtp.domain=…`
+(replacing `smtp.lua`'s `nmap.scanme.org` default). Composed through
+`_merge_script_args()`, the first site in this codebase to build a
+`--script-args` value from more than one source: every value is single-quoted
+(an unquoted User-Agent's `,`/`;`/`(`/`)` would otherwise be parsed as
+separate args by nmap's own grammar) and a value containing `'`, `\`, `{`, or
+`}` is rejected outright — `{` specifically produces `NSE: failed to
+initialize the script engine`, silently aborting the entire script pass for
+that port rather than just that one argument.
+
+**Own-goal fixes, applied unconditionally (not gated behind
+`scanner_profile`):** `nse/delve-debugger.nse` sent `"clientID":"spoonmap"` in
+its DAP probe — logged verbatim into the target's own Delve session log for
+zero benefit; now sends `"vscode"`. Seven of the eight bundled raw-socket
+HTTP-probing NSE scripts (all but `wsus-detect.nse`) sent HTTP/1.0 requests
+with **no `User-Agent` header at all** — itself a distinguishing scanner tell,
+and a request some WAFs/app servers simply refuse or serve differently. All
+eight also sent `Host: host.ip` rather than `host.targetname`, throwing away
+the hostname resolution this tool already does "for SNI/vhost" (see Key
+Implementation Details) and missing every name-based vhost. Both are
+correctness defects independent of evasion, so they're unconditional; each
+script now reads `stdnse.get_script_args('http.useragent')` first with a
+protocol-appropriate fallback (a generic modern browser string; `wsus-detect`
+keeps impersonating `Windows-Update-Agent`, since that is deliberately
+protocol-correct there), so `scanner_profile`'s `user_agent` token
+automatically reaches the bundled scripts too through the same
+`--script-args` knob — one setting, not eight separately-defaulted ones that
+would each be a fresh signature if forgotten.
+
+**Deconfliction record**: every activation writes/updates
+`<output_path>/scan_profile.json` — the tokens used, the source nmap datadir
+and version, a sha256 + substitution count per overlay file, the composed
+`--script-args`, and an append-only `runs` timestamp list — so an operator can
+answer a client's "was that scan traffic you?" months later. `--resume` and
+`[a]ppend` (which also keeps prior output) reuse the tokens already recorded
+there rather than drawing a fresh set, so one engagement's output directory
+never mixes two different signature profiles; `[d]elete` removes the record
+(see below) and the next run draws fresh. `scan_profile.json` and the overlay
+directory (`<output_path>/.nmap-overlay/`) are generated *before* scanning
+starts, not as a scan result, so both are excluded from
+`_previous_results_exist()` via `_CLEANUP_ONLY_DIRS`/`_CLEANUP_ONLY_FILES` — a
+run interrupted right after generating them but before any real output must
+not make an ordinary first run look like it has prior results to
+delete/append/resume. `_delete_previous_results()` still removes both on
+`[d]elete` or `--cleanup`, so neither outlives the results it describes.
+
+**What this does not do**, stated explicitly so it is never oversold:
+`nmap -sS`'s TCP/IP stack fingerprint (SYN option ordering, fixed MSS,
+IP ID/ISN generation) is untouched; masscan's own hand-rolled stack and SYN
+cookie sequence-number encoding are untouched (masscan is never invoked with
+`--banners`, so its one string lever is moot here); TLS/JA3 fingerprinting is
+untouched beyond the `Random` field, since JA3 keys on cipher-suite/extension
+ordering, not `Random`; and scan shape/volume (`-T4`, `-Pn` on everything,
+`--version-intensity 0`, fixed port sets) is untouched — touching 10 ports on
+every host in a /16 is itself a signature no string substitution addresses.
+
 ## Architecture
 
 ### Host Discovery (Internal)
@@ -283,7 +438,105 @@ Internal discovery runs a single masscan sweep (no source-port override) followe
 - **When the record is written and dropped**: on **success paths only**, exactly as `_EMPTY_RESULT_XML` is — a record on a killed scan would assert coverage that never happened. A `KeyboardInterrupt`, a missing binary and a non-zero exit all leave none; `_nmap_udp_discovery()` needs an explicit `proc.returncode == 0` guard for the last of those, because unlike `_nmap_port_discovery()` it does not treat a non-zero exit as fatal and a failing nmap can still leave parseable partial XML. Each phase also calls `_discard_coverage_record()` **before it scans**, not only on failure: a run killed outright never reaches the stamp, and the previous run's record would otherwise sit beside output that run had already replaced. The hazard is specifically a record that covered *more* than the output now on disk, since a subset test accepts it — a narrower leftover can only cause a redundant re-scan. Both halves live in one file written by a single `_atomic_write` for the same reason: as two sidecars written in sequence, a `KeyboardInterrupt` between them (a `BaseException`, so `except Exception` missed it) left a fresh target list beside a stale exclusion list and the gate accepted the pair as an exclusion-free scan. Neither an unreadable input nor a failed write raises on its own account — the scan already succeeded, so unwinding would discard real results — but every failure path, including an interrupt, deletes the record first. A cache whose record is absent or malformed is rejected, so output from before this change re-scans once on the first resume after upgrading; that is the deliberate direction, since a redundant re-scan is visible and an under-scan is not. The `.coverage` suffix is invisible to every result consumer: `masscan_results/` is aggregated by listing the directory, and `_parse_result_xml()` drops anything not ending in `.xml`, the same guard that hides `portN.xml.failed`. `_delete_previous_results()` removes it with the directory, so `--cleanup` and `[d]elete` need no special handling.
 - **config.json validation**: `_load_config()` refuses to start a scan it cannot run correctly. Missing required keys are reported all at once and exit. `target_scan` goes through `_config_target_scan()`, which accepts any case/whitespace spelling of `Internal`/`External` (normalising to the exact literal the ~25 comparison sites use) and exits on anything else — an unvalidated `"internal"` matched neither literal, so the scan ran and looked completely normal while every `target_scan == 'Internal'` gated check was silently skipped. Every numeric goes through `_config_int(key, value, default, minimum=1)`, mirroring `_prompt_int`'s floor: a non-numeric or null value warns and takes the default, and a value below `minimum` is clamped with a warning. `max_rate` is included (defaulting to the interactive prompt's 20000 external / 2000 internal) and only then re-`str()`-ed for Popen.
 - **Hostname support**: hostnames in the target file are resolved once at startup; nmap receives the original hostname (for SNI/vhost), masscan receives the resolved IP
+- **TLS certificate hostname discovery**: on External scans, `_extract_ssl_cert_hostnames()` parses the `ssl-cert` NSE output SpooNMAP already collects (commonName off the `Subject:` line, each `DNS:` entry off `Subject Alternative Name:`) and reports every name found as a LOW-severity `TLS Certificate Hostname(s) Identified` finding, wildcards included. Separately, `_merge_ssl_cert_hostnames()` runs right after the NSE script pass (gated on `script_scan`, since that's the only time `nse_results/` exists) and fills gaps in `ip_to_hostname` with the first non-wildcard name per host — never overwriting an operator-supplied hostname from the target file — then rewrites `discovery/ip_hostname_map.json`. It runs before `_aggregate_result_dir()` and `generate_findings()` (which re-reads that file fresh) so `spoonmap_output.*` and the findings report both reflect the merged map for the current run. It does not retroactively change what *this* run's nmap invocations targeted — hostname-based targeting via `create_hostname_target_file()` already happened earlier in the same run using whatever `ip_to_hostname` looked like at that point; the benefit is to this run's reporting. A `--resume` run does not inherit the merged file directly — `main()` calls `preprocess_targets()` unconditionally, including on resume, and it rewrites `discovery/ip_hostname_map.json` from the target file alone with no merge of the existing file's contents — but it re-derives the same cert hostnames from the still-cached `nse_results/*.xml`, since a persisted cert-derived hostname reaching `create_hostname_target_file()` could send nmap after a name-resolved address different from the one actually in scope (a commonName lifted off a shared/CDN certificate can resolve elsewhere entirely). The clobber-on-every-run behavior of `preprocess_targets()` is what accidentally prevents that, and is deliberately left as-is. `'TLS Certificate Hostname(s) Identified'` is also added to `_PER_HOST_DETAIL_TITLES`, since its detail (the actual discovered names) differs per host — without that, `findings.txt` would collapse the group to a single shared description that doesn't exist for this finding.
 - **IPv4-only, enforced at the edges**: the tool scans IPv4 exclusively (masscan/nmap invocations, target expansion, and address sorting all assume it). IPv6 is rejected rather than half-supported, in two places. (1) `_build_discovery_target_file()`'s `_parse_ranges()` skips any entry `ipaddress.ip_network()` resolves to a non-v4 network and prints the offending file, line number, and content — previously the v6 bounds were stored silently and only surfaced hundreds of lines later as `AddressValueError: ... (>= 2**32)` from `summarize_address_range()`, and only when an exclusions file happened to be configured. (2) The masscan/discovery XML parsers (`_parse_masscan_ping_xml()`, `_parse_nmap_sn_xml()`, `_run_masscan_batch()`) select `address[@addrtype='ipv4']` instead of the first `<address>` child, matching what the nmap-side parsers already did, so a dual-stacked host's IPv6 or MAC string can't enter `live_ips`/`port_ips` and become a masscan `-iL` target. Address sorting goes through `_ip_sort_key()`, which orders valid IPv4 numerically and sorts anything unparseable last instead of raising — the three former inline `tuple(int(o) for o in x.split('.'))` keys ran *after* a completed sweep, so one odd entry discarded the whole thing.
 - **XML result parsing is per-element defensive**: every `etree.parse()` site guards the *walk* as well as the parse. Attributes are read with `.attrib.get(...)` and the element is skipped when the identifier is missing — never a bare `attrib['addr']` or `findall('address')[0]`, both of which raise `KeyError`/`IndexError` that `except etree.ParseError` does not catch. Those exceptions escaped the guard and discarded the results for *every other host* in the file (or, in `_host_elem_to_dict()`, lost `spoonmap_output.xml`/`.json` for the whole run) over one truncated element. `<script>` elements with no `id=` are filtered out of the comprehensions for the same reason. Where a fallback to the first `<address>` child is wanted after `address[@addrtype='ipv4']` misses (`generate_findings()`, `_scan_extra_sql_ports()`), it is a `None`-checked `find('address')`.
 - **Firewall state table safety**: internal discovery caps masscan at `INTERNAL_DISCOVERY_MAX_RATE = 1000 pps`; at that rate with a 60 s half-open timeout, concurrent state entries peak at ~60 K regardless of target range size; for ranges above `INTERNAL_DISCOVERY_STATE_CEILING = 262_144` hosts the port list is trimmed from 10 to 5 to keep total packet volume bounded. Separately and for the same reason, `mass_scan()` clamps a **Full** scan to `full_scan_rate` — 10000 pps External, 1000 pps Internal — since a single 1-65535 invocation fans out every port across every target at once. This cap applies *only* to `scan_type == 'Full'`; category and custom batched scans scan a handful of ports per invocation and always use the operator's full `max_rate`. The clamp prints a notice when it actually lowers the rate, because `main()`'s run summary echoes the *requested* `max_rate`: clamping silently made the summary contradict what masscan was told to do, and read as the operator's `--max-rate` having been ignored outright.
-- **Honeypot/tarpit detection**: `mass_scan()` flags hosts open on ≥`HONEYPOT_OPEN_PORT_FRACTION` (90%) of scanned TCP ports (min sample `HONEYPOT_MIN_PORTS_SCANNED = 10`) as likely tarpits (LaBrea, portspoof) via `_flag_suspected_tarpits()`/`_report_suspected_tarpits()`, writing `discovery/suspected_tarpits.txt`. Separately, `_count_unmatched_service_ports()` reads `nmap_results/*.xml` and counts open ports whose `-sV` probe captured a `servicefp` (no signature match); `≥HONEYPOT_MIN_UNMATCHED_PORTS = 3` such ports on one host is consistent with decoys (e.g. Artillery) that return random data on full connect. Both signals surface as a single "Likely Honeypot / Decoy Host" MEDIUM finding in `generate_findings()`. `_flag_suspected_tarpits()` counts TCP ports only, skipping any `port_key` that starts with `U:`, so every loop that reconstructs a port key from a `live_hosts/portNN.txt` filename must run the stem through `_fname_port()` (`'U_53'` → `'U:53'`) — the raw stem was counted as TCP, skewing the open-port fraction, and printed as `Hosts Found on Port U_53`.
+- **Honeypot/tarpit detection**: `mass_scan()` flags hosts open on ≥`HONEYPOT_OPEN_PORT_FRACTION` (90%) of scanned TCP ports (min sample `HONEYPOT_MIN_PORTS_SCANNED = 10`) as likely tarpits (LaBrea, portspoof) via `_flag_suspected_tarpits()`/`_report_suspected_tarpits()`, writing `discovery/suspected_tarpits.txt`. Separately, `_count_unmatched_service_ports()` reads `nmap_results/*.xml` and counts open ports whose `-sV` probe captured a `servicefp` (no signature match); `≥HONEYPOT_MIN_UNMATCHED_PORTS = 3` such ports on one host is consistent with decoys (e.g. Artillery) that return random data on full connect. Both signals surface as a single "Likely Honeypot / Decoy Host" finding in `generate_findings()`, severity-tiered as described below. `_flag_suspected_tarpits()` counts TCP ports only, skipping any `port_key` that starts with `U:`, so every loop that reconstructs a port key from a `live_hosts/portNN.txt` filename must run the stem through `_fname_port()` (`'U_53'` → `'U:53'`) — the raw stem was counted as TCP, skewing the open-port fraction, and printed as `Hosts Found on Port U_53`.
+ Four more signals feed the same finding, each combined and tiered by
+`_honeypot_severity()` rather than emitted as separate findings: TTL
+inconsistency across a host's open ports (`_ttl_spread_by_host()`, read back
+from `masscan_results/*.xml` at Stage 1, since one TCP/IP stack always
+reports one TTL — several differing values means several emulated listeners
+behind one address, though NAT/load-balancing can produce the same pattern,
+which is why this signal alone is capped at LOW and can never alone reach
+HIGH); known port-profile matching against `HONEYPOT_PORT_PROFILES`
+(Thinkst Canary, Artillery — placeholders pending verification against
+current upstream defaults — the finding's own reason text carries that
+caveat verbatim, since it lands in an engagement deliverable); generic
+named-product signature matching against `HONEYPOT_SIGNATURES` via the -sV
+service data already captured, **which ships EMPTY in this release** — the
+two development-era entries (Cowrie/Kippo, Dionaea) were both verified
+incorrect against nmap's real output in final review and removed rather than
+patched, so there are no active generic signatures and the mechanism
+(`_honeypot_signature_match()`, `_named_honeypot_matches()`) is retained
+purely as an extensibility point for future entries verified against real
+`-sV` output rather than a synthetic fixture (the reasons are recorded at
+the tuple itself; the short version is that the Cowrie needle's hyphen can
+never match nmap's space-rendered template, and "fixing" it would
+false-positive HIGH on every ordinary Debian OpenSSH host, while the Dionaea
+needle only ever appears in `servicefp`, a field the matcher never reads); a
+source-verified Heralding VNC honeypot tell (`_vnc_heralding_match()`,
+Task 3 Step 7 — vnc-info reporting RFB protocol 3.7 with no security-type
+list, since Heralding's VNC capability hardcodes that exact version and
+drops the connection on any client mismatch, unlike a real RFB server)
+read from `nse_results/*.xml` rather than `nmap_results/*.xml`; and
+silent-open-port counting (`_count_silent_open_ports()`), which complements
+the existing unmatched-fingerprint count by catching a tarpit that holds a
+connection open and sends nothing back — `servicefp` is only set when *some*
+data came back and failed to match, so a LaBrea-style silent host previously
+scored zero on that check alone. `_iter_open_tcp_ports()` is the shared,
+per-element-defensive XML walk both nmap-side counters and the signature
+matcher use, factored out of what was originally
+`_count_unmatched_service_ports()`'s own walk. With `HONEYPOT_SIGNATURES`
+empty, the Heralding VNC tell is the only named-product match this release
+can produce. Severity is HIGH for a named
+signature match or an active-probe confirmation, MEDIUM for two or more
+heuristic signals together, LOW for exactly one — a behavior change from the
+single flat MEDIUM this finding used to emit unconditionally. An optional
+active confirmation probe (`_active_confirm_probe()`) attempts a raw TCP
+connect against a handful of high, never-scanned ports
+(`_select_confirm_probe_ports()`, deterministic per-IP via a seeded
+`random.Random(ip)` rather than global randomness, so it is reproducible and
+testable) on any host flagged by the TTL-spread or port-profile signals —
+**not** on a host flagged only by the older tarpit-ratio heuristic, which
+feeds the finding but never the probe; a real host has no reason to answer on
+an ephemeral port outside the scan, so an answer is treated as confirmation.
+This is the one signal that sends new traffic, so it is gated behind
+`honeypot_active_confirm` in config.json — default false, absent means
+false, no interactive prompt of its own — mirroring `check_for_updates`'s
+existing precedent exactly and for the same reason: SpooNMAP runs from
+client-network jumpboxes, and an unrequested probe against a possible
+client-deployed decoy must never fire without the operator explicitly
+turning it on. (An earlier design considered a live per-host prompt after
+the Stage 1 warning instead; every `input()` call in this codebase happens
+in `main()` before any scan starts, and `mass_scan()` never prompts
+mid-run, so the config-only gate was used instead to stay consistent with
+that pattern.) `discovery/suspected_honeypots.txt` (Stage 1: TTL spread and
+port-profile hits, one line per `(ip, signal)` pair) and
+`discovery/confirmed_honeypots.txt` (Stage 2: active-probe confirmations)
+are new sibling files to the existing `discovery/suspected_tarpits.txt`,
+read back the same defensively-parsed way in `generate_findings()`. Unlike
+`suspected_tarpits.txt`, both of those are written **unconditionally** — an
+empty result truncates the file rather than leaving the previous run's
+content in place. That divergence is deliberate: severity is now computed by
+*counting* signals, so a stale line from an earlier, broader run silently
+inflates a later, narrower run's severity, and a stale
+`confirmed_honeypots.txt` line additionally makes the deliverable assert
+"host answered on a port never scanned open" for a probe that did not run
+this time at all (exactly what happens when the operator turns
+`honeypot_active_confirm` back off). The `enabled` check happens in
+`_confirm_flagged_honeypots()` itself, ahead of the per-host loop, so the
+common disabled case skips `_select_confirm_probe_ports()`'s candidate-set
+work entirely — but that path still truncates the file rather than returning
+outright, for the reason just given. Every host handed to the probe is first
+run through `_scope_filtered_flags()` against the current `target_file`,
+since the probe is the only honeypot signal that *sends packets* and the
+flag dict is built from cached `live_hosts/` and `masscan_results/` data
+that a narrowed `ranges.txt` deliberately never prunes; an empty/unparseable
+scope is permissive, matching `_report_out_of_scope_retained()`.
+
+**Three limitations an operator enabling `honeypot_active_confirm` needs to
+know.** (1) On a **Full** scan (`dest_ports == ['1-65535']`) essentially every
+ephemeral port has already been scanned, so `_select_confirm_probe_ports()`
+finds few or zero unscanned candidates and the probe effectively does
+nothing — silently, with no message either way. (2) **All** honeypot
+detection, Stage 1 signals and the active probe alike, lives inside
+`mass_scan()`; the alternate direct-nmap port-discovery path (taken for
+small/medium scans below the configured `nmap_threshold` work-unit ceiling)
+performs none of it. (3) Every signal in this feature only ever becomes a
+*finding* when `script_scan: true`, because `generate_findings()` returns
+immediately when `nse_results/` does not exist and the default is off — the
+Stage 1 stdout warnings and the `discovery/*.txt` files are still written
+either way, since those come from `mass_scan()`, not `generate_findings()`.
+None of the three is fixed in code; they are documented as-is.

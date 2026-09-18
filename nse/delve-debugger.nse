@@ -41,8 +41,10 @@ action = function(host, port)
     return nil
   end
 
-  -- Minimal DAP initialize request
-  local probe = '{"seq":1,"type":"request","command":"initialize","arguments":{"clientID":"spoonmap"}}\n'
+  -- Minimal DAP initialize request. clientID is a real VS Code client id
+  -- rather than this tool's name: it is echoed back into the target's own
+  -- Delve session log verbatim, and naming the scanner there buys nothing.
+  local probe = '{"seq":1,"type":"request","command":"initialize","arguments":{"clientID":"vscode"}}\n'
 
   status, err = socket:send(probe)
   if not status then

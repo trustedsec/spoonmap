@@ -18,6 +18,8 @@
     "resume" : false,
     "__check_for_updates_note__": "Optional. When true, SpooNMAP contacts api.github.com at startup to see whether a newer release exists. Default false, and absent means false: the tool makes no network connection other than the scan itself unless you turn this on. Use --check-update for a one-off check without enabling it here.",
     "check_for_updates": false,
+    "__honeypot_active_confirm_note__": "Optional. When true, SpooNMAP attempts a small number of raw TCP connects against unscanned high ports on any host flagged by the TTL-spread or port-profile signals, to confirm it. Hosts flagged only by the tarpit open-port-ratio heuristic are not probed. Default false, and absent means false: the tool sends no traffic beyond the scan itself unless you turn this on. A confirmed host answered a port that was never part of this scan, which is a strong tell that it accepts every connection rather than running a real service. Limitations: hosts outside target_file are never probed; on a Full (1-65535) scan there are almost no unscanned ports left to probe, so it does little or nothing; and honeypot detection as a whole only runs on the masscan path, not the direct-nmap path used for scans below nmap_threshold.",
+    "honeypot_active_confirm": false,
     "__target_scan_choices__" : "External, Internal (case-insensitive; any other value stops the run rather than scanning with the Internal-only checks silently skipped)",
     "target_scan" : "Internal",
     "__max_rate_external_recommendation__" : "Default = 20000 (full port scan capped at 10000)",
@@ -28,5 +30,8 @@
     "nmap_threshold": 5000000,
     "target_file" : "ranges.txt",
     "output_path" : "./",
-    "exclusions_file" : "exclusions.txt"
+    "exclusions_file" : "exclusions.txt",
+    "__scanner_profile_choices__": "false/absent (default, disabled), \"random\", or an object pinning some of: probe_token, tls_random, rdp_cookie, workstation, native_os, user_agent, smtp_domain — any omitted key is drawn from a built-in pool",
+    "__scanner_profile_note__": "When set, nmap probes and SpooNMAP's bundled NSE scripts no longer send literal strings that identify the scanner (e.g. the RDP probe's \"mstshash=nmap\" cookie, or nmap's own NSE HTTP User-Agent) — see scan_profile.json in the output directory for exactly what was substituted, for engagement deconfliction. Does NOT affect TCP/IP stack fingerprinting, TLS/JA3 fingerprinting, or scan rate/shape; those are unrelated to string substitution.",
+    "scanner_profile" : false
 }

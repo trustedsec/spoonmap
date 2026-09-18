@@ -34,6 +34,11 @@ portrule = shortport.port_or_service({1234, 1337, 3000, 8000},
                                      {"http", "unknown"}, "tcp",
                                      {"open", "open|filtered"})
 
+-- Default sent when no --script-args http.useragent override is given: a
+-- generic browser string, not nmap's own default UA, which is itself a
+-- distinctive scanner signature to any WAF or IDS.
+local DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
 -- Send a raw HTTP/1.0 GET and return the full response string, or nil on error.
 local function http_get(host, port, path)
   local TIMEOUT_MS = 8000
@@ -45,9 +50,11 @@ local function http_get(host, port, path)
     socket:close()
     return nil
   end
+  local user_agent = stdnse.get_script_args("http.useragent") or DEFAULT_USER_AGENT
   local req = table.concat({
     "GET " .. path .. " HTTP/1.0\r\n",
-    "Host: " .. host.ip .. "\r\n",
+    "Host: " .. (host.targetname or host.ip) .. "\r\n",
+    "User-Agent: " .. user_agent .. "\r\n",
     "Connection: close\r\n",
     "\r\n",
   })

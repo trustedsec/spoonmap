@@ -72,10 +72,11 @@ local function http_get(host, port, proto, path)
     socket:close()
     return nil
   end
+  local user_agent = stdnse.get_script_args("http.useragent") or "Windows-Update-Agent"
   local req = table.concat({
     "GET " .. path .. " HTTP/1.0\r\n",
-    "Host: " .. host.ip .. "\r\n",
-    "User-Agent: Windows-Update-Agent\r\n",
+    "Host: " .. (host.targetname or host.ip) .. "\r\n",
+    "User-Agent: " .. user_agent .. "\r\n",
     "Connection: close\r\n",
     "\r\n",
   })

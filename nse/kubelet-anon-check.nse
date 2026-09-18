@@ -33,6 +33,11 @@ categories = {"discovery", "safe", "auth"}
 portrule = shortport.port_or_service(10250, {"ssl/kubernetes-kubelet", "unknown"}, "tcp",
                                      {"open", "open|filtered"})
 
+-- Default sent when no --script-args http.useragent override is given: a
+-- generic browser string, not nmap's own default UA, which is itself a
+-- distinctive scanner signature to any WAF or IDS.
+local DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
 action = function(host, port)
   local TIMEOUT_MS = 5000
 
@@ -55,9 +60,11 @@ action = function(host, port)
     end
   end
 
+  local user_agent = stdnse.get_script_args("http.useragent") or DEFAULT_USER_AGENT
   local probe = table.concat({
     "GET /pods HTTP/1.0\r\n",
-    "Host: " .. host.ip .. "\r\n",
+    "Host: " .. (host.targetname or host.ip) .. "\r\n",
+    "User-Agent: " .. user_agent .. "\r\n",
     "Connection: close\r\n",
     "\r\n",
   })
