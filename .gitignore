@@ -5,6 +5,10 @@ __pycache__/
 htmlcov/
 .DS_Store
 
+# SDD spec/plan docs carry absolute local paths from the machine they were
+# written on and are not tracked in the public repo (see 9ea2bb3)
+docs/
+
 # generated scan output
 all_live_hosts.txt
 resolved_targets.txt
