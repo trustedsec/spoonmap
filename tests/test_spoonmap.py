@@ -7692,6 +7692,64 @@ class TestBuildNmapCmd:
         assert '88' in cmd
 
 
+    def test_build_nmap_cmd_disables_rdns_every_branch(self):
+        """Every _build_nmap_cmd() shape must carry -n so nmap never fires a
+        reverse-DNS (PTR) lookup — nothing in SpooNMAP consumes the PTR name,
+        and on an internal engagement the queries land in the client's own DNS
+        logs (issue #57). -n is unconditional, not gated on any config."""
+        shapes = (
+            {},                                          # banner TCP
+            {'script_scan': True},                       # banner TCP + scripts
+            {'script_only': True},                       # NSE-only pass, TCP
+        )
+        for kwargs in shapes:
+            cmd = _build_nmap_cmd('445', '/in.txt', '/out.xml', '88',
+                                  target_scan='Internal', **kwargs)
+            assert '-n' in cmd, (kwargs, cmd)
+        # UDP banner + UDP script_only branches
+        for kwargs in ({}, {'script_only': True}):
+            cmd = _build_nmap_cmd('U:161', '/in.txt', '/out.xml', '88',
+                                  target_scan='Internal', **kwargs)
+            assert '-n' in cmd, (kwargs, cmd)
+
+
+class TestNmapNeverDoesReverseDns:
+    """Pin issue #57 across the whole module, not just _build_nmap_cmd(): a
+    future refactor of any nmap command list must not silently drop -n and
+    reintroduce a per-host PTR lookup nothing reads. Assert on the parsed AST
+    so a comment or docstring merely quoting an nmap command line can't satisfy
+    (or trip) the check — only a real list literal counts, the same technique
+    TestNseDirResolution uses for _DIR-relative paths."""
+
+    def _nmap_command_lists(self):
+        """Yield (lineno, string_constants) for every list literal whose first
+        element is the constant 'nmap' — i.e. an actual nmap argv."""
+        tree = ast.parse(inspect.getsource(spoonmap))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.List) or not node.elts:
+                continue
+            first = node.elts[0]
+            if not (isinstance(first, ast.Constant) and first.value == 'nmap'):
+                continue
+            consts = [e.value for e in node.elts
+                      if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+            yield node.lineno, consts
+
+    def test_at_least_one_nmap_command_found(self):
+        # Guard against the AST shape check silently matching nothing (e.g. if
+        # every call site were refactored behind a helper) and passing vacuously.
+        assert list(self._nmap_command_lists()),             'found no nmap command list literals to check'
+
+    def test_every_nmap_command_list_passes_dash_n(self):
+        offenders = [lineno for lineno, consts in self._nmap_command_lists()
+                     if '-n' not in consts]
+        assert not offenders, (
+            'nmap command list(s) at line(s) '
+            f'{offenders} omit -n; every nmap invocation must pass -n so it '
+            'never performs an unconsumed reverse-DNS lookup (issue #57)'
+        )
+
+
 class TestCreateHostnameTargetFile:
     def test_maps_known_ips_to_hostnames(self, tmp_path):
         ip_file = tmp_path / 'ips.txt'
