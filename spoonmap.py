@@ -1390,7 +1390,7 @@ def _nmap_host_discovery(target_file, disc, source_port, exclusions_file):
     """Run nmap -sn (ICMP echo probe only); return set of live IPs."""
     output_xml = os.path.join(disc, 'discovery_nmap.xml')
     cmd = [
-        'nmap', '-sn', '-T4',
+        'nmap', '-n', '-sn', '-T4',
         '--min-parallelism', '256',
         '--max-retries', '1',
         '-PE',                       # ICMP echo only — TCP SYN probes risk RST from routers for non-existent hosts
@@ -1698,7 +1698,7 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
     _discard_coverage_record(output_file)
 
     cmd = [
-        'nmap', '-T4', '-sU', '-Pn',
+        'nmap', '-n', '-T4', '-sU', '-Pn',
         '-p', port_num,
         '--open',
         '--max-retries', '2',
@@ -1855,7 +1855,7 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
         _target_count = 0
 
     cmd = [
-        'nmap', '-T4', *scan_flags, '-Pn', '-v',
+        'nmap', '-n', '-T4', *scan_flags, '-Pn', '-v',
         '-p', port_spec,
         '--open',
         '--max-retries', '2',
@@ -2857,7 +2857,7 @@ def _build_nmap_cmd(dest_port, input_file, output_file, source_port,
     if script_only:
         scan_flag = '-sU' if 'U:' in dest_port else '-sS'
         cmd = [
-            'nmap', '-T4', scan_flag, '-Pn', '-p',
+            'nmap', '-n', '-T4', scan_flag, '-Pn', '-p',
             dest_port[2:] if 'U:' in dest_port else dest_port,
             '--open', '--randomize-hosts',
         ]
@@ -2881,7 +2881,7 @@ def _build_nmap_cmd(dest_port, input_file, output_file, source_port,
     # Banner pass — never add --script regardless of script_scan
     if 'U:' in dest_port:
         cmd = [
-            'nmap', '-T4', '-sU', '-sV',
+            'nmap', '-n', '-T4', '-sU', '-sV',
             '--version-intensity', '0',
             '-Pn', '-p', dest_port[2:],
             '--open', '--randomize-hosts',
@@ -2889,7 +2889,7 @@ def _build_nmap_cmd(dest_port, input_file, output_file, source_port,
         ]
     else:
         cmd = [
-            'nmap', '-T4', '-sS', '-sV',
+            'nmap', '-n', '-T4', '-sS', '-sV',
             '--version-intensity', '0',
             '-Pn', '-p', dest_port,
             '--open', '--randomize-hosts',
@@ -3740,7 +3740,7 @@ def _scan_extra_sql_ports(output_path, source_port):
                 term_state = save_terminal_state()
                 try:
                     proc = subprocess.Popen([
-                        'nmap', '-T4', '-sS', '-sV', '--version-intensity', '0',
+                        'nmap', '-n', '-T4', '-sS', '-sV', '--version-intensity', '0',
                         '-Pn', '-p', port,
                         *(['--source-port', source_port] if source_port else []),
                         ip, '-oX', out_file
@@ -3763,7 +3763,7 @@ def _scan_extra_sql_ports(output_path, source_port):
             term_state = save_terminal_state()
             try:
                 proc = subprocess.Popen([
-                    'nmap', '-T4', '-sS', '-Pn', '-p', port,
+                    'nmap', '-n', '-T4', '-sS', '-Pn', '-p', port,
                     '--script', f'{_NSE_DIR}/azure-sql-detect.nse',
                     '--script-timeout', '30s',
                     *(['--source-port', source_port] if source_port else []),
@@ -3819,7 +3819,7 @@ def _validate_snmp_any_community(nmap_dir, scan_type, extra_script_args=None):
                         # so this call's own snmp-brute arg survives unconditionally.
                         script_args += ',' + extra_script_args
                     cmd = [
-                        'nmap', '-sU', '-p', '161',
+                        'nmap', '-n', '-sU', '-p', '161',
                         '--source-port', src_port,
                         '--script', 'snmp-brute',
                         '--script-args', script_args,
@@ -7104,7 +7104,7 @@ def _verify_nmap_overlay(overlay_dir, extra_script_args=None):
     env = dict(os.environ)
     env['NMAPDIR'] = overlay_dir
 
-    cmd = ['nmap', '-d2', '-sn', '-Pn', '--script', _OVERLAY_VERIFY_SCRIPTS]
+    cmd = ['nmap', '-n', '-d2', '-sn', '-Pn', '--script', _OVERLAY_VERIFY_SCRIPTS]
     if extra_script_args:
         cmd += ['--script-args', extra_script_args]
     cmd += ['127.0.0.1']
@@ -7126,7 +7126,7 @@ def _verify_nmap_overlay(overlay_dir, extra_script_args=None):
 
     try:
         result2 = subprocess.run(
-            ['nmap', '-d1', '-sV', '-p', '1', '127.0.0.1'],
+            ['nmap', '-n', '-d1', '-sV', '-p', '1', '127.0.0.1'],
             env=env, capture_output=True, text=True, timeout=30)
     except (subprocess.TimeoutExpired, OSError) as exc:
         return False, f'overlay verification probe failed to run: {exc}'
