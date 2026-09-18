@@ -1,37 +1,37 @@
 {
   "errors": [],
-  "generated_at": "2026-08-26T18:28:21Z",
+  "generated_at": "2026-08-28T18:56:28Z",
   "metrics": {
     "./spoonmap.py": {
-      "CONFIDENCE.HIGH": 33,
+      "CONFIDENCE.HIGH": 36,
       "CONFIDENCE.LOW": 0,
       "CONFIDENCE.MEDIUM": 0,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 20,
-      "SEVERITY.MEDIUM": 13,
+      "SEVERITY.LOW": 21,
+      "SEVERITY.MEDIUM": 15,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 5056,
+      "loc": 5448,
       "nosec": 0,
       "skipped_tests": 0
     },
     "_totals": {
-      "CONFIDENCE.HIGH": 33,
+      "CONFIDENCE.HIGH": 36,
       "CONFIDENCE.LOW": 0,
       "CONFIDENCE.MEDIUM": 0,
       "CONFIDENCE.UNDEFINED": 0,
       "SEVERITY.HIGH": 0,
-      "SEVERITY.LOW": 20,
-      "SEVERITY.MEDIUM": 13,
+      "SEVERITY.LOW": 21,
+      "SEVERITY.MEDIUM": 15,
       "SEVERITY.UNDEFINED": 0,
-      "loc": 5056,
+      "loc": 5448,
       "nosec": 0,
       "skipped_tests": 0
     }
   },
   "results": [
     {
-      "code": "18 import socket\n19 import subprocess\n20 import sys\n",
+      "code": "19 import socket\n20 import subprocess\n21 import sys\n",
       "col_offset": 0,
       "end_col_offset": 17,
       "filename": "./spoonmap.py",
@@ -42,16 +42,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Consider possible security implications associated with the subprocess module.",
-      "line_number": 19,
+      "line_number": 20,
       "line_range": [
-        19
+        20
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_imports.html#b404-import-subprocess",
       "test_id": "B404",
       "test_name": "blacklist"
     },
     {
-      "code": "28 import urllib.request\n29 import xml.etree.ElementTree as etree\n30 from importlib import metadata\n",
+      "code": "30 import urllib.request\n31 import xml.etree.ElementTree as etree\n32 from importlib import metadata\n",
       "col_offset": 0,
       "end_col_offset": 37,
       "filename": "./spoonmap.py",
@@ -62,16 +62,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Using xml.etree.ElementTree to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree with the equivalent defusedxml package, or make sure defusedxml.defuse_stdlib() is called.",
-      "line_number": 29,
+      "line_number": 31,
       "line_range": [
-        29
+        31
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_imports.html#b405-import-xml-etree",
       "test_id": "B405",
       "test_name": "blacklist"
     },
     {
-      "code": "84     try:\n85         subprocess.run(['stty', 'sane'], check=False, stderr=subprocess.DEVNULL)\n86     except (OSError, subprocess.SubprocessError):\n",
+      "code": "86     try:\n87         subprocess.run(['stty', 'sane'], check=False, stderr=subprocess.DEVNULL)\n88     except (OSError, subprocess.SubprocessError):\n",
       "col_offset": 8,
       "end_col_offset": 80,
       "filename": "./spoonmap.py",
@@ -82,16 +82,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Starting a process with a partial executable path",
-      "line_number": 85,
+      "line_number": 87,
       "line_range": [
-        85
+        87
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b607_start_process_with_partial_path.html",
       "test_id": "B607",
       "test_name": "start_process_with_partial_path"
     },
     {
-      "code": "84     try:\n85         subprocess.run(['stty', 'sane'], check=False, stderr=subprocess.DEVNULL)\n86     except (OSError, subprocess.SubprocessError):\n",
+      "code": "86     try:\n87         subprocess.run(['stty', 'sane'], check=False, stderr=subprocess.DEVNULL)\n88     except (OSError, subprocess.SubprocessError):\n",
       "col_offset": 8,
       "end_col_offset": 80,
       "filename": "./spoonmap.py",
@@ -102,16 +102,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 85,
+      "line_number": 87,
       "line_range": [
-        85
+        87
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
       "test_id": "B603",
       "test_name": "subprocess_without_shell_equals_true"
     },
     {
-      "code": "921     try:\n922         root = etree.parse(xml_file)\n923         for host in root.findall('host'):\n",
+      "code": "981     try:\n982         root = etree.parse(xml_file)\n983         for host in root.findall('host'):\n",
       "col_offset": 15,
       "end_col_offset": 36,
       "filename": "./spoonmap.py",
@@ -122,16 +122,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
-      "line_number": 922,
+      "line_number": 982,
       "line_range": [
-        922
+        982
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
       "test_id": "B314",
       "test_name": "blacklist"
     },
     {
-      "code": "943     try:\n944         root = etree.parse(xml_file)\n945         for host in root.findall('host'):\n",
+      "code": "1003     try:\n1004         root = etree.parse(xml_file)\n1005         for host in root.findall('host'):\n",
       "col_offset": 15,
       "end_col_offset": 36,
       "filename": "./spoonmap.py",
@@ -142,16 +142,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
-      "line_number": 944,
+      "line_number": 1004,
       "line_range": [
-        944
+        1004
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
       "test_id": "B314",
       "test_name": "blacklist"
     },
     {
-      "code": "1025     try:\n1026         proc = subprocess.Popen(masscan_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,\n1027                                 preexec_fn=_raise_fd_limit)\n1028         progress_thread = threading.Thread(target=_stream_masscan_progress, args=(proc,), daemon=True)\n",
+      "code": "1085     try:\n1086         proc = subprocess.Popen(masscan_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,\n1087                                 preexec_fn=_raise_fd_limit)\n1088         progress_thread = threading.Thread(target=_stream_masscan_progress, args=(proc,), daemon=True)\n",
       "col_offset": 15,
       "end_col_offset": 59,
       "filename": "./spoonmap.py",
@@ -162,17 +162,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 1026,
+      "line_number": 1086,
       "line_range": [
-        1026,
-        1027
+        1086,
+        1087
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
       "test_id": "B603",
       "test_name": "subprocess_without_shell_equals_true"
     },
     {
-      "code": "1083     try:\n1084         proc = subprocess.Popen(masscan_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,\n1085                                 preexec_fn=_raise_fd_limit)\n1086         progress_thread = threading.Thread(target=_stream_masscan_progress, args=(proc,), daemon=True)\n",
+      "code": "1143     try:\n1144         proc = subprocess.Popen(masscan_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,\n1145                                 preexec_fn=_raise_fd_limit)\n1146         progress_thread = threading.Thread(target=_stream_masscan_progress, args=(proc,), daemon=True)\n",
       "col_offset": 15,
       "end_col_offset": 59,
       "filename": "./spoonmap.py",
@@ -183,17 +183,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 1084,
+      "line_number": 1144,
       "line_range": [
-        1084,
-        1085
+        1144,
+        1145
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
       "test_id": "B603",
       "test_name": "subprocess_without_shell_equals_true"
     },
     {
-      "code": "1263     try:\n1264         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n1265         proc.wait()\n",
+      "code": "1323     try:\n1324         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n1325         proc.wait()\n",
       "col_offset": 15,
       "end_col_offset": 90,
       "filename": "./spoonmap.py",
@@ -204,16 +204,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 1264,
+      "line_number": 1324,
       "line_range": [
-        1264
+        1324
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
       "test_id": "B603",
       "test_name": "subprocess_without_shell_equals_true"
     },
     {
-      "code": "1282     try:\n1283         root = etree.parse(output_xml)\n1284         for host in root.findall('host'):\n",
+      "code": "1342     try:\n1343         root = etree.parse(output_xml)\n1344         for host in root.findall('host'):\n",
       "col_offset": 15,
       "end_col_offset": 38,
       "filename": "./spoonmap.py",
@@ -224,16 +224,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
-      "line_number": 1283,
+      "line_number": 1343,
       "line_range": [
-        1283
+        1343
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
       "test_id": "B314",
       "test_name": "blacklist"
     },
     {
-      "code": "1338     try:\n1339         masscan_process = subprocess.Popen(\n1340             masscan_cmd,\n1341             stdout=subprocess.DEVNULL,\n1342             stderr=subprocess.PIPE,\n1343             preexec_fn=_raise_fd_limit,\n1344         )\n1345         progress_thread = threading.Thread(target=run_progress_and_capture, args=(masscan_process,), daemon=True)\n",
+      "code": "1398     try:\n1399         masscan_process = subprocess.Popen(\n1400             masscan_cmd,\n1401             stdout=subprocess.DEVNULL,\n1402             stderr=subprocess.PIPE,\n1403             preexec_fn=_raise_fd_limit,\n1404         )\n1405         progress_thread = threading.Thread(target=run_progress_and_capture, args=(masscan_process,), daemon=True)\n",
       "col_offset": 26,
       "end_col_offset": 9,
       "filename": "./spoonmap.py",
@@ -244,21 +244,21 @@
       },
       "issue_severity": "LOW",
       "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 1339,
+      "line_number": 1399,
       "line_range": [
-        1339,
-        1340,
-        1341,
-        1342,
-        1343,
-        1344
+        1399,
+        1400,
+        1401,
+        1402,
+        1403,
+        1404
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
       "test_id": "B603",
       "test_name": "subprocess_without_shell_equals_true"
     },
     {
-      "code": "1398     try:\n1399         root = etree.parse(output_file)\n1400         for host in root.findall('host'):\n",
+      "code": "1458     try:\n1459         root = etree.parse(output_file)\n1460         for host in root.findall('host'):\n",
       "col_offset": 15,
       "end_col_offset": 39,
       "filename": "./spoonmap.py",
@@ -269,16 +269,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
-      "line_number": 1399,
+      "line_number": 1459,
       "line_range": [
-        1399
+        1459
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
       "test_id": "B314",
       "test_name": "blacklist"
     },
     {
-      "code": "1564     try:\n1565         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n1566         proc.wait()\n",
+      "code": "1624     try:\n1625         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n1626         proc.wait()\n",
       "col_offset": 15,
       "end_col_offset": 90,
       "filename": "./spoonmap.py",
@@ -289,16 +289,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 1565,
+      "line_number": 1625,
       "line_range": [
-        1565
+        1625
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
       "test_id": "B603",
       "test_name": "subprocess_without_shell_equals_true"
     },
     {
-      "code": "1594     try:\n1595         root = etree.parse(output_file)\n1596         for host in root.findall('host'):\n",
+      "code": "1654     try:\n1655         root = etree.parse(output_file)\n1656         for host in root.findall('host'):\n",
       "col_offset": 15,
       "end_col_offset": 39,
       "filename": "./spoonmap.py",
@@ -309,16 +309,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
-      "line_number": 1595,
+      "line_number": 1655,
       "line_range": [
-        1595
+        1655
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
       "test_id": "B314",
       "test_name": "blacklist"
     },
     {
-      "code": "1753     try:\n1754         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,\n1755                                 stderr=subprocess.PIPE, text=True)\n1756         _t = threading.Thread(target=_progress_reader, args=(proc.stdout,), daemon=True)\n",
+      "code": "1813     try:\n1814         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,\n1815                                 stderr=subprocess.PIPE, text=True)\n1816         _t = threading.Thread(target=_progress_reader, args=(proc.stdout,), daemon=True)\n",
       "col_offset": 15,
       "end_col_offset": 66,
       "filename": "./spoonmap.py",
@@ -329,17 +329,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 1754,
+      "line_number": 1814,
       "line_range": [
-        1754,
-        1755
+        1814,
+        1815
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
       "test_id": "B603",
       "test_name": "subprocess_without_shell_equals_true"
     },
     {
-      "code": "1793     try:\n1794         root = etree.parse(output_file)\n1795         for host in root.findall('host'):\n",
+      "code": "1853     try:\n1854         root = etree.parse(output_file)\n1855         for host in root.findall('host'):\n",
       "col_offset": 15,
       "end_col_offset": 39,
       "filename": "./spoonmap.py",
@@ -350,16 +350,56 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
-      "line_number": 1794,
+      "line_number": 1854,
       "line_range": [
-        1794
+        1854
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
       "test_id": "B314",
       "test_name": "blacklist"
     },
     {
-      "code": "2547                 # non-None and work_queue.join() in nmap_scan() hangs forever.\n2548                 nmap_process = subprocess.Popen(\n2549                     nmap_cmd,\n2550                     stdout=subprocess.DEVNULL,\n2551                     stderr=subprocess.PIPE,\n2552                     text=True,\n2553                     start_new_session=True,\n2554                 )\n2555                 nmap_err_thread, nmap_err_lines = _start_stderr_reader(nmap_process.stderr)\n",
+      "code": "1939         try:\n1940             root = etree.parse(os.path.join(masscan_dir, fname))\n1941         except etree.ParseError:\n",
+      "col_offset": 19,
+      "end_col_offset": 64,
+      "filename": "./spoonmap.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 20,
+        "link": "https://cwe.mitre.org/data/definitions/20.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+      "line_number": 1940,
+      "line_range": [
+        1940
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+      "test_id": "B314",
+      "test_name": "blacklist"
+    },
+    {
+      "code": "2076     scanned = _expand_scanned_ports(p for p in scanned_ports if not p.startswith('U:'))\n2077     rng = random.Random(ip)\n2078     candidates = [p for p in range(49152, 65536) if p not in scanned]\n",
+      "col_offset": 10,
+      "end_col_offset": 27,
+      "filename": "./spoonmap.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 330,
+        "link": "https://cwe.mitre.org/data/definitions/330.html"
+      },
+      "issue_severity": "LOW",
+      "issue_text": "Standard pseudo-random generators are not suitable for security/cryptographic purposes.",
+      "line_number": 2077,
+      "line_range": [
+        2077
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b311-random",
+      "test_id": "B311",
+      "test_name": "blacklist"
+    },
+    {
+      "code": "2840                 # non-None and work_queue.join() in nmap_scan() hangs forever.\n2841                 nmap_process = subprocess.Popen(\n2842                     nmap_cmd,\n2843                     stdout=subprocess.DEVNULL,\n2844                     stderr=subprocess.PIPE,\n2845                     text=True,\n2846                     start_new_session=True,\n2847                 )\n2848                 nmap_err_thread, nmap_err_lines = _start_stderr_reader(nmap_process.stderr)\n",
       "col_offset": 31,
       "end_col_offset": 17,
       "filename": "./spoonmap.py",
@@ -370,22 +410,22 @@
       },
       "issue_severity": "LOW",
       "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 2548,
+      "line_number": 2841,
       "line_range": [
-        2548,
-        2549,
-        2550,
-        2551,
-        2552,
-        2553,
-        2554
+        2841,
+        2842,
+        2843,
+        2844,
+        2845,
+        2846,
+        2847
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
       "test_id": "B603",
       "test_name": "subprocess_without_shell_equals_true"
     },
     {
-      "code": "2615                         _discard_coverage_record(nse_output)\n2616                         nse_process = subprocess.Popen(\n2617                             nse_cmd,\n2618                             stdout=subprocess.DEVNULL,\n2619                             stderr=subprocess.PIPE,\n2620                             text=True,\n2621                             start_new_session=True,\n2622                         )\n2623                         # Same concurrent drain as the banner pass: an NSE run\n",
+      "code": "2908                         _discard_coverage_record(nse_output)\n2909                         nse_process = subprocess.Popen(\n2910                             nse_cmd,\n2911                             stdout=subprocess.DEVNULL,\n2912                             stderr=subprocess.PIPE,\n2913                             text=True,\n2914                             start_new_session=True,\n2915                         )\n2916                         # Same concurrent drain as the banner pass: an NSE run\n",
       "col_offset": 38,
       "end_col_offset": 25,
       "filename": "./spoonmap.py",
@@ -396,22 +436,22 @@
       },
       "issue_severity": "LOW",
       "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 2616,
+      "line_number": 2909,
       "line_range": [
-        2616,
-        2617,
-        2618,
-        2619,
-        2620,
-        2621,
-        2622
+        2909,
+        2910,
+        2911,
+        2912,
+        2913,
+        2914,
+        2915
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
       "test_id": "B603",
       "test_name": "subprocess_without_shell_equals_true"
     },
     {
-      "code": "3147         try:\n3148             root = etree.parse(fpath)\n3149             for host in root.findall('host'):\n",
+      "code": "3454         try:\n3455             root = etree.parse(fpath)\n3456             for host in root.findall('host'):\n",
       "col_offset": 19,
       "end_col_offset": 37,
       "filename": "./spoonmap.py",
@@ -422,16 +462,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
-      "line_number": 3148,
+      "line_number": 3455,
       "line_range": [
-        3148
+        3455
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
       "test_id": "B314",
       "test_name": "blacklist"
     },
     {
-      "code": "3185                 try:\n3186                     proc = subprocess.Popen([\n3187                         'nmap', '-T4', '-sS', '-sV', '--version-intensity', '0',\n3188                         '-Pn', '-p', port,\n3189                         *(['--source-port', source_port] if source_port else []),\n3190                         ip, '-oX', out_file\n3191                     ])\n3192                     proc.wait()\n",
+      "code": "3492                 try:\n3493                     proc = subprocess.Popen([\n3494                         'nmap', '-T4', '-sS', '-sV', '--version-intensity', '0',\n3495                         '-Pn', '-p', port,\n3496                         *(['--source-port', source_port] if source_port else []),\n3497                         ip, '-oX', out_file\n3498                     ])\n3499                     proc.wait()\n",
       "col_offset": 27,
       "end_col_offset": 22,
       "filename": "./spoonmap.py",
@@ -442,21 +482,21 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Starting a process with a partial executable path",
-      "line_number": 3186,
+      "line_number": 3493,
       "line_range": [
-        3186,
-        3187,
-        3188,
-        3189,
-        3190,
-        3191
+        3493,
+        3494,
+        3495,
+        3496,
+        3497,
+        3498
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b607_start_process_with_partial_path.html",
       "test_id": "B607",
       "test_name": "start_process_with_partial_path"
     },
     {
-      "code": "3185                 try:\n3186                     proc = subprocess.Popen([\n3187                         'nmap', '-T4', '-sS', '-sV', '--version-intensity', '0',\n3188                         '-Pn', '-p', port,\n3189                         *(['--source-port', source_port] if source_port else []),\n3190                         ip, '-oX', out_file\n3191                     ])\n3192                     proc.wait()\n",
+      "code": "3492                 try:\n3493                     proc = subprocess.Popen([\n3494                         'nmap', '-T4', '-sS', '-sV', '--version-intensity', '0',\n3495                         '-Pn', '-p', port,\n3496                         *(['--source-port', source_port] if source_port else []),\n3497                         ip, '-oX', out_file\n3498                     ])\n3499                     proc.wait()\n",
       "col_offset": 27,
       "end_col_offset": 22,
       "filename": "./spoonmap.py",
@@ -467,21 +507,21 @@
       },
       "issue_severity": "LOW",
       "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 3186,
+      "line_number": 3493,
       "line_range": [
-        3186,
-        3187,
-        3188,
-        3189,
-        3190,
-        3191
+        3493,
+        3494,
+        3495,
+        3496,
+        3497,
+        3498
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
       "test_id": "B603",
       "test_name": "subprocess_without_shell_equals_true"
     },
     {
-      "code": "3208             try:\n3209                 proc = subprocess.Popen([\n3210                     'nmap', '-T4', '-sS', '-Pn', '-p', port,\n3211                     '--script', f'{_NSE_DIR}/azure-sql-detect.nse',\n3212                     '--script-timeout', '30s',\n3213                     *(['--source-port', source_port] if source_port else []),\n3214                     ip, '-oX', nse_out_file\n3215                 ])\n3216                 proc.wait()\n",
+      "code": "3515             try:\n3516                 proc = subprocess.Popen([\n3517                     'nmap', '-T4', '-sS', '-Pn', '-p', port,\n3518                     '--script', f'{_NSE_DIR}/azure-sql-detect.nse',\n3519                     '--script-timeout', '30s',\n3520                     *(['--source-port', source_port] if source_port else []),\n3521                     ip, '-oX', nse_out_file\n3522                 ])\n3523                 proc.wait()\n",
       "col_offset": 23,
       "end_col_offset": 18,
       "filename": "./spoonmap.py",
@@ -492,22 +532,22 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Starting a process with a partial executable path",
-      "line_number": 3209,
+      "line_number": 3516,
       "line_range": [
-        3209,
-        3210,
-        3211,
-        3212,
-        3213,
-        3214,
-        3215
+        3516,
+        3517,
+        3518,
+        3519,
+        3520,
+        3521,
+        3522
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b607_start_process_with_partial_path.html",
       "test_id": "B607",
       "test_name": "start_process_with_partial_path"
     },
     {
-      "code": "3208             try:\n3209                 proc = subprocess.Popen([\n3210                     'nmap', '-T4', '-sS', '-Pn', '-p', port,\n3211                     '--script', f'{_NSE_DIR}/azure-sql-detect.nse',\n3212                     '--script-timeout', '30s',\n3213                     *(['--source-port', source_port] if source_port else []),\n3214                     ip, '-oX', nse_out_file\n3215                 ])\n3216                 proc.wait()\n",
+      "code": "3515             try:\n3516                 proc = subprocess.Popen([\n3517                     'nmap', '-T4', '-sS', '-Pn', '-p', port,\n3518                     '--script', f'{_NSE_DIR}/azure-sql-detect.nse',\n3519                     '--script-timeout', '30s',\n3520                     *(['--source-port', source_port] if source_port else []),\n3521                     ip, '-oX', nse_out_file\n3522                 ])\n3523                 proc.wait()\n",
       "col_offset": 23,
       "end_col_offset": 18,
       "filename": "./spoonmap.py",
@@ -518,22 +558,22 @@
       },
       "issue_severity": "LOW",
       "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 3209,
+      "line_number": 3516,
       "line_range": [
-        3209,
-        3210,
-        3211,
-        3212,
-        3213,
-        3214,
-        3215
+        3516,
+        3517,
+        3518,
+        3519,
+        3520,
+        3521,
+        3522
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
       "test_id": "B603",
       "test_name": "subprocess_without_shell_equals_true"
     },
     {
-      "code": "3230         try:\n3231             tree = etree.parse(xml_file)\n3232         except Exception:\n",
+      "code": "3537         try:\n3538             tree = etree.parse(xml_file)\n3539         except Exception:\n",
       "col_offset": 19,
       "end_col_offset": 40,
       "filename": "./spoonmap.py",
@@ -544,16 +584,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
-      "line_number": 3231,
+      "line_number": 3538,
       "line_range": [
-        3231
+        3538
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
       "test_id": "B314",
       "test_name": "blacklist"
     },
     {
-      "code": "3231             tree = etree.parse(xml_file)\n3232         except Exception:\n3233             continue\n3234         for host_elem in tree.findall('.//host'):\n",
+      "code": "3538             tree = etree.parse(xml_file)\n3539         except Exception:\n3540             continue\n3541         for host_elem in tree.findall('.//host'):\n",
       "col_offset": 8,
       "end_col_offset": 20,
       "filename": "./spoonmap.py",
@@ -564,17 +604,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Continue detected.",
-      "line_number": 3232,
+      "line_number": 3539,
       "line_range": [
-        3232,
-        3233
+        3539,
+        3540
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b112_try_except_continue.html",
       "test_id": "B112",
       "test_name": "try_except_continue"
     },
     {
-      "code": "3266                     ]\n3267                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)\n3268                     if 'Valid credentials' in result.stdout:\n",
+      "code": "3573                     ]\n3574                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)\n3575                     if 'Valid credentials' in result.stdout:\n",
       "col_offset": 29,
       "end_col_offset": 92,
       "filename": "./spoonmap.py",
@@ -585,16 +625,16 @@
       },
       "issue_severity": "LOW",
       "issue_text": "subprocess call - check for execution of untrusted input.",
-      "line_number": 3267,
+      "line_number": 3574,
       "line_range": [
-        3267
+        3574
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b603_subprocess_without_shell_equals_true.html",
       "test_id": "B603",
       "test_name": "subprocess_without_shell_equals_true"
     },
     {
-      "code": "3438         try:\n3439             root = etree.parse(f'{nmap_dir}/{fname}')\n3440         except etree.ParseError:\n",
+      "code": "3743         try:\n3744             root = etree.parse(f'{nmap_dir}/{fname}')\n3745         except etree.ParseError:\n",
       "col_offset": 19,
       "end_col_offset": 53,
       "filename": "./spoonmap.py",
@@ -605,16 +645,36 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
-      "line_number": 3439,
+      "line_number": 3744,
       "line_range": [
-        3439
+        3744
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
       "test_id": "B314",
       "test_name": "blacklist"
     },
     {
-      "code": "3588         try:\n3589             root = etree.parse(fpath)\n3590         except Exception:\n",
+      "code": "3855         try:\n3856             root = etree.parse(f'{nse_dir}/{fname}')\n3857         except etree.ParseError:\n",
+      "col_offset": 19,
+      "end_col_offset": 52,
+      "filename": "./spoonmap.py",
+      "issue_confidence": "HIGH",
+      "issue_cwe": {
+        "id": 20,
+        "link": "https://cwe.mitre.org/data/definitions/20.html"
+      },
+      "issue_severity": "MEDIUM",
+      "issue_text": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
+      "line_number": 3856,
+      "line_range": [
+        3856
+      ],
+      "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
+      "test_id": "B314",
+      "test_name": "blacklist"
+    },
+    {
+      "code": "4002         try:\n4003             root = etree.parse(fpath)\n4004         except Exception:\n",
       "col_offset": 19,
       "end_col_offset": 37,
       "filename": "./spoonmap.py",
@@ -625,16 +685,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
-      "line_number": 3589,
+      "line_number": 4003,
       "line_range": [
-        3589
+        4003
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
       "test_id": "B314",
       "test_name": "blacklist"
     },
     {
-      "code": "3589             root = etree.parse(fpath)\n3590         except Exception:\n3591             continue\n3592 \n",
+      "code": "4003             root = etree.parse(fpath)\n4004         except Exception:\n4005             continue\n4006 \n",
       "col_offset": 8,
       "end_col_offset": 20,
       "filename": "./spoonmap.py",
@@ -645,17 +705,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Continue detected.",
-      "line_number": 3590,
+      "line_number": 4004,
       "line_range": [
-        3590,
-        3591
+        4004,
+        4005
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b112_try_except_continue.html",
       "test_id": "B112",
       "test_name": "try_except_continue"
     },
     {
-      "code": "4933     try:\n4934         return etree.parse(path)\n4935     except etree.ParseError as e:\n",
+      "code": "5347     try:\n5348         return etree.parse(path)\n5349     except etree.ParseError as e:\n",
       "col_offset": 15,
       "end_col_offset": 32,
       "filename": "./spoonmap.py",
@@ -666,16 +726,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
-      "line_number": 4934,
+      "line_number": 5348,
       "line_range": [
-        4934
+        5348
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
       "test_id": "B314",
       "test_name": "blacklist"
     },
     {
-      "code": "5238             readline.set_completer(None)  # type: ignore[name-defined]\n5239         except Exception:\n5240             pass\n5241 \n",
+      "code": "5656             readline.set_completer(None)  # type: ignore[name-defined]\n5657         except Exception:\n5658             pass\n5659 \n",
       "col_offset": 8,
       "end_col_offset": 16,
       "filename": "./spoonmap.py",
@@ -686,17 +746,17 @@
       },
       "issue_severity": "LOW",
       "issue_text": "Try, Except, Pass detected.",
-      "line_number": 5239,
+      "line_number": 5657,
       "line_range": [
-        5239,
-        5240
+        5657,
+        5658
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/plugins/b110_try_except_pass.html",
       "test_id": "B110",
       "test_name": "try_except_pass"
     },
     {
-      "code": "5276         try:\n5277             tree = etree.parse(nmap_xml)\n5278             root_elem = tree.getroot()\n",
+      "code": "5694         try:\n5695             tree = etree.parse(nmap_xml)\n5696             root_elem = tree.getroot()\n",
       "col_offset": 19,
       "end_col_offset": 40,
       "filename": "./spoonmap.py",
@@ -707,16 +767,16 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Using xml.etree.ElementTree.parse to parse untrusted XML data is known to be vulnerable to XML attacks. Replace xml.etree.ElementTree.parse with its defusedxml equivalent function or make sure defusedxml.defuse_stdlib() is called",
-      "line_number": 5277,
+      "line_number": 5695,
       "line_range": [
-        5277
+        5695
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b313-b320-xml-bad-elementtree",
       "test_id": "B314",
       "test_name": "blacklist"
     },
     {
-      "code": "5898     try:\n5899         with urllib.request.urlopen(_RELEASE_API_URL, timeout=timeout) as resp:\n5900             payload = json.loads(resp.read().decode('utf-8', 'replace'))\n",
+      "code": "6353     try:\n6354         with urllib.request.urlopen(_RELEASE_API_URL, timeout=timeout) as resp:\n6355             payload = json.loads(resp.read().decode('utf-8', 'replace'))\n",
       "col_offset": 13,
       "end_col_offset": 70,
       "filename": "./spoonmap.py",
@@ -727,9 +787,9 @@
       },
       "issue_severity": "MEDIUM",
       "issue_text": "Audit url open for permitted schemes. Allowing use of file:/ or custom schemes is often unexpected.",
-      "line_number": 5899,
+      "line_number": 6354,
       "line_range": [
-        5899
+        6354
       ],
       "more_info": "https://bandit.readthedocs.io/en/1.9.4/blacklists/blacklist_calls.html#b310-urllib-urlopen",
       "test_id": "B310",
