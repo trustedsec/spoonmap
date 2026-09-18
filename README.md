@@ -218,7 +218,7 @@ run from jumpboxes inside client networks where an unprompted call out to
 performs a single check on demand. To enable the check at every startup, set
 `"check_for_updates": true` in `config.json`; the key defaults to `false` and
 omitting it entirely means `false`. Only stable releases are reported —
-pre-release candidates are never advertised as updates.
+nightly release candidates are never advertised as updates.
 
 For a summary of every flag, use `--help` (or `-h`):
 

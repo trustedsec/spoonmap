@@ -71,10 +71,10 @@ def _normalize_yaml_expr(expr):
 
 
 def test_ci_runs_on_pushes_to_both_release_branches():
-    """A push to `dev` that runs no CI would never reach the tag job, and
+    """A push to `nightly` that runs no CI would never reach the tag job, and
     no candidate would ever be cut. Nothing errors; tags just stop appearing."""
     branches = _triggers(_load('ci.yml'))['push']['branches']
-    assert 'dev' in branches
+    assert 'nightly' in branches
     assert 'main' in branches
 
 
@@ -116,7 +116,7 @@ def test_the_tag_job_never_runs_on_pull_requests():
     # Must assert the full expression to catch && → || mutations
     expected = _normalize_yaml_expr(
         "github.event_name == 'push' && "
-        "(github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')"
+        "(github.ref == 'refs/heads/main' || github.ref == 'refs/heads/nightly')"
     )
     assert normalized == expected, f'Expected: {expected}\nGot: {normalized}'
 
@@ -230,17 +230,17 @@ def test_exactly_one_call_to_the_policy_module():
 
 
 def test_both_channels_are_reachable():
-    """main cuts the final release, dev cuts a candidate for the same
+    """main cuts the final release, nightly cuts a candidate for the same
     target. A job that only ever computed one channel would silently tag
-    dev builds as releases, or never cut a release at all."""
+    nightly builds as releases, or never cut a release at all."""
     script = _step_script(_job('ci.yml', 'tag'), 'Compute tag')
     assert 'channel=stable' in script
-    assert 'channel=dev' in script
+    assert 'channel=nightly' in script
 
 
 @pytest.mark.parametrize('branch,expected_channel', [
     ('refs/heads/main', 'stable'),
-    ('refs/heads/dev', 'dev'),
+    ('refs/heads/nightly', 'nightly'),
 ])
 def test_compute_tag_step_assigns_correct_channel(branch, expected_channel, tmp_path):
     """The Compute tag step must actually WRITE the channel and new_tag outputs
@@ -287,11 +287,11 @@ def test_compute_tag_step_assigns_correct_channel(branch, expected_channel, tmp_
 
     # Validate new_tag value shape without guarding. Empty is legitimate when HEAD
     # sits exactly on a tag (no new commits). Non-empty must match the channel's
-    # tag format: stable uses v0.1.0, dev uses v0.1.0rc1.
+    # tag format: stable uses v0.1.0, nightly uses v0.1.0rc1.
     new_tag = parsed['new_tag']
     if expected_channel == 'stable':
         tag_pattern = r'^v\d+\.\d+\.\d+$'
-    else:  # dev
+    else:  # nightly
         tag_pattern = r'^v\d+\.\d+\.\d+rc\d+$'
 
     # Assert value is either empty or matches the channel-appropriate format.
@@ -333,7 +333,7 @@ def test_no_shell_version_arithmetic():
 
 
 def test_only_stable_publishes_a_release():
-    """Dev candidates exist to make builds addressable, not to be releases.
+    """Nightly candidates exist to make builds addressable, not to be releases.
     Publishing them would make anything ranking releases see a candidate as
     latest. Assert the full if condition, not fragments."""
     release_steps = [
@@ -401,7 +401,7 @@ def test_create_tag_pushes_the_tag(repo_with_remote):
     # also push any branch refs the local repo happens to carry) would leave
     # the tag assertion above passing while silently also moving/creating a
     # branch on the remote -- something this job has no business doing; only
-    # main and dev themselves are supposed to advance, and only by a real
+    # main and nightly themselves are supposed to advance, and only by a real
     # merge, never by this tagging step.
     branches_after = set(_git(remote, 'branch').split())
     assert branches_after == branches_before, (
@@ -435,7 +435,7 @@ def test_the_policy_module_agrees_with_this_repository():
     test would see."""
     result = subprocess.run(
         ['python3', os.path.join(REPO_ROOT, 'tools', 'next_version.py'),
-         '--channel', 'dev', '--repo-dir', REPO_ROOT],
+         '--channel', 'nightly', '--repo-dir', REPO_ROOT],
         capture_output=True, text=True,
     )
     assert result.returncode == 0, result.stderr

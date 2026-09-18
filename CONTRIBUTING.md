@@ -35,19 +35,19 @@ produced it.
 `nmap` against `127.0.0.1`. Keep it that way — no test in this repo may send a
 packet to an address it does not own.
 
-## Target `dev`, not `main`
+## Target `nightly`, not `main`
 
 `main` is the default branch, so GitHub will preselect it — **change the base to
-`dev`.** `main` holds the last released state and receives work only through a
-batch integration merge from `dev`. A pull request landing on `main` directly
-breaks that and creates cleanup for the maintainers.
+`nightly`.** `main` holds the last released state and receives work only
+through a batch integration merge from `nightly`. A pull request landing on
+`main` directly breaks that and creates cleanup for the maintainers.
 
 ```bash
 git clone https://github.com/<you>/spoonmap
 cd spoonmap
-git checkout -b my-change origin/dev
+git checkout -b my-change origin/nightly
 # ... work ...
-git push -u origin my-change     # then open a PR with base: dev
+git push -u origin my-change     # then open a PR with base: nightly
 ```
 
 Branch names follow a `type/short-description` pattern matching the prefixes
@@ -59,10 +59,10 @@ immediately. Say so in the PR body.
 `CLAUDE.md` describes the same flow from the maintainer side under "Release
 Versioning", and it is worth reading if you want the reasoning. The mechanic you
 do not need to do anything about, but should know exists: maintainers integrate
-`dev` into `main` with a **merge or a fast-forward, never a squash**. CI derives
-every release version from the commits themselves, and a squash merge collapses
-already-released commits into one that no prior tag can reach, which silently
-corrupts every version computed afterward.
+`nightly` into `main` with a **merge or a fast-forward, never a squash**. CI
+derives every release version from the commits themselves, and a squash merge
+collapses already-released commits into one that no prior tag can reach, which
+silently corrupts every version computed afterward.
 
 ## Every bug fix needs a regression test
 
