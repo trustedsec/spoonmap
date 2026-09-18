@@ -1,7 +1,7 @@
 """Tests for tools/next_version.py -- the release policy itself.
 
 The policy is ordinary semver with the bump derived from the batch: the second
-component moves only for features, `nightly` cuts release candidates for the
+component moves only for features, `dev` cuts release candidates for the
 version the batch is heading toward, and `main` cuts the final of that same
 target.
 
@@ -43,7 +43,7 @@ from tools.next_version import (
         ("v2.20.0+g1234567", None),
         ("2.20.0", None),
         ("v2.20", None),
-        ("nightly", None),
+        ("dev", None),
     ],
 )
 def test_only_released_versions_are_baseline_candidates(tag, expected):
@@ -69,7 +69,7 @@ def test_latest_final_compares_numerically_not_lexically():
 
 def test_no_tags_at_all_starts_from_zero():
     assert latest_final([]) == (0, 0, 0)
-    assert latest_final(["nightly", "some-marker"]) == (0, 0, 0)
+    assert latest_final(["dev", "some-marker"]) == (0, 0, 0)
 
 
 # --- feature detection ------------------------------------------------------
@@ -148,7 +148,7 @@ def test_an_empty_batch_has_no_target():
     than invent a version."""
     assert target_version((2, 20, 0), []) is None
     assert compute("stable", ["v2.20.0"], []) is None
-    assert compute("nightly", ["v2.20.0"], []) is None
+    assert compute("dev", ["v2.20.0"], []) is None
 
 
 # --- candidate numbering ----------------------------------------------------
@@ -180,14 +180,14 @@ def test_candidate_numbering_survives_a_deleted_tag():
 # --- the two channels, and the ordering that motivates the whole design -----
 
 
-def test_nightly_cuts_a_candidate_for_the_next_version():
+def test_dev_cuts_a_candidate_for_the_next_version():
     tags = ["v2.20.0"]
-    assert compute("nightly", tags, ["fix: a"]) == "v2.20.1rc1"
-    assert compute("nightly", tags, ["feat: a"]) == "v2.21.0rc1"
+    assert compute("dev", tags, ["fix: a"]) == "v2.20.1rc1"
+    assert compute("dev", tags, ["feat: a"]) == "v2.21.0rc1"
 
 
 def test_main_cuts_the_final_of_the_same_target():
-    """Merging nightly down promotes the candidate rather than inventing a
+    """Merging dev down promotes the candidate rather than inventing a
     different number: the fix-only cycle above ends at 2.20.1, not 2.21.0."""
     tags = ["v2.20.0", "v2.20.1rc1", "v2.20.1rc2"]
     assert compute("stable", tags, ["fix: a"]) == "v2.20.1"
@@ -201,9 +201,9 @@ def test_candidates_sort_above_the_previous_release_and_below_their_own():
     it becomes. Asserted end to end across a whole fix-only cycle.
     """
     shipped = parse("2.20.0")
-    rc1 = parse(compute("nightly", ["v2.20.0"], ["fix: a"]).lstrip("v"))
+    rc1 = parse(compute("dev", ["v2.20.0"], ["fix: a"]).lstrip("v"))
     rc2 = parse(
-        compute("nightly", ["v2.20.0", "v2.20.1rc1"], ["fix: a", "fix: b"]).lstrip("v")
+        compute("dev", ["v2.20.0", "v2.20.1rc1"], ["fix: a", "fix: b"]).lstrip("v")
     )
     final = parse(
         compute("stable", ["v2.20.0", "v2.20.1rc1", "v2.20.1rc2"], ["fix: a"]).lstrip(
@@ -220,7 +220,7 @@ def test_a_feature_cycle_also_orders_correctly_against_the_fix_cycle():
     """2.20.1 < 2.21.0rc1 < 2.21.0 -- a candidate for the next minor must not
     look older than the patch release that preceded it."""
     patch_release = parse("2.20.1")
-    rc = parse(compute("nightly", ["v2.20.1"], ["feat: a"]).lstrip("v"))
+    rc = parse(compute("dev", ["v2.20.1"], ["feat: a"]).lstrip("v"))
     final = parse(compute("stable", ["v2.20.1", "v2.21.0rc1"], ["feat: a"]).lstrip("v"))
     assert patch_release < rc < final
 
@@ -301,9 +301,9 @@ def test_commit_messages_since_baseline_excludes_the_baseline_itself(tmp_path):
 
 
 def test_baseline_need_not_be_reachable_from_head(tmp_path):
-    """main's release tag can sit on a commit nightly does not contain.
+    """main's release tag can sit on a commit dev does not contain.
 
-    A reachability-restricted baseline would compute the next nightly from a
+    A reachability-restricted baseline would compute the next dev from a
     stale release and hand out a version below what already shipped.
     """
     repo = tmp_path / "repo"
@@ -320,24 +320,24 @@ def test_baseline_need_not_be_reachable_from_head(tmp_path):
     _git("commit", "-qm", "fix: released on main", cwd=repo)
     _git("tag", "v2.20.1", cwd=repo)
 
-    _git("checkout", "-q", "-b", "nightly", "v2.20.0", cwd=repo)
-    (repo / "f.txt").write_text("nightly\n")
+    _git("checkout", "-q", "-b", "dev", "v2.20.0", cwd=repo)
+    (repo / "f.txt").write_text("dev\n")
     _git("add", "-A", cwd=repo)
-    _git("commit", "-qm", "fix: on the nightly branch", cwd=repo)
+    _git("commit", "-qm", "fix: on the dev branch", cwd=repo)
 
     tags = [t for t in _git("tag", cwd=repo).splitlines() if t.strip()]
     assert latest_final(tags) == (2, 20, 1), "baseline must see main's release tag"
 
     messages = commit_messages(str(repo), (2, 20, 1))
-    got = compute("nightly", tags, messages)
+    got = compute("dev", tags, messages)
     assert got == "v2.20.2rc1", (
-        f"the next nightly must sort above the release that already shipped, got {got}"
+        f"the next dev must sort above the release that already shipped, got {got}"
     )
     assert parse("2.20.1") < parse(got.lstrip("v"))
 
 
-def test_main_prints_candidate_for_nightly(tmp_path, capsys):
-    """main(["--channel", "nightly", "--repo-dir", str(repo)]) returns 0 and
+def test_main_prints_candidate_for_dev(tmp_path, capsys):
+    """main(["--channel", "dev", "--repo-dir", str(repo)]) returns 0 and
     prints a candidate tag matching ^v\\d+\\.\\d+\\.\\d+rc\\d+$."""
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -348,10 +348,10 @@ def test_main_prints_candidate_for_nightly(tmp_path, capsys):
 
     from tools.next_version import main
 
-    result = main(["--channel", "nightly", "--repo-dir", str(repo)])
+    result = main(["--channel", "dev", "--repo-dir", str(repo)])
     assert result == 0
     captured = capsys.readouterr()
-    assert captured.out.strip(), "nightly must print a tag"
+    assert captured.out.strip(), "dev must print a tag"
     assert captured.out.strip().startswith("v")
     # Verify format: v0.0.1rc1
     import re
@@ -429,4 +429,4 @@ def test_a_repository_with_no_tags_cuts_the_first_patch():
 def test_a_first_batch_containing_a_feature_cuts_the_first_minor():
     """The whole history is one batch on the first run, so a single `feat`
     anywhere in it takes the first release to 0.1.0 rather than 0.0.1."""
-    assert compute("nightly", [], ["fix: a", "feat: b", "docs: c"]) == "v0.1.0rc1"
+    assert compute("dev", [], ["fix: a", "feat: b", "docs: c"]) == "v0.1.0rc1"

@@ -3,11 +3,11 @@ name: CI
 on:
   pull_request:
   push:
-    # `nightly` is here because the `tag` job below runs inside this workflow
-    # and is gated on `needs: [...]` plus this push trigger for main/nightly.
-    # Without it, pushes to nightly run no CI at all and the tag job silently
+    # `dev` is here because the `tag` job below runs inside this workflow
+    # and is gated on `needs: [...]` plus this push trigger for main/dev.
+    # Without it, pushes to dev run no CI at all and the tag job silently
     # never fires.
-    branches: [main, nightly]
+    branches: [main, dev]
 
 # A new push to the same PR supersedes the previous run. Scoped to pull_request
 # only: on `main`, cancelling the previous commit's in-progress run because a
@@ -678,7 +678,7 @@ jobs:
           }
 
   # Cuts release tags from the commits themselves, once every other job in this
-  # run has passed. `nightly` cuts release candidates for whichever version the
+  # run has passed. `dev` cuts release candidates for whichever version the
   # batch is heading toward (v0.1.0rc1, v0.1.0rc2, ...) and `main` promotes that
   # same target to its final release, so they order correctly at both ends:
   #
@@ -710,7 +710,7 @@ jobs:
     # pull_request, where tagging would be actively wrong.
     if: >-
       github.event_name == 'push' &&
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/nightly')
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev')
     # This workflow declares contents: read at the top level. This job alone
     # needs write, to push a tag and create a release.
     permissions:
@@ -745,12 +745,12 @@ jobs:
         id: bump
         run: |
           set -euo pipefail
-          # main cuts the final release; nightly cuts a candidate for the same
+          # main cuts the final release; dev cuts a candidate for the same
           # target. tools/next_version.py owns the decision entirely.
           if [ "$GITHUB_REF" = "refs/heads/main" ]; then
             channel=stable
           else
-            channel=nightly
+            channel=dev
           fi
           new_tag=$(python3 tools/next_version.py --channel "$channel")
           echo "Channel: $channel; tag: ${new_tag:-<nothing to tag>}"
@@ -781,9 +781,9 @@ jobs:
             git push origin "refs/tags/$NEW_TAG"
           fi
 
-      # Only main publishes. Nightly candidate tags exist to make builds
+      # Only main publishes. Dev candidate tags exist to make builds
       # addressable and to give hatch-vcs a version; they are deliberately not
-      # releases, so nothing ranking releases ever sees a nightly as latest.
+      # releases, so nothing ranking releases ever sees a candidate as latest.
       - name: Create GitHub release
         if: steps.bump.outputs.channel == 'stable'
         env:

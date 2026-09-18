@@ -172,7 +172,7 @@ automatically** — a breaking marker counts as a feature, because an automatic
 major is an irreversible published mistake waiting for one mistyped subject
 line. Push a major by hand and `release.yml` will publish it.
 
-`nightly` cuts candidates for the version the batch is heading toward
+`dev` cuts candidates for the version the batch is heading toward
 (`v0.1.0rc1`, `v0.1.0rc2`, …) and `main` promotes that same target to its final
 release. Aiming candidates one version *forward* is what makes them sort
 correctly: `0.0.0 < 0.1.0rc1 < 0.1.0 < 0.2.0rc1 < 0.2.0`. This makes conventional
@@ -180,7 +180,7 @@ commit subjects load-bearing — a `feat:` typo'd as `fix:` ships as a patch.
 
 The tagging lives in a `tag` job **inside `ci.yml`**, gated on
 `needs: [test, test-legacy, lint, bandit, nse-root, workflow-lint, build]` and
-on `github.event_name == 'push'` for `main`/`nightly` only. It is deliberately
+on `github.event_name == 'push'` for `main`/`dev` only. It is deliberately
 not a separate `workflow_run`-triggered workflow, which is how this was first
 built: zizmor — a required job in this same file — rates `workflow_run` an
 error-level dangerous trigger and exits 14, because it is the standard
@@ -192,7 +192,7 @@ head SHA. Do not reintroduce `workflow_run` here.
 Things that fail silently rather than loudly, all guarded by
 `tests/test_release_versioning.py`:
 
-- **`ci.yml` must run on pushes to `nightly`.** Otherwise the tag job never runs
+- **`ci.yml` must run on pushes to `dev`.** Otherwise the tag job never runs
   there and no candidate is ever cut, with no error anywhere.
 - **The `tag` job must keep every validating job in `needs`.** Drop one and a
   tag can land on a commit that failed it.
@@ -209,10 +209,10 @@ Version arithmetic belongs in `tools/next_version.py`, where it is unit-tested,
 never in a workflow step. hate_crack carried ~70 lines of `cut -d.` duplicated
 across two YAML files before extracting this module; do not reintroduce it here.
 
-**`main` must contain `nightly`'s commits as ancestors — merge or fast-forward
-`nightly` into `main`, never squash.** `tools/next_version.py` computes
+**`main` must contain `dev`'s commits as ancestors — merge or fast-forward
+`dev` into `main`, never squash.** `tools/next_version.py` computes
 `git log <last-tag>..HEAD` from whichever branch is tagging. A squash merge
-collapses `nightly`'s already-released commits into one commit unreachable
+collapses `dev`'s already-released commits into one commit unreachable
 from any prior tag, so that range re-lists them on `main` on every subsequent
 push, forever. This fails quietly, not loudly: versions stay monotonic (the
 squash commit itself is still "since the last release"), so nothing errors —
