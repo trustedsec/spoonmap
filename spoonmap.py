@@ -7339,7 +7339,7 @@ def _tool_version():
 
 
 # Latest *release* specifically: GitHub's /releases/latest excludes
-# pre-releases, so the vX.Y.ZrcN candidates cut on `nightly` are never
+# pre-releases, so the vX.Y.ZrcN candidates cut on `dev` are never
 # advertised to an operator as an available update.
 _RELEASE_API_URL = (
     'https://api.github.com/repos/trustedsec/spoonmap/releases/latest'

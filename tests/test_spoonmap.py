@@ -14831,7 +14831,7 @@ class TestCheckForUpdates:
 
     def test_the_url_requests_the_latest_release_specifically(self):
         """/releases (plural, no /latest) would include pre-releases, which
-        would advertise a nightly rc candidate as an available update to
+        would advertise an rc candidate as an available update to
         every operator -- exactly what _RELEASE_API_URL's own comment says
         must not happen."""
         assert spoonmap._RELEASE_API_URL.rstrip('/').endswith('/releases/latest')
@@ -14858,7 +14858,7 @@ class TestParseReleaseTag:
         # running-from-source sentinel.
         ('v0.1.0rc1', None),
         ('0.0.1.post1.dev1', None),
-        ('nightly', None),
+        ('dev', None),
         ('', None),
     ])
     def test_only_plain_releases_compare(self, text, expected):

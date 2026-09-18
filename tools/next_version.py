@@ -7,7 +7,7 @@ the batch:
 * **The second component moves only for features.** Any ``feat`` commit since
   the last release means the batch is heading for ``X.(Y+1).0``. A batch of
   nothing but fixes, docs and chores is heading for ``X.Y.(Z+1)``.
-* **``nightly`` cuts release candidates** for whichever version the batch is
+* **``dev`` cuts release candidates** for whichever version the batch is
   heading toward: ``v2.20.1rc1``, ``v2.20.1rc2``, … These are real PEP 440
   pre-releases, so they sort *above* the release that precedes them and *below*
   the release they become::
@@ -16,7 +16,7 @@ the batch:
 
   That ordering is the whole point of targeting the *next* version rather than
   the current one.
-* **``main`` cuts the final** of that same target. Merging ``nightly`` down
+* **``main`` cuts the final** of that same target. Merging ``dev`` down
   promotes the candidate: a fix-only cycle ends at ``2.20.1``, a cycle with a
   feature ends at ``2.21.0``.
 
@@ -27,13 +27,13 @@ line; a major release stays an explicit human act (tag and push it by hand).
 
 Baseline is the highest final tag in the repository, deliberately NOT restricted
 to tags reachable from HEAD. ``main``'s release tag can sit on a commit that the
-``nightly`` tip does not contain, and a reachability-restricted lookup would
-then compute the next nightly from a stale baseline and hand out a version below
+``dev`` tip does not contain, and a reachability-restricted lookup would
+then compute the next candidate from a stale baseline and hand out a version below
 the release that already shipped.
 
-This policy assumes ``main`` contains ``nightly``'s commits as ancestors --
-merge or fast-forward ``nightly`` into ``main``, never squash. A squash merge
-collapses ``nightly``'s already-released commits into one commit that is not
+This policy assumes ``main`` contains ``dev``'s commits as ancestors --
+merge or fast-forward ``dev`` into ``main``, never squash. A squash merge
+collapses ``dev``'s already-released commits into one commit that is not
 reachable from any prior tag, so ``git log <last-tag>..HEAD`` on ``main``
 re-lists them on every subsequent push, forever. Versions still come out
 monotonic (there is always at least the squash commit itself since the last
@@ -153,10 +153,10 @@ def compute(channel: str, tags: List[str], messages: List[str]) -> Optional[str]
     """The tag to create for *channel*, or ``None`` when there is nothing to tag.
 
     Pure: every input is passed in, so the whole policy is testable without a
-    repository. ``stable`` is ``main``'s final release; ``nightly`` is the
+    repository. ``stable`` is ``main``'s final release; ``dev`` is the
     candidate heading for the same target.
     """
-    if channel not in ("stable", "nightly"):
+    if channel not in ("stable", "dev"):
         raise ValueError(f"unknown channel {channel!r}")
     target = target_version(latest_final(tags), messages)
     if target is None:
@@ -205,7 +205,7 @@ def commit_messages(repo_dir: str, base: Version) -> List[str]:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--channel", required=True, choices=["stable", "nightly"])
+    parser.add_argument("--channel", required=True, choices=["stable", "dev"])
     parser.add_argument("--repo-dir", default=".")
     args = parser.parse_args(argv)
 
