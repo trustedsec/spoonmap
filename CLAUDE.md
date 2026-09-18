@@ -440,6 +440,80 @@ Internal discovery runs a single masscan sweep (no source-port override) followe
 - **Hostname support**: hostnames in the target file are resolved once at startup; nmap receives the original hostname (for SNI/vhost), masscan receives the resolved IP
 - **No reverse DNS from nmap**: every nmap command list passes `-n`, unconditionally, so nmap never performs its default per-host reverse (PTR) lookup. SpooNMAP's only DNS call is the one forward `socket.gethostbyname()` in `resolve_hostname()`; nothing in the module ever reads a `<hostname>`/PTR element out of nmap's XML (`_host_elem_to_dict()` and every other consumer build the host record from the in-memory `ip_to_hostname` map, whose only sources are that forward lookup and `_merge_ssl_cert_hostnames()`). Without `-n`, `-Pn` on the banner/NSE passes makes nmap treat every `-iL` host as up and PTR-resolve it once per port scanned — a burst of queries against the client's own resolver on an internal engagement, for output the tool discards. This is the same unrequested-traffic concern as `check_for_updates`/`honeypot_active_confirm`/`scanner_profile`, so it is off by construction rather than configurable: a future feature that actually wants PTR names should add `-n`-removal at its own site, not make the whole tool pay. `TestNmapNeverDoesReverseDns` pins `-n` on every nmap list literal via the module AST (the same technique as the `_DIR`-relative NSE-path guard), so a refactor can't silently drop it — the failure mode is invisible traffic, exactly what these tests exist to catch. The two `_verify_nmap_overlay()` probes are loopback-only and carry `-n` too, for uniformity. (Issue #57.)
 - **TLS certificate hostname discovery**: on External scans, `_extract_ssl_cert_hostnames()` parses the `ssl-cert` NSE output SpooNMAP already collects (commonName off the `Subject:` line, each `DNS:` entry off `Subject Alternative Name:`) and reports every name found as a LOW-severity `TLS Certificate Hostname(s) Identified` finding, wildcards included. Separately, `_merge_ssl_cert_hostnames()` runs right after the NSE script pass (gated on `script_scan`, since that's the only time `nse_results/` exists) and fills gaps in `ip_to_hostname` with the first non-wildcard name per host — never overwriting an operator-supplied hostname from the target file — then rewrites `discovery/ip_hostname_map.json`. It runs before `_aggregate_result_dir()` and `generate_findings()` (which re-reads that file fresh) so `spoonmap_output.*` and the findings report both reflect the merged map for the current run. It does not retroactively change what *this* run's nmap invocations targeted — hostname-based targeting via `create_hostname_target_file()` already happened earlier in the same run using whatever `ip_to_hostname` looked like at that point; the benefit is to this run's reporting. A `--resume` run does not inherit the merged file directly — `main()` calls `preprocess_targets()` unconditionally, including on resume, and it rewrites `discovery/ip_hostname_map.json` from the target file alone with no merge of the existing file's contents — but it re-derives the same cert hostnames from the still-cached `nse_results/*.xml`, since a persisted cert-derived hostname reaching `create_hostname_target_file()` could send nmap after a name-resolved address different from the one actually in scope (a commonName lifted off a shared/CDN certificate can resolve elsewhere entirely). The clobber-on-every-run behavior of `preprocess_targets()` is what accidentally prevents that, and is deliberately left as-is. `'TLS Certificate Hostname(s) Identified'` is also added to `_PER_HOST_DETAIL_TITLES`, since its detail (the actual discovered names) differs per host — without that, `findings.txt` would collapse the group to a single shared description that doesn't exist for this finding.
+- **OS identification from the network side**: `_extract_os_details()` reads two
+unauthenticated OS sources out of NSE output the script pass already collects
+and emits them as a LOW-severity `Operating System Identified` finding on
+**both** scan types. From `smb-os-discovery` (ports 139/445, newly added to both
+script maps) it takes the `OS:` line and the `FQDN:` line; from any
+`*-ntlm-info` script it takes the `Product_Version` build number.
+
+**It is called from two places, and both are load-bearing.** `smb-os-discovery`
+is a **hostrule** script, so nmap emits it under `<hostscript>`; the
+`*-ntlm-info` scripts are **portrule** and land inside `<port>`. The first
+implementation called `_extract_os_details()` only from the per-port loop, which
+meant the entire `smb-os-discovery` half read nothing, on every host, forever —
+no error, no warning, just an absent finding. Worse, the tests passed, because
+they built their fixtures with `_nmap_xml()` rather than
+`_nmap_xml_hostscript()` and so pinned an XML shape nmap never produces. When
+adding an OS source, check its rule type in the `.nse` file first and use the
+matching fixture helper.
+
+Two traps in testing this, both hit during development. First, assert against
+**`findings.json`, not `findings.txt`**: the text report embeds
+`_FINDING_REPRO`'s sample output, which quotes a specimen `smb-os-discovery`
+block, so a substring check on the text passes even when the real result was
+empty. Second, `test_both_call_sites_reached_for_one_host` exists specifically
+to pin both sites at once, and each site was mutation-tested — removing either
+call must fail tests.
+
+An `OS: Unknown` line yields nothing, and the `FQDN:` line rides along **only**
+with a real OS string: on its own it produced a finding titled `Operating
+System Identified` whose entire detail was a hostname. The two
+regexes are anchored per-line and deliberately strict: `^\s*OS:` must not match
+`smb-os-discovery`'s adjacent `OS CPE:` line, and `Product_Version` must match
+`major.minor.build` only, so the neighbouring `System_Time:` value is never read
+as a version. Both are pinned by tests against the `@output` blocks nmap's own
+scripts document, not only against fixtures written here.
+
+`rdp-ntlm-info` was already in `EXTERNAL_PORT_SCRIPTS` for 3389 but absent from
+`INTERNAL_PORT_SCRIPTS` entirely, which is backwards — RDP's NTLM challenge is
+the highest-precision unauthenticated OS source available on an internal AD
+network, where SMB null sessions are frequently refused outright. It now runs on
+both. `smb-os-discovery` was in neither map; it appeared in the codebase only as
+an overlay-verification script.
+
+`_WINDOWS_BUILD_NAMES` maps a build to a marketing name and is deliberately
+**short**. Every entry was verified against Microsoft's release-health pages on
+2026-09-18 and is pinned pair-by-pair by `TestWindowsBuildNamesCurrency`, so a
+careless edit fails a test rather than silently naming the wrong Windows in a
+deliverable. It will go stale as releases ship; re-verify against
+`learn.microsoft.com/windows/release-health` when adding to it. An unmapped build is
+reported as the bare number rather than guessed at, because this text lands in
+an engagement deliverable and a wrong OS claim there is worse than a number the
+operator looks up. The raw build is always printed, mapped or not.
+
+This finding is separate from, and does not replace, the existing HIGH
+`NTLM Information Disclosure` finding, which stays External-only: that one is
+about a host leaking internal names to the internet, this one is inventory and
+is wanted just as much internally. `'Operating System Identified'` is in
+`_PER_HOST_DETAIL_TITLES`, since the detail differs per host.
+
+**Resume caveat**: the coverage record (see **Resume target coverage**) records
+targets and exclusions, not the *script set*. A `--resume` or `[a]ppend` into an
+output directory produced before this change accepts the cached
+`nse_results/portN.xml` and never runs the newly-added scripts, so the finding
+silently does not appear for that engagement. Pre-existing behaviour of the
+gate, not introduced here; delete the output directory (or `--cleanup`) to pick
+the new scripts up on an old engagement.
+
+**Not added, and why**: `smb-enum-shares`/`smb-enum-users`/`smb-enum-domains`
+all require credentials against anything newer than Windows 2000 (verified
+against the nmap 7.99 script sources, which say so in their own `description`
+fields), and WMI has no unauthenticated NSE path at all. SpooNMAP is
+unauthenticated end to end, so neither can contribute OS precision here. There
+is also no `smb-ntlm-info` script in stock nmap despite the sample output in
+`_FINDING_REPRO`'s `NTLM Information Disclosure` entry showing one.
+
 - **IPv4-only, enforced at the edges**: the tool scans IPv4 exclusively (masscan/nmap invocations, target expansion, and address sorting all assume it). IPv6 is rejected rather than half-supported, in two places. (1) `_build_discovery_target_file()`'s `_parse_ranges()` skips any entry `ipaddress.ip_network()` resolves to a non-v4 network and prints the offending file, line number, and content — previously the v6 bounds were stored silently and only surfaced hundreds of lines later as `AddressValueError: ... (>= 2**32)` from `summarize_address_range()`, and only when an exclusions file happened to be configured. (2) The masscan/discovery XML parsers (`_parse_masscan_ping_xml()`, `_parse_nmap_sn_xml()`, `_run_masscan_batch()`) select `address[@addrtype='ipv4']` instead of the first `<address>` child, matching what the nmap-side parsers already did, so a dual-stacked host's IPv6 or MAC string can't enter `live_ips`/`port_ips` and become a masscan `-iL` target. Address sorting goes through `_ip_sort_key()`, which orders valid IPv4 numerically and sorts anything unparseable last instead of raising — the three former inline `tuple(int(o) for o in x.split('.'))` keys ran *after* a completed sweep, so one odd entry discarded the whole thing.
 - **XML result parsing is per-element defensive**: every `etree.parse()` site guards the *walk* as well as the parse. Attributes are read with `.attrib.get(...)` and the element is skipped when the identifier is missing — never a bare `attrib['addr']` or `findall('address')[0]`, both of which raise `KeyError`/`IndexError` that `except etree.ParseError` does not catch. Those exceptions escaped the guard and discarded the results for *every other host* in the file (or, in `_host_elem_to_dict()`, lost `spoonmap_output.xml`/`.json` for the whole run) over one truncated element. `<script>` elements with no `id=` are filtered out of the comprehensions for the same reason. Where a fallback to the first `<address>` child is wanted after `address[@addrtype='ipv4']` misses (`generate_findings()`, `_scan_extra_sql_ports()`), it is a `None`-checked `find('address')`.
 - **Firewall state table safety**: internal discovery caps masscan at `INTERNAL_DISCOVERY_MAX_RATE = 1000 pps`; at that rate with a 60 s half-open timeout, concurrent state entries peak at ~60 K regardless of target range size; for ranges above `INTERNAL_DISCOVERY_STATE_CEILING = 262_144` hosts the port list is trimmed from 10 to 5 to keep total packet volume bounded. Separately and for the same reason, `mass_scan()` clamps a **Full** scan to `full_scan_rate` — 10000 pps External, 1000 pps Internal — since a single 1-65535 invocation fans out every port across every target at once. This cap applies *only* to `scan_type == 'Full'`; category and custom batched scans scan a handful of ports per invocation and always use the operator's full `max_rate`. The clamp prints a notice when it actually lowers the rate, because `main()`'s run summary echoes the *requested* `max_rate`: clamping silently made the summary contradict what masscan was told to do, and read as the operator's `--max-rate` having been ignored outright.

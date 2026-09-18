@@ -571,6 +571,7 @@ After scanning, `generate_findings()` parses all nmap XML results and produces s
 | LOW | FTP exposed externally (plaintext protocol — credentials/data in cleartext; use FTPS/SFTP) |
 | LOW | Telnet exposed externally (plaintext protocol — credentials/data in cleartext; use SSH) |
 | LOW | SNMP default or accepts-any community — read-only (non-printer hosts only) |
+| LOW | Operating System Identified (139/445 via `smb-os-discovery`, 3389 and other NTLM-speaking services via `*-ntlm-info` — reports the OS product string, FQDN, and the exact Windows build number; both scan types) |
 | LOW | IPMI Service Detected |
 | LOW | IKE/IPsec Service Detected (U:500) |
 | LOW | OpenVPN Service Detected (U:1194/1194; identification only — VPN exposure is expected, no "exposed externally" finding is raised) |

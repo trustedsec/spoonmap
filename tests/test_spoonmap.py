@@ -6,6 +6,7 @@ import inspect
 import io
 import json
 import os
+import re
 import readline
 import shutil
 import subprocess
@@ -38,6 +39,7 @@ from spoonmap import (
     INTERNAL_PORT_SCRIPTS,
     _build_discovery_target_file,
     _build_interactive_config,
+    _extract_os_details,
     _build_nmap_cmd,
     _build_repro_cmd,
     _classify_sql,
@@ -15662,3 +15664,335 @@ class TestBuildInteractiveConfigScannerProfile:
         # this only guards against a future caller passing {} by mistake.
         cfg = _build_interactive_config(*self._base_args(), scanner_profile={})
         assert 'scanner_profile' not in cfg
+
+
+SMB_OS_SAMPLE = (
+    'OS: Windows Server 2019 Standard 17763 (Windows Server 2019 Standard 6.3)\n'
+    'Computer name: DC01\n'
+    'NetBIOS computer name: DC01\n'
+    'Domain name: corp.local\n'
+    'Forest name: corp.local\n'
+    'FQDN: DC01.corp.local\n'
+    'System time: 2026-09-18T19:00:00-04:00\n'
+)
+
+RDP_NTLM_SAMPLE = (
+    'Target_Name: CORP\n'
+    'NetBIOS_Domain_Name: CORP\n'
+    'NetBIOS_Computer_Name: DC01\n'
+    'DNS_Domain_Name: corp.local\n'
+    'DNS_Computer_Name: DC01.corp.local\n'
+    'DNS_Tree_Name: corp.local\n'
+    'Product_Version: 10.0.17763\n'
+    'System_Time: 2026-09-18T23:00:00+00:00\n'
+)
+
+
+class TestExtractOsDetails:
+    def test_smb_os_discovery_os_line(self):
+        details = _extract_os_details({'smb-os-discovery': SMB_OS_SAMPLE})
+        assert any('Windows Server 2019 Standard 17763' in d for d in details)
+
+    def test_smb_os_discovery_fqdn(self):
+        details = _extract_os_details({'smb-os-discovery': SMB_OS_SAMPLE})
+        assert any('DC01.corp.local' in d for d in details)
+
+    def test_smb_os_discovery_unknown_os_ignored(self):
+        details = _extract_os_details({'smb-os-discovery': 'OS: Unknown\n'})
+        assert details == []
+
+    def test_ntlm_product_version_reported_raw(self):
+        details = _extract_os_details({'rdp-ntlm-info': RDP_NTLM_SAMPLE})
+        assert any('10.0.17763' in d for d in details)
+
+    def test_known_build_gets_a_name(self):
+        details = _extract_os_details({'rdp-ntlm-info': RDP_NTLM_SAMPLE})
+        assert details == [
+            'rdp-ntlm-info: Windows build 10.0.17763 '
+            '(Windows 10 1809 / Windows Server 2019)']
+
+    def test_unknown_build_reported_without_a_guess(self):
+        details = _extract_os_details(
+            {'rdp-ntlm-info': 'Product_Version: 10.0.99999\n'})
+        assert details == ['rdp-ntlm-info: Windows build 10.0.99999']
+
+    def test_names_the_source_script(self):
+        details = _extract_os_details({'smtp-ntlm-info': RDP_NTLM_SAMPLE})
+        assert any(d.startswith('smtp-ntlm-info:') for d in details)
+
+    def test_both_sources_combined(self):
+        details = _extract_os_details({
+            'smb-os-discovery': SMB_OS_SAMPLE,
+            'rdp-ntlm-info': RDP_NTLM_SAMPLE,
+        })
+        joined = ' '.join(details)
+        assert 'Windows Server 2019 Standard 17763' in joined
+        assert '10.0.17763' in joined
+
+    def test_unrelated_scripts_yield_nothing(self):
+        assert _extract_os_details({'ssl-cert': 'Subject: commonName=x'}) == []
+
+    def test_empty_scripts_yield_nothing(self):
+        assert _extract_os_details({}) == []
+
+    def test_malformed_product_version_ignored(self):
+        assert _extract_os_details({'rdp-ntlm-info': 'Product_Version: garbage\n'}) == []
+
+    def test_blank_script_output_ignored(self):
+        assert _extract_os_details({'smb-os-discovery': '', 'rdp-ntlm-info': ''}) == []
+
+    def test_deterministic_order_across_ntlm_scripts(self):
+        scripts = {
+            'smtp-ntlm-info': 'Product_Version: 10.0.14393\n',
+            'rdp-ntlm-info': 'Product_Version: 10.0.17763\n',
+        }
+        assert _extract_os_details(scripts) == _extract_os_details(dict(reversed(list(scripts.items()))))
+
+
+class TestOsIdentificationFinding:
+    def test_flagged_on_internal_from_smb(self, nmap_dir):
+        # smb-os-discovery is a hostrule script: nmap emits it under
+        # <hostscript>, never inside <port>.  A fixture built the other way
+        # pins behaviour against XML that cannot occur on disk.
+        xml = _nmap_xml_hostscript('10.0.0.5', 'tcp', '445',
+                                   {'smb-os-discovery': SMB_OS_SAMPLE})
+        (nmap_dir / 'nse_results' / 'port445.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        # findings.json, not findings.txt: the txt report embeds a specimen
+        # smb-os-discovery block from _FINDING_REPRO, so a substring check
+        # there cannot distinguish a real result from the sample.
+        data = json.loads((nmap_dir / 'findings.json').read_text())
+        os_findings = [f for f in data if f['title'] == 'Operating System Identified']
+        assert len(os_findings) == 1
+        assert 'Windows Server 2019 Standard 17763' in os_findings[0]['detail']
+
+    def test_both_call_sites_reached_for_one_host(self, nmap_dir):
+        """Pin both halves at once, in the shape real nmap emits.
+
+        smb-os-discovery is hostrule (<hostscript>), rdp-ntlm-info is portrule
+        (<port>), and a domain-joined Windows host open on both 445 and 3389
+        produces both in the same run.  Reading only one element type is the
+        defect this pins: it loses half the feature with no error, which is
+        exactly how it shipped past an all-green suite the first time.
+
+        Asserts against findings.json, NOT findings.txt: the txt report embeds
+        _FINDING_REPRO's sample output, which quotes a specimen
+        smb-os-discovery block -- so a substring check on the text passes even
+        when the hostscript half produced nothing at all.
+        """
+        xml = _nmap_xml_hostscript('10.0.0.5', 'tcp', '445',
+                                   {'smb-os-discovery': SMB_OS_SAMPLE})
+        (nmap_dir / 'nse_results' / 'port445.xml').write_text(xml)
+        rdp = _nmap_xml('10.0.0.5', 'tcp', '3389',
+                        scripts={'rdp-ntlm-info': RDP_NTLM_SAMPLE})
+        (nmap_dir / 'nse_results' / 'port3389.xml').write_text(rdp)
+
+        generate_findings(str(nmap_dir), 'Internal')
+
+        data = json.loads((nmap_dir / 'findings.json').read_text())
+        details = {f['port']: f['detail'] for f in data
+                   if f['title'] == 'Operating System Identified'}
+        assert set(details) == {'tcp/445', 'tcp/3389'}
+        assert 'Windows Server 2019 Standard 17763' in details['tcp/445']
+        assert 'DC01.corp.local' in details['tcp/445']
+        assert '10.0.17763' in details['tcp/3389']
+
+    def test_flagged_on_internal_from_rdp(self, nmap_dir):
+        xml = _nmap_xml('10.0.0.5', 'tcp', '3389',
+                        scripts={'rdp-ntlm-info': RDP_NTLM_SAMPLE})
+        (nmap_dir / 'nse_results' / 'port3389.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        data = json.loads((nmap_dir / 'findings.json').read_text())
+        os_findings = [f for f in data if f['title'] == 'Operating System Identified']
+        assert len(os_findings) == 1
+        assert '10.0.17763' in os_findings[0]['detail']
+
+    def test_flagged_on_external_too(self, nmap_dir):
+        xml = _nmap_xml('1.2.3.4', 'tcp', '3389',
+                        scripts={'rdp-ntlm-info': RDP_NTLM_SAMPLE})
+        (nmap_dir / 'nse_results' / 'port3389.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        assert 'Operating System Identified' in (nmap_dir / 'findings.txt').read_text()
+
+    def test_is_low_severity(self, nmap_dir):
+        xml = _nmap_xml_hostscript('10.0.0.5', 'tcp', '445',
+                                   {'smb-os-discovery': SMB_OS_SAMPLE})
+        (nmap_dir / 'nse_results' / 'port445.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        data = json.loads((nmap_dir / 'findings.json').read_text())
+        sevs = {f['severity'] for f in data if f['title'] == 'Operating System Identified'}
+        assert sevs == {'LOW'}
+
+    def test_no_finding_without_os_data(self, nmap_dir):
+        xml = _nmap_xml_hostscript('10.0.0.5', 'tcp', '445',
+                                   {'smb-security-mode': 'message_signing: disabled'})
+        (nmap_dir / 'nse_results' / 'port445.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        assert 'Operating System Identified' not in (nmap_dir / 'findings.txt').read_text()
+
+    def test_detail_is_per_host(self):
+        assert 'Operating System Identified' in spoonmap._PER_HOST_DETAIL_TITLES
+
+    def test_distinct_hosts_keep_distinct_os_detail(self, nmap_dir):
+        xml_a = _nmap_xml_hostscript('10.0.0.5', 'tcp', '445',
+                                     {'smb-os-discovery': SMB_OS_SAMPLE})
+        xml_b = _nmap_xml('10.0.0.6', 'tcp', '3389',
+                          scripts={'rdp-ntlm-info': 'Product_Version: 10.0.20348\n'})
+        (nmap_dir / 'nse_results' / 'port445.xml').write_text(xml_a)
+        (nmap_dir / 'nse_results' / 'port3389.xml').write_text(xml_b)
+        generate_findings(str(nmap_dir), 'Internal')
+        data = json.loads((nmap_dir / 'findings.json').read_text())
+        details = {f['host']: f['detail'] for f in data
+                   if f['title'] == 'Operating System Identified'}
+        assert 'Windows Server 2019 Standard 17763' in details['10.0.0.5']
+        assert '10.0.20348' in details['10.0.0.6']
+
+    def test_ntlm_disclosure_finding_still_emitted_on_external(self, nmap_dir):
+        xml = _nmap_xml('1.2.3.4', 'tcp', '3389',
+                        scripts={'rdp-ntlm-info': RDP_NTLM_SAMPLE})
+        (nmap_dir / 'nse_results' / 'port3389.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        assert 'NTLM Information Disclosure' in (nmap_dir / 'findings.txt').read_text()
+
+
+class TestOsPrecisionPortScripts:
+    def test_internal_rdp_runs_ntlm_info(self):
+        assert 'rdp-ntlm-info' in _get_scripts_for_port('3389', 'Internal')
+
+    def test_external_rdp_still_runs_ntlm_info(self):
+        assert 'rdp-ntlm-info' in _get_scripts_for_port('3389', 'External')
+
+    def test_smb_os_discovery_on_internal_smb_ports(self):
+        for port in ('139', '445'):
+            assert 'smb-os-discovery' in _get_scripts_for_port(port, 'Internal'), port
+
+    def test_smb_os_discovery_on_external_smb_ports(self):
+        for port in ('139', '445'):
+            assert 'smb-os-discovery' in _get_scripts_for_port(port, 'External'), port
+
+    def test_existing_smb_scripts_retained(self):
+        result = _get_scripts_for_port('445', 'Internal')
+        for script in ('smb-security-mode', 'smb2-security-mode', 'smb-vuln-ms17-010'):
+            assert script in result, script
+
+
+class TestWindowsBuildNames:
+    def test_every_key_is_a_dotted_version(self):
+        # Shape only; TestWindowsBuildNamesCurrency pins each build->name pair
+        # exactly, which is what actually protects the deliverable.
+        for build in spoonmap._WINDOWS_BUILD_NAMES:
+            assert re.fullmatch(r'\d+\.\d+\.\d+', build), build
+
+
+class TestExtractOsDetailsAgainstUpstreamSamples:
+    """Parse the exact output blocks nmap's own scripts document.
+
+    The synthetic fixtures above are ours; these are upstream's, copied from the
+    @output sections of smb-os-discovery.nse and rdp-ntlm-info.nse.  They carry
+    real-world shapes our own samples do not -- parenthesised '(R)' vendor
+    strings, a Service Pack suffix, and an 'OS CPE:' line that a loose 'OS:'
+    pattern would wrongly match.
+    """
+
+    UPSTREAM_SMB = (
+        '\n  OS: Windows Server (R) 2008 Standard 6001 Service Pack 1 '
+        '(Windows Server (R) 2008 Standard 6.0)'
+        '\n  OS CPE: cpe:/o:microsoft:windows_2008::sp1'
+        '\n  Computer name: Sql2008'
+        '\n  NetBIOS computer name: SQL2008'
+        '\n  Domain name: lab.test.local'
+        '\n  Forest name: test.local'
+        '\n  FQDN: Sql2008.lab.test.local'
+        '\n  NetBIOS domain name: LAB'
+        '\n  System time: 2011-04-20T13:34:06-05:00'
+    )
+
+    UPSTREAM_RDP = (
+        '\n  Target_Name: W2016'
+        '\n  NetBIOS_Domain_Name: W2016'
+        '\n  NetBIOS_Computer_Name: W16GA-SRV01'
+        '\n  DNS_Domain_Name: W2016.lab'
+        '\n  DNS_Computer_Name: W16GA-SRV01.W2016.lab'
+        '\n  DNS_Tree_Name: W2016.lab'
+        '\n  Product_Version: 10.0.14393'
+        '\n  System_Time: 2019-06-13T10:38:35+00:00'
+    )
+
+    def test_smb_full_os_string_captured(self):
+        details = _extract_os_details({'smb-os-discovery': self.UPSTREAM_SMB})
+        assert details[0] == (
+            'smb-os-discovery: Windows Server (R) 2008 Standard 6001 '
+            'Service Pack 1 (Windows Server (R) 2008 Standard 6.0)')
+
+    def test_os_cpe_line_not_mistaken_for_the_os_line(self):
+        details = _extract_os_details({'smb-os-discovery': self.UPSTREAM_SMB})
+        assert not any('cpe:/o:' in d for d in details)
+
+    def test_smb_fqdn_captured(self):
+        details = _extract_os_details({'smb-os-discovery': self.UPSTREAM_SMB})
+        assert 'FQDN: Sql2008.lab.test.local' in details
+
+    def test_rdp_build_mapped_to_a_name(self):
+        details = _extract_os_details({'rdp-ntlm-info': self.UPSTREAM_RDP})
+        assert details == [
+            'rdp-ntlm-info: Windows build 10.0.14393 '
+            '(Windows 10 1607 / Windows Server 2016)']
+
+    def test_system_time_not_mistaken_for_a_version(self):
+        details = _extract_os_details({'rdp-ntlm-info': self.UPSTREAM_RDP})
+        assert not any('2019-06-13' in d for d in details)
+
+
+class TestWindowsBuildNamesCurrency:
+    """Pin the build->name pairs verified against Microsoft release-health data.
+
+    These are the releases an operator is most likely to meet on a current
+    engagement.  A wrong pair here puts a wrong OS claim in a deliverable, and
+    the failure is silent -- the finding still renders, just naming the wrong
+    Windows.  Pinning them means a careless edit to the table fails a test.
+    """
+
+    @pytest.mark.parametrize('build,expected', [
+        ('10.0.28000', 'Windows 11 26H1'),
+        ('10.0.26200', 'Windows 11 25H2'),
+        ('10.0.26100', 'Windows 11 24H2 / Windows Server 2025'),
+        ('10.0.22631', 'Windows 11 23H2'),
+        ('10.0.22621', 'Windows 11 22H2'),
+        ('10.0.22000', 'Windows 11 21H2'),
+        ('10.0.25398', 'Windows Server, version 23H2 (Annual Channel)'),
+        ('10.0.20348', 'Windows Server 2022'),
+        ('10.0.19045', 'Windows 10 22H2'),
+        ('10.0.19044', 'Windows 10 21H2'),
+        ('10.0.17763', 'Windows 10 1809 / Windows Server 2019'),
+        ('10.0.14393', 'Windows 10 1607 / Windows Server 2016'),
+    ])
+    def test_build_maps_to_expected_release(self, build, expected):
+        assert spoonmap._WINDOWS_BUILD_NAMES[build] == expected
+
+    def test_no_duplicate_build_numbers_across_names(self):
+        builds = list(spoonmap._WINDOWS_BUILD_NAMES)
+        assert len(builds) == len(set(builds))
+
+
+class TestOsDetailsUnknownOsHandling:
+    def test_unknown_os_with_fqdn_identifies_nothing(self):
+        """An FQDN alone is not an OS identification.
+
+        smb-os-discovery can return 'OS: Unknown' while still reporting an
+        FQDN.  Emitting the FQDN by itself produced a finding titled
+        'Operating System Identified' whose whole detail was a hostname.
+        """
+        details = _extract_os_details({'smb-os-discovery':
+                                       'OS: Unknown\nFQDN: host.corp.local\n'})
+        assert details == []
+
+    def test_real_os_still_carries_its_fqdn(self):
+        details = _extract_os_details({'smb-os-discovery':
+                                       'OS: Windows Server 2022 20348\n'
+                                       'FQDN: host.corp.local\n'})
+        assert details == ['smb-os-discovery: Windows Server 2022 20348',
+                           'FQDN: host.corp.local']
+
+    def test_missing_os_line_with_fqdn_identifies_nothing(self):
+        details = _extract_os_details({'smb-os-discovery': 'FQDN: host.corp.local\n'})
+        assert details == []

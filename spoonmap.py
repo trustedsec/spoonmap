@@ -617,6 +617,87 @@ def _extract_ssl_cert_hostnames(ssl_cert_output):
 
     return hostnames
 
+
+# Windows build number -> marketing name, for the build reported by the
+# *-ntlm-info scripts' Product_Version field (major.minor.build; the UBR/patch
+# level is not carried in an NTLM challenge, so precision stops at the build).
+# Deliberately a SHORT list of builds confidently known at the time of writing.
+# An unmapped build is reported as the raw number rather than guessed at: this
+# lands in an engagement deliverable, and a wrong OS claim there is worse than
+# a bare build number the operator looks up.
+_WINDOWS_BUILD_NAMES = {
+    # Verified against Microsoft's release-health pages on 2026-09-18.
+    '10.0.28000': 'Windows 11 26H1',
+    '10.0.26200': 'Windows 11 25H2',
+    '10.0.26100': 'Windows 11 24H2 / Windows Server 2025',
+    '10.0.22631': 'Windows 11 23H2',
+    '10.0.22621': 'Windows 11 22H2',
+    '10.0.22000': 'Windows 11 21H2',
+    '10.0.25398': 'Windows Server, version 23H2 (Annual Channel)',
+    '10.0.20348': 'Windows Server 2022',
+    '10.0.19045': 'Windows 10 22H2',
+    '10.0.19044': 'Windows 10 21H2',
+    '10.0.17763': 'Windows 10 1809 / Windows Server 2019',
+    '10.0.14393': 'Windows 10 1607 / Windows Server 2016',
+    '6.3.9600':   'Windows 8.1 / Windows Server 2012 R2',
+    '6.2.9200':   'Windows 8 / Windows Server 2012',
+    '6.1.7601':   'Windows 7 SP1 / Windows Server 2008 R2 SP1',
+}
+
+# Product_Version is always major.minor.build; anything else is not a version
+# this can interpret and is skipped rather than reported as one.
+_PRODUCT_VERSION_RE = re.compile(
+    r'^\s*Product_Version:\s*(\d+\.\d+\.\d+)\s*$', re.MULTILINE)
+_SMB_OS_LINE_RE = re.compile(r'^\s*OS:\s*(.+?)\s*$', re.MULTILINE)
+_SMB_FQDN_LINE_RE = re.compile(r'^\s*FQDN:\s*(.+?)\s*$', re.MULTILINE)
+
+
+def _extract_os_details(scripts):
+    """Return OS-identifying detail strings from one port's NSE script output.
+
+    Reads two unauthenticated sources, both already collected by the normal NSE
+    pass: smb-os-discovery's ``OS:`` line (a product string straight off the SMB
+    session setup) and any ``*-ntlm-info`` script's ``Product_Version`` field (a
+    build number off an NTLM challenge).  Each returned string names the script
+    it came from, so an operator can reproduce it.
+
+    Returns a list -- possibly empty, never None -- in a deterministic order
+    regardless of dict insertion order, so the same scan produces the same
+    finding text twice running.
+    """
+    details = []
+
+    smb_out = scripts.get('smb-os-discovery') or ''
+    if smb_out:
+        os_match = _SMB_OS_LINE_RE.search(smb_out)
+        os_str = os_match.group(1) if os_match else ''
+        # smb-os-discovery prints a literal 'Unknown' when the session
+        # succeeded but carried no version -- not an identification.
+        if os_str and os_str.lower() != 'unknown':
+            details.append(f'smb-os-discovery: {os_str}')
+            # FQDN rides along with a real OS string only.  On its own it would
+            # produce a finding titled 'Operating System Identified' whose
+            # entire detail is a hostname, identifying no operating system.
+            fqdn_match = _SMB_FQDN_LINE_RE.search(smb_out)
+            if fqdn_match and fqdn_match.group(1):
+                details.append(f'FQDN: {fqdn_match.group(1)}')
+
+    for sid in sorted(scripts):
+        if not sid.endswith('-ntlm-info'):
+            continue
+        version_match = _PRODUCT_VERSION_RE.search(scripts[sid] or '')
+        if not version_match:
+            continue
+        build = version_match.group(1)
+        label = f'{sid}: Windows build {build}'
+        name = _WINDOWS_BUILD_NAMES.get(build)
+        if name:
+            label += f' ({name})'
+        details.append(label)
+
+    return details
+
+
 def _write_if_changed(path, content):
     """Write *content* to *path* only if it differs from the current contents.
 
@@ -3471,6 +3552,8 @@ EXTERNAL_PORT_SCRIPTS = {
     '995':   'pop3-ntlm-info,ssl-cert',
     '1433':  f'ms-sql-ntlm-info,{_NSE_DIR}/azure-sql-detect.nse',
     '3342':  f'{_NSE_DIR}/azure-sql-detect.nse',  # Azure SQL Managed Instance public endpoint
+    '139':   'smb-os-discovery',
+    '445':   'smb-os-discovery',
     '3389':  'rdp-ntlm-info',
     '2375':  'docker-version',
     '4243':  'docker-version',
@@ -3504,9 +3587,13 @@ EXTERNAL_PORT_SCRIPTS = {
 # Scripts run on INTERNAL scans only (no ssl-cert — not relevant for internal assessments)
 INTERNAL_PORT_SCRIPTS = {
     '21':    'ftp-anon',
+    # RDP's NTLM challenge carries the exact Windows build; this is the
+    # highest-precision unauthenticated OS source on an internal network,
+    # where SMB null sessions are frequently refused.
+    '3389':  'rdp-ntlm-info',
     '111':   'rpcinfo,nfs-showmount,nfs-ls',
-    '139':   'smb-security-mode,smb2-security-mode,smb-vuln-ms17-010,smb-vuln-ms08-067,smb-double-pulsar-backdoor,smb-vuln-cve-2017-7494',
-    '445':   'smb-security-mode,smb2-security-mode,smb-vuln-ms17-010,smb-vuln-ms08-067,smb-double-pulsar-backdoor,smb-vuln-cve-2017-7494',
+    '139':   'smb-os-discovery,smb-security-mode,smb2-security-mode,smb-vuln-ms17-010,smb-vuln-ms08-067,smb-double-pulsar-backdoor,smb-vuln-cve-2017-7494',
+    '445':   'smb-os-discovery,smb-security-mode,smb2-security-mode,smb-vuln-ms17-010,smb-vuln-ms08-067,smb-double-pulsar-backdoor,smb-vuln-cve-2017-7494',
     '2375':  'docker-version',
     '4243':  'docker-version',
     '1090':  'rmi-dumpregistry',
@@ -4423,6 +4510,18 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                         add('MEDIUM', ip, port_str, 'Weak SSH Algorithms',
                             f'Deprecated algorithm(s) offered: {", ".join(sorted(found_weak))}.')
 
+                # ── OS identification (port-level source) ─────────────────
+                # Reaches the portrule *-ntlm-info scripts only; hostrule
+                # smb-os-discovery is handled in the <hostscript> block above.
+                # Separate from the NTLM disclosure finding below: that one is
+                # about a host leaking internal names to the internet, this one
+                # is inventory -- what the host actually runs -- and is just as
+                # wanted on an internal engagement.
+                os_details = _extract_os_details(scripts)
+                if os_details:
+                    add('LOW', ip, port_str, 'Operating System Identified',
+                        '; '.join(os_details))
+
                 # ── *-ntlm-info (external only) ───────────────────────────
                 if target_scan == 'External':
                     for sid, out in scripts.items():
@@ -4875,6 +4974,17 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
             if hostscript_elem is not None:
                 hscripts = scripts_for_elem(hostscript_elem)
 
+                # ── OS identification (host-level source) ─────────────────
+                # smb-os-discovery is a *hostrule* script, so nmap emits it
+                # under <hostscript> and it never appears in the per-port loop
+                # below -- reading it there finds nothing, silently, forever.
+                # The *-ntlm-info scripts are portrule and are handled in that
+                # loop instead; both feed the same finding.
+                os_details = _extract_os_details(hscripts)
+                if os_details:
+                    add('LOW', ip, file_port_str, 'Operating System Identified',
+                        '; '.join(os_details))
+
                 # ── smb-security-mode / smb2-security-mode ────────────────
                 if target_scan == 'Internal':
                     def _signing_not_req(key):
@@ -5057,6 +5167,23 @@ _FINDING_REPRO = {
             '|     publickey\n'
             '|     password\n'
             '|_    keyboard-interactive'
+        ),
+    },
+    'Operating System Identified': {
+        'flags': '--script smb-os-discovery,rdp-ntlm-info',
+        'sample': (
+            'PORT     STATE SERVICE\n'
+            '445/tcp  open  microsoft-ds\n'
+            '3389/tcp open  ms-wbt-server\n'
+            '| rdp-ntlm-info:\n'
+            '|   NetBIOS_Computer_Name: DC01\n'
+            '|_  Product_Version: 10.0.17763\n'
+            '\n'
+            'Host script results:\n'
+            '| smb-os-discovery:\n'
+            '|   OS: Windows Server 2019 Standard 17763 (Windows Server 2019 Standard 6.3)\n'
+            '|   Computer name: DC01\n'
+            '|_  FQDN: DC01.corp.local'
         ),
     },
     'NTLM Information Disclosure': {
@@ -5525,6 +5652,7 @@ _PER_HOST_DETAIL_TITLES = frozenset({
     'Service Exposed Externally',
     'VNC Desktop Name Disclosed',
     'TLS Certificate Hostname(s) Identified',
+    'Operating System Identified',
 })
 
 
