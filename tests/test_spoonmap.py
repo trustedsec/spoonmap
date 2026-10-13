@@ -15112,8 +15112,11 @@ class TestConfigNetworkOverride:
         assert _config_network_override(None, None, None) is None
 
     def test_interface_only_valid(self):
-        result = _config_network_override('lo', '', '')
-        assert result == NetworkOverride('lo', None, None)
+        # A real interface name varies by OS (lo on Linux, lo0 on macOS), so
+        # the existence check itself is mocked rather than relying on one.
+        with patch('spoonmap.socket.if_nametoindex', return_value=1):
+            result = _config_network_override('eth0', '', '')
+        assert result == NetworkOverride('eth0', None, None)
 
     def test_invalid_interface_exits(self, capsys):
         with pytest.raises(SystemExit) as exc:
@@ -15152,8 +15155,9 @@ class TestConfigNetworkOverride:
         assert result.router_ip == '10.0.0.1'
 
     def test_all_three_set(self):
-        result = _config_network_override('lo', '10.0.0.5', '10.0.0.1')
-        assert result == NetworkOverride('lo', '10.0.0.5', '10.0.0.1')
+        with patch('spoonmap.socket.if_nametoindex', return_value=1):
+            result = _config_network_override('eth0', '10.0.0.5', '10.0.0.1')
+        assert result == NetworkOverride('eth0', '10.0.0.5', '10.0.0.1')
 
     def test_whitespace_only_treated_as_absent(self):
         assert _config_network_override('   ', '  ', '  ') is None
@@ -15863,18 +15867,22 @@ class TestLoadConfigNetworkOverride:
         assert cfg['router_ip'] == ''
 
     def test_interface_only(self):
-        cfg = _load_config(_config_dict(interface='lo'), '/t')
-        assert cfg['net_override'] == NetworkOverride('lo', None, None)
-        assert cfg['interface'] == 'lo'
+        # A real interface name varies by OS (lo on Linux, lo0 on macOS), so
+        # the existence check itself is mocked rather than relying on one.
+        with patch('spoonmap.socket.if_nametoindex', return_value=1):
+            cfg = _load_config(_config_dict(interface='eth0'), '/t')
+        assert cfg['net_override'] == NetworkOverride('eth0', None, None)
+        assert cfg['interface'] == 'eth0'
 
     def test_source_ip_only(self):
         cfg = _load_config(_config_dict(source_ip='10.0.0.5'), '/t')
         assert cfg['net_override'] == NetworkOverride(None, '10.0.0.5', None)
 
     def test_all_three_set(self):
-        cfg = _load_config(
-            _config_dict(interface='lo', source_ip='10.0.0.5', router_ip='10.0.0.1'), '/t')
-        assert cfg['net_override'] == NetworkOverride('lo', '10.0.0.5', '10.0.0.1')
+        with patch('spoonmap.socket.if_nametoindex', return_value=1):
+            cfg = _load_config(
+                _config_dict(interface='eth0', source_ip='10.0.0.5', router_ip='10.0.0.1'), '/t')
+        assert cfg['net_override'] == NetworkOverride('eth0', '10.0.0.5', '10.0.0.1')
 
     def test_invalid_interface_exits(self):
         with pytest.raises(SystemExit):
