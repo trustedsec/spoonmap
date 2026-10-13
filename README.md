@@ -2,6 +2,32 @@
 
 [![CI](https://github.com/trustedsec/spoonmap/actions/workflows/ci.yml/badge.svg)](https://github.com/trustedsec/spoonmap/actions/workflows/ci.yml)
 
+## Table of Contents
+
+- [Dependencies](#dependencies)
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Scanning a target without a file](#scanning-a-target-without-a-file)
+- [Where Files Live](#where-files-live)
+- [Target File (ranges.txt)](#target-file-rangestxt)
+- [config.json Parameters](#configjson-parameters)
+  - [scanner_profile: reducing scanner fingerprinting](#scanner_profile-reducing-scanner-fingerprinting)
+  - [interface / source_ip / router_ip: fixing ambiguous routing](#interface--source_ip--router_ip-fixing-ambiguous-routing)
+  - [max_rate guidance](#max_rate-guidance)
+  - [Host discovery](#host-discovery)
+    - [Exclusion pre-filtering](#exclusion-pre-filtering)
+    - [External scans](#external-scans)
+    - [Internal scans](#internal-scans)
+  - [Intelligent tool selection: masscan vs nmap (port discovery)](#intelligent-tool-selection-masscan-vs-nmap-port-discovery)
+  - [Inter-scan wait (automatic)](#inter-scan-wait-automatic)
+- [Output Structure](#output-structure)
+  - [Greppable output](#greppable-output)
+- [NSE Script Scanning and Findings](#nse-script-scanning-and-findings)
+- [Potential Hacks to Look For](#potential-hacks-to-look-for)
+  - [References](#references)
+- [Development](#development)
+  - [Continuous integration](#continuous-integration)
+
 ## Dependencies
 This script is a wrapper for masscan and nmap. nmap handles host discovery and (for smaller scans) port discovery, service banner grabbing, and NSE scripts. Masscan is used for large-scale port discovery where raw speed matters. Install both from your favourite package manager or from source.
 
