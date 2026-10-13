@@ -413,6 +413,64 @@ ordering, not `Random`; and scan shape/volume (`-T4`, `-Pn` on everything,
 `--version-intensity 0`, fixed port sets) is untouched — touching 10 ports on
 every host in a /16 is itself a signature no string substitution addresses.
 
+## Network Override (`interface`/`source_ip`/`router_ip`)
+
+masscan and nmap both auto-detect which interface to send from and which
+next-hop to ARP for by walking the host's own routing table. A host with
+more than one default route — a hypervisor's shared-network/NAT adapter
+alongside a real LAN gateway, or a split-tunnel VPN client, are the two
+observed cases — makes that auto-detection either fail outright (masscan:
+`FAIL: could not determine default interface`) or silently pick the wrong
+one, so packets go out a path that never reaches the target. The kernel's
+own routing (ordinary `socket`-based TCP, which both masscan and nmap also
+rely on for everything *except* raw packet crafting) can resolve the same
+host correctly, which is why the symptom is counterintuitive: `curl`/`nc`
+succeed while an nmap `-Pn` SYN scan against the identical host and port
+reports it down or every port filtered.
+
+Three independent, optional `config.json` keys — `interface`, `source_ip`,
+`router_ip` — pin these choices explicitly instead of leaving them guessed.
+None has an interactive prompt (same posture as `scanner_profile` and
+`honeypot_active_confirm`: hand-edit the file to turn this on); absent or
+empty means every masscan/nmap invocation behaves exactly as before. Setting
+any one of the three is enough to activate the override — they are not
+all-or-nothing — though in practice `interface` and `source_ip` are set
+together, since pinning only one rarely disambiguates a two-default-route
+host on its own.
+
+`NetworkOverride` is a plain `(interface, source_ip, router_ip)` namedtuple,
+threaded as an explicit `net_override=None` parameter through every function
+that builds a masscan or nmap command list — all 3 masscan call sites
+(`_discover_external_masscan`, `_discover_internal_masscan`,
+`_run_masscan_batch`) and all 9 nmap ones (`_nmap_host_discovery`,
+`_nmap_udp_discovery`, `_nmap_port_discovery`, `_build_nmap_cmd`'s three
+branches, `_scan_extra_sql_ports`'s two invocations,
+`_validate_snmp_any_community`) — the same explicit-parameter-threading
+discipline this module uses everywhere else (`max_rate`, `source_port`,
+`exclusions_file`), not a module-global, so every call site is independently
+testable and a forgotten site is a missing argument, not a silent no-op.
+`_masscan_network_args()`/`_nmap_network_args()` are the two translation
+points: `interface` → masscan `--interface` / nmap `-e`; `source_ip` →
+masscan `--source-ip` / nmap `-S`; `router_ip` → masscan `--router-ip` only,
+since nmap resolves its own next-hop once source/interface are fixed and has
+no equivalent flag. nmap's `-S` always carries `--disable-arp-ping`
+alongside it whenever `source_ip` is set: nmap's own ARP-ping host discovery
+bypasses `-S`/`-e` entirely and can contradict the pinned identity against a
+target that happens to share the local subnet. The two `_verify_nmap_overlay()`
+loopback probes (127.0.0.1, verifying the `scanner_profile` overlay) deliberately
+do **not** take this override — pinning a non-loopback interface/source against
+a 127.0.0.1 target would break the one thing those probes exist to check.
+
+`_config_network_override()` validates at config-load time and, like
+`_config_scanner_profile()`, **exits rather than warns** on an invalid value:
+`interface` must name a real interface on this host (`socket.if_nametoindex()`);
+`source_ip`/`router_ip` must each be a valid IPv4 address (this tool's
+IPv4-only enforcement applies here too). An operator who set this is already
+routing around a host where auto-detection is known unreliable — silently
+falling back to it would either reproduce the exact failure this knob exists
+to fix, or scan out a path the operator never intended, neither of which
+should happen quietly.
+
 ## Architecture
 
 ### Host Discovery (Internal)
