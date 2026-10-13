@@ -126,7 +126,11 @@ from spoonmap import (
     _validate_snmp_any_community,
     _SMB_COUPLED_PORTS,
     _build_nmap_overlay,
+    _config_network_override,
     _config_scanner_profile,
+    _masscan_network_args,
+    _nmap_network_args,
+    NetworkOverride,
     _decode_probe_string,
     _generate_scanner_tokens,
     _locate_nmap_datadir,
@@ -3067,7 +3071,7 @@ class TestFullPortScan:
             ['1-65535'], '10000',   # capped from 20000 (External cap)
             str(tmp_path) + '/discovery/masscan_results/portFull.xml',
             '/fake/targets.txt', '53', '',
-            wait_secs=2,
+            wait_secs=2, net_override=None,
         )
         assert 'Hosts Found on Port 80' in result
         assert 'Hosts Found on Port 443' in result
@@ -3081,7 +3085,7 @@ class TestFullPortScan:
             ['1-65535'], '1000',   # capped from 2000 (Internal cap)
             str(tmp_path) + '/discovery/masscan_results/portFull.xml',
             '/fake/targets.txt', '88', '',
-            wait_secs=2,
+            wait_secs=2, net_override=None,
         )
 
     def test_full_scan_targets_discovered_hosts_not_full_range(self, tmp_path):
@@ -3104,7 +3108,7 @@ class TestFullPortScan:
             ['1-65535'], '1000',
             str(tmp_path) + '/discovery/masscan_results/portFull.xml',
             str(discovery_file), '88', '',
-            wait_secs=0,
+            wait_secs=0, net_override=None,
         )
 
     def test_full_scan_falls_back_when_discovery_file_missing(self, tmp_path):
@@ -8419,7 +8423,7 @@ class TestNmapWorker:
 
 def _fake_worker_drain(work_queue, completed_count, total_count, source_port, lock,
                        interrupt_event, ip_to_hostname, script_scan, target_scan, start_time,
-                       extra_script_args=None):
+                       extra_script_args=None, net_override=None):
     """Stand-in for nmap_worker() used by TestNmapScan — drains real queue
     items instantly instead of spawning subprocesses, so nmap_scan()'s own
     orchestration logic (queuing, resume-skip, join/poison-pill, thread
@@ -8599,7 +8603,7 @@ class TestNmapScan:
 
         def fake_worker(work_queue, completed_count, total_count, source_port, lock,
                         interrupt_event, ip_to_hostname, script_scan, target_scan, start_time,
-                        extra_script_args=None):
+                        extra_script_args=None, net_override=None):
             captured_event['event'] = interrupt_event
             # Never drains the queue — join() below will block until we
             # interrupt it via the patched Queue.join raising KeyboardInterrupt.
@@ -8627,7 +8631,7 @@ class TestNmapScan:
 
         def fake_worker_capture(work_queue, completed_count, total_count, source_port, lock,
                                 interrupt_event, ip_to_hostname, script_scan, target_scan, start_time,
-                                extra_script_args=None):
+                                extra_script_args=None, net_override=None):
             while True:
                 item = work_queue.get()
                 if item is None:
@@ -8656,7 +8660,7 @@ class TestNmapScan:
 
         def fake_worker_capture(work_queue, completed_count, total_count, source_port, lock,
                                 interrupt_event, ip_to_hostname, script_scan, target_scan, start_time,
-                                extra_script_args=None):
+                                extra_script_args=None, net_override=None):
             while True:
                 item = work_queue.get()
                 if item is None:
@@ -8685,7 +8689,7 @@ class TestNmapScan:
 
         def fake_worker_capture(work_queue, completed_count, total_count, source_port, lock,
                                 interrupt_event, ip_to_hostname, script_scan, target_scan, start_time,
-                                extra_script_args=None):
+                                extra_script_args=None, net_override=None):
             while True:
                 item = work_queue.get()
                 if item is None:
@@ -10876,7 +10880,7 @@ class TestSMBCoupling:
         calls = []
 
         def side_effect(batch, rate, output_file, target_file, source_port,
-                        exclusions_file, wait_secs=2):
+                        exclusions_file, wait_secs=2, net_override=None):
             idx = len(calls)
             calls.append(batch)
             return port_map.get(idx, {})
@@ -10953,7 +10957,7 @@ class TestSlowPortsSMB:
         call_log = []
 
         def side_effect(batch, rate, output_file, target_file, source_port,
-                        exclusions_file, wait_secs=2):
+                        exclusions_file, wait_secs=2, net_override=None):
             call_log.append(list(batch))
             # First call is the fast probe — simulate finding 445
             return {'445': {'10.0.0.1'}} if len(call_log) == 1 else {}
@@ -15050,6 +15054,192 @@ class TestValidateScannerToken:
         _validate_scanner_token(key, 'DESKTOP-4KJ2L1P')  # must not raise
 
 
+class TestMasscanNetworkArgs:
+    def test_none_override_returns_no_args(self):
+        assert _masscan_network_args(None) == []
+
+    def test_all_disabled_returns_no_args(self):
+        assert _masscan_network_args(NetworkOverride(None, None, None)) == []
+
+    def test_interface_only(self):
+        args = _masscan_network_args(NetworkOverride('eth0', None, None))
+        assert args == ['--interface', 'eth0']
+
+    def test_source_ip_only(self):
+        args = _masscan_network_args(NetworkOverride(None, '10.0.0.5', None))
+        assert args == ['--source-ip', '10.0.0.5']
+
+    def test_router_ip_only(self):
+        args = _masscan_network_args(NetworkOverride(None, None, '10.0.0.1'))
+        assert args == ['--router-ip', '10.0.0.1']
+
+    def test_all_three_set(self):
+        args = _masscan_network_args(NetworkOverride('eth0', '10.0.0.5', '10.0.0.1'))
+        assert args == ['--interface', 'eth0', '--source-ip', '10.0.0.5',
+                        '--router-ip', '10.0.0.1']
+
+
+class TestNmapNetworkArgs:
+    def test_none_override_returns_no_args(self):
+        assert _nmap_network_args(None) == []
+
+    def test_all_disabled_returns_no_args(self):
+        assert _nmap_network_args(NetworkOverride(None, None, None)) == []
+
+    def test_interface_only(self):
+        args = _nmap_network_args(NetworkOverride('eth0', None, None))
+        assert args == ['-e', 'eth0']
+
+    def test_source_ip_adds_disable_arp_ping(self):
+        args = _nmap_network_args(NetworkOverride(None, '10.0.0.5', None))
+        assert args == ['-S', '10.0.0.5', '--disable-arp-ping']
+
+    def test_router_ip_has_no_nmap_equivalent(self):
+        # router_ip is masscan-only; nmap resolves its own next-hop.
+        args = _nmap_network_args(NetworkOverride(None, None, '10.0.0.1'))
+        assert args == []
+
+    def test_all_three_set_router_ip_ignored(self):
+        args = _nmap_network_args(NetworkOverride('eth0', '10.0.0.5', '10.0.0.1'))
+        assert args == ['-e', 'eth0', '-S', '10.0.0.5', '--disable-arp-ping']
+
+
+class TestConfigNetworkOverride:
+    def test_all_absent_returns_none(self):
+        assert _config_network_override('', '', '') is None
+
+    def test_all_none_returns_none(self):
+        assert _config_network_override(None, None, None) is None
+
+    def test_interface_only_valid(self):
+        result = _config_network_override('lo', '', '')
+        assert result == NetworkOverride('lo', None, None)
+
+    def test_invalid_interface_exits(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            _config_network_override('not-a-real-interface-xyz', '', '')
+        assert exc.value.code == 1
+        assert 'interface' in capsys.readouterr().out
+
+    def test_valid_source_ip(self):
+        result = _config_network_override('', '10.0.0.5', '')
+        assert result == NetworkOverride(None, '10.0.0.5', None)
+
+    def test_invalid_source_ip_exits(self, capsys):
+        with pytest.raises(SystemExit):
+            _config_network_override('', 'not-an-ip', '')
+        assert 'source_ip' in capsys.readouterr().out
+
+    def test_ipv6_source_ip_rejected(self, capsys):
+        # IPv4-only enforcement, same as the rest of this module.
+        with pytest.raises(SystemExit):
+            _config_network_override('', '::1', '')
+        assert 'IPv4' in capsys.readouterr().out
+
+    def test_valid_router_ip(self):
+        result = _config_network_override('', '', '10.0.0.1')
+        assert result == NetworkOverride(None, None, '10.0.0.1')
+
+    def test_invalid_router_ip_exits(self, capsys):
+        with pytest.raises(SystemExit):
+            _config_network_override('', '', 'not-an-ip')
+        assert 'router_ip' in capsys.readouterr().out
+
+    def test_router_ip_alone_without_interface_is_accepted(self):
+        # masscan does not require --interface alongside --router-ip.
+        result = _config_network_override('', '', '10.0.0.1')
+        assert result.interface is None
+        assert result.router_ip == '10.0.0.1'
+
+    def test_all_three_set(self):
+        result = _config_network_override('lo', '10.0.0.5', '10.0.0.1')
+        assert result == NetworkOverride('lo', '10.0.0.5', '10.0.0.1')
+
+    def test_whitespace_only_treated_as_absent(self):
+        assert _config_network_override('   ', '  ', '  ') is None
+
+
+class TestBuildNmapCmdNetworkOverride:
+    """_build_nmap_cmd() splices _nmap_network_args() into every branch."""
+
+    def test_banner_pass_tcp(self):
+        cmd = _build_nmap_cmd('445', '/in.txt', '/out.xml', '',
+                              target_scan='Internal',
+                              net_override=NetworkOverride('eth0', '10.0.0.5', None))
+        assert '-e' in cmd and cmd[cmd.index('-e') + 1] == 'eth0'
+        assert '-S' in cmd and cmd[cmd.index('-S') + 1] == '10.0.0.5'
+        assert '--disable-arp-ping' in cmd
+
+    def test_banner_pass_udp(self):
+        cmd = _build_nmap_cmd('U:161', '/in.txt', '/out.xml', '',
+                              target_scan='Internal',
+                              net_override=NetworkOverride('eth0', None, None))
+        assert '-e' in cmd and cmd[cmd.index('-e') + 1] == 'eth0'
+
+    def test_script_only_pass(self):
+        cmd = _build_nmap_cmd('22', '/in.txt', '/out.xml', '',
+                              script_only=True, target_scan='Internal',
+                              net_override=NetworkOverride('eth0', None, None))
+        assert '-e' in cmd and cmd[cmd.index('-e') + 1] == 'eth0'
+
+    def test_no_override_means_no_extra_args(self):
+        cmd = _build_nmap_cmd('22', '/in.txt', '/out.xml', '', target_scan='Internal')
+        assert '-e' not in cmd
+        assert '-S' not in cmd
+        assert '--disable-arp-ping' not in cmd
+
+
+class TestRunMasscanBatchNetworkOverride:
+    def _make_mock_proc(self):
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = 0
+        mock_proc.returncode = 0
+        mock_proc.pid = 12345
+        mock_proc.stderr = io.BytesIO(b'')
+        return mock_proc
+
+    def test_network_override_args_in_command(self, tmp_path):
+        output_xml = tmp_path / 'out.xml'
+        captured_cmds = []
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmds.append(cmd)
+            output_xml.write_text('<nmaprun/>')
+            return self._make_mock_proc()
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            _run_masscan_batch(['445'], '1000', str(output_xml),
+                               '/fake/targets.txt', None, None,
+                               net_override=NetworkOverride('eth0', '10.0.0.5', '10.0.0.1'))
+
+        cmd = captured_cmds[0]
+        assert cmd[cmd.index('--interface') + 1] == 'eth0'
+        assert cmd[cmd.index('--source-ip') + 1] == '10.0.0.5'
+        assert cmd[cmd.index('--router-ip') + 1] == '10.0.0.1'
+
+    def test_no_override_means_no_extra_args(self, tmp_path):
+        output_xml = tmp_path / 'out.xml'
+        captured_cmds = []
+
+        def fake_popen(cmd, **kwargs):
+            captured_cmds.append(cmd)
+            output_xml.write_text('<nmaprun/>')
+            return self._make_mock_proc()
+
+        with patch('spoonmap.subprocess.Popen', side_effect=fake_popen), \
+             patch('spoonmap.save_terminal_state', return_value=None), \
+             patch('spoonmap.restore_terminal_state'):
+            _run_masscan_batch(['445'], '1000', str(output_xml),
+                               '/fake/targets.txt', None, None)
+
+        cmd = captured_cmds[0]
+        assert '--interface' not in cmd
+        assert '--source-ip' not in cmd
+        assert '--router-ip' not in cmd
+
+
 class TestGenerateScannerTokens:
     def test_empty_overrides_fills_all_seven_keys(self):
         tokens = _generate_scanner_tokens({})
@@ -15662,3 +15852,67 @@ class TestBuildInteractiveConfigScannerProfile:
         # this only guards against a future caller passing {} by mistake.
         cfg = _build_interactive_config(*self._base_args(), scanner_profile={})
         assert 'scanner_profile' not in cfg
+
+
+class TestLoadConfigNetworkOverride:
+    def test_absent_keys_disabled(self):
+        cfg = _load_config(_config_dict(), '/t')
+        assert cfg['net_override'] is None
+        assert cfg['interface'] == ''
+        assert cfg['source_ip'] == ''
+        assert cfg['router_ip'] == ''
+
+    def test_interface_only(self):
+        cfg = _load_config(_config_dict(interface='lo'), '/t')
+        assert cfg['net_override'] == NetworkOverride('lo', None, None)
+        assert cfg['interface'] == 'lo'
+
+    def test_source_ip_only(self):
+        cfg = _load_config(_config_dict(source_ip='10.0.0.5'), '/t')
+        assert cfg['net_override'] == NetworkOverride(None, '10.0.0.5', None)
+
+    def test_all_three_set(self):
+        cfg = _load_config(
+            _config_dict(interface='lo', source_ip='10.0.0.5', router_ip='10.0.0.1'), '/t')
+        assert cfg['net_override'] == NetworkOverride('lo', '10.0.0.5', '10.0.0.1')
+
+    def test_invalid_interface_exits(self):
+        with pytest.raises(SystemExit):
+            _load_config(_config_dict(interface='not-a-real-interface-xyz'), '/t')
+
+    def test_invalid_source_ip_exits(self):
+        with pytest.raises(SystemExit):
+            _load_config(_config_dict(source_ip='not-an-ip'), '/t')
+
+
+class TestBuildInteractiveConfigNetworkOverride:
+    def _base_args(self):
+        return (['Web'], [], 'Web', True, False, 'Internal', '2000',
+                'r', 'o', None, 5, 5, 5_000_000, True)
+
+    def test_all_empty_omits_keys(self):
+        cfg = _build_interactive_config(*self._base_args())
+        assert 'interface' not in cfg
+        assert 'source_ip' not in cfg
+        assert 'router_ip' not in cfg
+
+    def test_interface_only_writes_all_three_keys(self):
+        # The doc note is attached only to 'interface' in _CONFIG_DOCS, so all
+        # three must be written together whenever any one is set, or the note
+        # silently disappears when only source_ip/router_ip is set.
+        cfg = _build_interactive_config(*self._base_args(), interface='eth0')
+        assert cfg['interface'] == 'eth0'
+        assert cfg['source_ip'] == ''
+        assert cfg['router_ip'] == ''
+
+    def test_source_ip_only_still_writes_interface_key(self):
+        cfg = _build_interactive_config(*self._base_args(), source_ip='10.0.0.5')
+        assert cfg['interface'] == ''
+        assert cfg['source_ip'] == '10.0.0.5'
+
+    def test_all_three_set(self):
+        cfg = _build_interactive_config(
+            *self._base_args(), interface='eth0', source_ip='10.0.0.5', router_ip='10.0.0.1')
+        assert cfg['interface'] == 'eth0'
+        assert cfg['source_ip'] == '10.0.0.5'
+        assert cfg['router_ip'] == '10.0.0.1'

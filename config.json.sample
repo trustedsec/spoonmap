@@ -33,5 +33,9 @@
     "exclusions_file" : "exclusions.txt",
     "__scanner_profile_choices__": "false/absent (default, disabled), \"random\", or an object pinning some of: probe_token, tls_random, rdp_cookie, workstation, native_os, user_agent, smtp_domain — any omitted key is drawn from a built-in pool",
     "__scanner_profile_note__": "When set, nmap probes and SpooNMAP's bundled NSE scripts no longer send literal strings that identify the scanner (e.g. the RDP probe's \"mstshash=nmap\" cookie, or nmap's own NSE HTTP User-Agent) — see scan_profile.json in the output directory for exactly what was substituted, for engagement deconfliction. Does NOT affect TCP/IP stack fingerprinting, TLS/JA3 fingerprinting, or scan rate/shape; those are unrelated to string substitution.",
-    "scanner_profile" : false
+    "scanner_profile" : false,
+    "__network_override_note__": "Optional, independent knobs for a host where masscan and/or nmap cannot reliably auto-detect which interface, source IP, or next-hop gateway to scan from — e.g. a host with more than one default route (common behind NAT/VPN split-tunnel setups). All three default to absent/empty, meaning masscan/nmap auto-detect as before; setting any one of them is enough to activate the override for that tool. interface maps to masscan --interface and nmap -e. source_ip maps to masscan --source-ip and nmap -S (nmap also gets --disable-arp-ping automatically whenever source_ip is set, since nmap's own ARP-ping host discovery bypasses -S/-e entirely and can contradict the pinned identity against a target on the same local subnet). router_ip maps to masscan --router-ip only — nmap resolves its own next-hop once source/interface are fixed. An invalid interface name or a non-IPv4 address in source_ip/router_ip stops the run rather than silently falling back to auto-detection.",
+    "interface": "",
+    "source_ip": "",
+    "router_ip": ""
 }

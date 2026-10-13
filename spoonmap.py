@@ -1147,7 +1147,67 @@ def _stream_masscan_progress(proc):
     return b'\n'.join(stderr_lines)
 
 
-def _discover_external_masscan(target_file, disc, max_rate, exclusions_file, target_count):
+NetworkOverride = collections.namedtuple(
+    'NetworkOverride', ('interface', 'source_ip', 'router_ip'))
+
+# The no-op override: every _masscan_network_args()/_nmap_network_args() call
+# site also accepts a bare None for this, so a caller with nothing configured
+# never has to construct one.
+_NO_NETWORK_OVERRIDE = NetworkOverride(None, None, None)
+
+
+def _masscan_network_args(net_override):
+    """Extra masscan CLI args for an operator-pinned interface/source/router IP.
+
+    masscan auto-detects its sending interface and next-hop from the host's
+    own routing table. A host with more than one default route — common
+    behind NAT/VPN split-tunnel setups (e.g. a hypervisor's shared-network
+    adapter alongside a real LAN gateway) — makes that auto-detection either
+    fail outright ("could not determine default interface") or silently pick
+    the wrong one, sending every packet out a path that never reaches the
+    target. net_override pins the three masscan knobs that make the choice
+    explicit instead of guessed. A disabled override (None, the default)
+    returns no args, so behaviour is byte-for-byte unchanged unless an
+    operator sets interface/source_ip/router_ip in config.json.
+    """
+    if net_override is None:
+        return []
+    args = []
+    if net_override.interface:
+        args += ['--interface', net_override.interface]
+    if net_override.source_ip:
+        args += ['--source-ip', net_override.source_ip]
+    if net_override.router_ip:
+        args += ['--router-ip', net_override.router_ip]
+    return args
+
+
+def _nmap_network_args(net_override):
+    """Extra nmap CLI args mirroring _masscan_network_args() for the same cause.
+
+    nmap performs the same kind of route/interface auto-detection to craft
+    and sniff its own raw packets, independent of the kernel's routing table
+    that ordinary socket I/O (and masscan once pinned) relies on — so the
+    same ambiguous-default-route host can show a target as fully reachable
+    over a plain TCP connect while nmap reports it down or filtered.
+    -S requires --disable-arp-ping alongside it: nmap's own ARP-ping host
+    discovery bypasses -S/-e entirely and can contradict the pinned identity
+    against a target on the same local subnet. router_ip has no nmap
+    equivalent — nmap resolves the next-hop itself once source/interface are
+    fixed — so it is masscan-only and intentionally unused here.
+    """
+    if net_override is None:
+        return []
+    args = []
+    if net_override.interface:
+        args += ['-e', net_override.interface]
+    if net_override.source_ip:
+        args += ['-S', net_override.source_ip, '--disable-arp-ping']
+    return args
+
+
+def _discover_external_masscan(target_file, disc, max_rate, exclusions_file, target_count,
+                               net_override=None):
     """Single masscan TCP SYN sweep for external host discovery. Returns set of live IPs."""
     xml_file = os.path.join(disc, 'discovery_masscan_external.xml')
     print(_COLOR_INFO + 'Host discovery: running masscan (external)...' + _COLOR_RESET)
@@ -1158,6 +1218,7 @@ def _discover_external_masscan(target_file, disc, max_rate, exclusions_file, tar
         '-iL', target_file,
         '-oX', xml_file,
         '--wait', _discovery_wait(target_count),
+        *_masscan_network_args(net_override),
     ]
     if exclusions_file:
         masscan_cmd.extend(['--excludefile', exclusions_file])
@@ -1194,7 +1255,8 @@ def _discover_external_masscan(target_file, disc, max_rate, exclusions_file, tar
     return ips
 
 
-def _discover_internal_masscan(target_file, disc, max_rate, exclusions_file, target_count):
+def _discover_internal_masscan(target_file, disc, max_rate, exclusions_file, target_count,
+                               net_override=None):
     """Single masscan TCP SYN sweep for internal host discovery. Returns set of live IPs.
 
     Rate capped to INTERNAL_DISCOVERY_MAX_RATE. Port list trimmed to
@@ -1216,6 +1278,7 @@ def _discover_internal_masscan(target_file, disc, max_rate, exclusions_file, tar
         '-iL', target_file,
         '-oX', xml_file,
         '--wait', _discovery_wait(target_count),
+        *_masscan_network_args(net_override),
     ]
     if exclusions_file:
         masscan_cmd.extend(['--excludefile', exclusions_file])
@@ -1252,18 +1315,22 @@ def _discover_internal_masscan(target_file, disc, max_rate, exclusions_file, tar
     return ips
 
 
-def _external_host_discovery(target_file, disc, max_rate, exclusions_file, target_count):
+def _external_host_discovery(target_file, disc, max_rate, exclusions_file, target_count,
+                             net_override=None):
     """Masscan TCP SYN sweep + nmap -sn for external host discovery.
 
     Returns set of live IPs (union of both passes).
     """
     masscan_ips = _discover_external_masscan(
-        target_file, disc, max_rate, exclusions_file, target_count)
-    nmap_ips = _nmap_host_discovery(target_file, disc, '', exclusions_file)
+        target_file, disc, max_rate, exclusions_file, target_count,
+        net_override=net_override)
+    nmap_ips = _nmap_host_discovery(target_file, disc, '', exclusions_file,
+                                    net_override=net_override)
     return masscan_ips | nmap_ips
 
 
-def _internal_host_discovery(target_file, disc, max_rate, exclusions_file, target_count):
+def _internal_host_discovery(target_file, disc, max_rate, exclusions_file, target_count,
+                             net_override=None):
     """Masscan TCP SYN sweep + concurrent nmap -sn for internal host discovery.
 
     For target sets ≤ HOST_DISCOVERY_NMAP_THRESHOLD, nmap -sn runs in a background
@@ -1277,7 +1344,8 @@ def _internal_host_discovery(target_file, disc, max_rate, exclusions_file, targe
     if target_count <= HOST_DISCOVERY_NMAP_THRESHOLD:
         def _run_nmap():
             try:
-                result = _nmap_host_discovery(target_file, disc, '', exclusions_file)
+                result = _nmap_host_discovery(target_file, disc, '', exclusions_file,
+                                              net_override=net_override)
                 nmap_ips.update(result)
             except Exception as exc:
                 nmap_errors.append(exc)
@@ -1287,7 +1355,8 @@ def _internal_host_discovery(target_file, disc, max_rate, exclusions_file, targe
 
     try:
         masscan_ips = _discover_internal_masscan(
-            target_file, disc, max_rate, exclusions_file, target_count)
+            target_file, disc, max_rate, exclusions_file, target_count,
+            net_override=net_override)
     except KeyboardInterrupt:
         if nmap_thread is not None:
             nmap_thread.join()
@@ -1303,7 +1372,7 @@ def _internal_host_discovery(target_file, disc, max_rate, exclusions_file, targe
 
 
 def _host_discovery(target_file, output_path, max_rate, exclusions_file,
-                    scan_type='Internal', resume=False):
+                    scan_type='Internal', resume=False, net_override=None):
     """Run host discovery and write live_hosts_discovery.txt.
 
     External scans run a single masscan TCP SYN sweep (curated safe ports) and
@@ -1359,10 +1428,12 @@ def _host_discovery(target_file, output_path, max_rate, exclusions_file,
 
     if scan_type == 'External':
         live_ips = _external_host_discovery(
-            filtered_target, disc, max_rate, discovery_excl, target_count)
+            filtered_target, disc, max_rate, discovery_excl, target_count,
+            net_override=net_override)
     else:  # Internal
         live_ips = _internal_host_discovery(
-            filtered_target, disc, max_rate, discovery_excl, target_count)
+            filtered_target, disc, max_rate, discovery_excl, target_count,
+            net_override=net_override)
 
     total = len(live_ips)
     print(_COLOR_PROGRESS + f'Host discovery total: {total} unique live host(s)' + _COLOR_RESET)
@@ -1386,7 +1457,7 @@ def _host_discovery(target_file, output_path, max_rate, exclusions_file,
     return discovery_file
 
 
-def _nmap_host_discovery(target_file, disc, source_port, exclusions_file):
+def _nmap_host_discovery(target_file, disc, source_port, exclusions_file, net_override=None):
     """Run nmap -sn (ICMP echo probe only); return set of live IPs."""
     output_xml = os.path.join(disc, 'discovery_nmap.xml')
     cmd = [
@@ -1395,6 +1466,7 @@ def _nmap_host_discovery(target_file, disc, source_port, exclusions_file):
         '--max-retries', '1',
         '-PE',                       # ICMP echo only — TCP SYN probes risk RST from routers for non-existent hosts
         *(['--source-port', source_port] if source_port else []),
+        *_nmap_network_args(net_override),
         '-iL', target_file,
         '-oX', output_xml,
     ]
@@ -1447,7 +1519,8 @@ def _nmap_host_discovery(target_file, disc, source_port, exclusions_file):
     return live_ips
 
 
-def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclusions_file, wait_secs=2):
+def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclusions_file,
+                       wait_secs=2, net_override=None):
     """Run masscan for one batch and return {port_key: set_of_ips}."""
     # Drop any prior coverage record before overwriting the output it describes.
     # Without this, a run killed by SIGKILL (or anything else that never reaches
@@ -1460,6 +1533,7 @@ def _run_masscan_batch(batch, rate, output_file, target_file, source_port, exclu
         '--open',
         '--max-rate', rate,
         *(['--source-port', source_port] if source_port else []),
+        *_masscan_network_args(net_override),
         '-iL', target_file,
         '-oX', output_file,
         '--retries', '4',
@@ -1669,7 +1743,7 @@ def _delete_previous_results(output_path):
 
 
 def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
-                        exclusions_file, resume=False):
+                        exclusions_file, resume=False, net_override=None):
     """Run nmap UDP scan for a single port; return set of candidate IPs.
 
     Uses --open (which in nmap captures 'open' and 'open|filtered' states) so
@@ -1705,6 +1779,7 @@ def _nmap_udp_discovery(udp_port, target_file, output_path, source_port,
         '--host-timeout', '30s',
         '--min-rate', '500',
         *(['--source-port', source_port] if source_port else []),
+        *_nmap_network_args(net_override),
         '-iL', target_file,
         '-oX', output_file,
     ]
@@ -1799,7 +1874,8 @@ def _start_stderr_reader(stderr_stream):
 
 
 def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
-                         scan_type='Full', resume=False, max_rate=None, total_hosts=None):
+                         scan_type='Full', resume=False, max_rate=None, total_hosts=None,
+                         net_override=None):
     """Run nmap -T4 port discovery in place of masscan for small target sets.
 
     Writes live_hosts/port{N}.txt files in the same format as mass_scan() so
@@ -1860,6 +1936,7 @@ def _nmap_port_discovery(dest_ports, target_file, source_port, exclusions_file,
         '--open',
         '--max-retries', '2',
         *(['--source-port', source_port] if source_port else []),
+        *_nmap_network_args(net_override),
         '-iL', target_file,
         '-oX', output_file,
         '--stats-every', '30s',
@@ -2328,7 +2405,7 @@ def _confirm_flagged_honeypots(flagged, enabled, dest_ports, disc, connector=Non
     _report_confirmed_honeypots(confirmed, disc)
 
 
-def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file, batch_size=1, resume=False, discovery_file=None, target_scan='Internal', honeypot_active_confirm=False):
+def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusions_file, batch_size=1, resume=False, discovery_file=None, target_scan='Internal', honeypot_active_confirm=False, net_override=None):
     status_summary = '\nSummary'
 
     if not os.path.exists(f'{_disc(output_path)}/masscan_results'):
@@ -2440,7 +2517,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         # it rather than leaving it to carry a host from a wider one.
         full_results = _run_masscan_batch(['1-65535'], full_scan_rate, output_file,
                                           discovered_target, source_port, exclusions_file,
-                                          wait_secs=wait_secs)
+                                          wait_secs=wait_secs, net_override=net_override)
         os.makedirs(f'{disc}/live_hosts', exist_ok=True)
         for port_key, ips in full_results.items():
             # Union with the cached per-port file instead of replacing it, exactly
@@ -2494,7 +2571,8 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                 print(_COLOR_INFO + f'Probe: scanning port {port} at {max_rate} pps...' + _COLOR_RESET)
                 port_fast = _run_masscan_batch([port], max_rate,
                     f'{disc}/masscan_results/probe_fast_{pb_idx}.xml',
-                    discovered_target, source_port, exclusions_file, wait_secs=wait_secs)
+                    discovered_target, source_port, exclusions_file, wait_secs=wait_secs,
+                    net_override=net_override)
                 for k, v in port_fast.items():
                     fast_results.setdefault(k, set()).update(v)
                 fast_ips = {ip for s in port_fast.values() for ip in s}
@@ -2504,7 +2582,8 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
                 print(_COLOR_INFO + f'Probe found 0 hosts at {max_rate} pps — checking {half_rate} pps...' + _COLOR_RESET)
                 port_slow = _run_masscan_batch([port], half_rate,
                     f'{disc}/masscan_results/probe_slow_{pb_idx}.xml',
-                    discovered_target, source_port, exclusions_file, wait_secs=wait_secs)
+                    discovered_target, source_port, exclusions_file, wait_secs=wait_secs,
+                    net_override=net_override)
                 for k, v in port_slow.items():
                     slow_results.setdefault(k, set()).update(v)
                 slow_ips = {ip for s in port_slow.values() for ip in s}
@@ -2522,10 +2601,10 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
             print(_COLOR_INFO + f'Probe: scanning {probe_label} at {max_rate} pps then {half_rate} pps to check for packet loss...' + _COLOR_RESET)
             fast_results = _run_masscan_batch(probe_ports, max_rate,
                 f'{disc}/masscan_results/probe_fast.xml', discovered_target, source_port, exclusions_file,
-                wait_secs=wait_secs)
+                wait_secs=wait_secs, net_override=net_override)
             slow_results = _run_masscan_batch(probe_ports, half_rate,
                 f'{disc}/masscan_results/probe_slow.xml', discovered_target, source_port, exclusions_file,
-                wait_secs=wait_secs)
+                wait_secs=wait_secs, net_override=net_override)
             fast_ips = {ip for s in fast_results.values() for ip in s}
             slow_ips = {ip for s in slow_results.values() for ip in s}
             new_ips = slow_ips - fast_ips
@@ -2709,7 +2788,7 @@ def mass_scan(scan_type, dest_ports, source_port, max_rate, target_file, exclusi
         print(_COLOR_INFO + f'Scanning ports {batch_label}...' + _COLOR_RESET)
 
         batch_results = _run_masscan_batch(batch, effective_rate, output_file, batch_target, source_port, exclusions_file,
-                                           wait_secs=batch_wait_secs)
+                                           wait_secs=batch_wait_secs, net_override=net_override)
 
         if not batch_results:
             print(_COLOR_INFO + f'\nNo hosts found in batch {batch_idx + 1}/{total_batches} ({batch_label})' + _COLOR_RESET)
@@ -2843,7 +2922,7 @@ def _merge_script_args(*pairs):
 
 def _build_nmap_cmd(dest_port, input_file, output_file, source_port,
                     script_scan=False, target_scan='Internal', script_only=False,
-                    extra_script_args=None):
+                    extra_script_args=None, net_override=None):
     """Return the nmap command list for a single port scan.
 
     --source-port is omitted for SMB ports when scripts are active: nmap runs all
@@ -2863,6 +2942,7 @@ def _build_nmap_cmd(dest_port, input_file, output_file, source_port,
         ]
         if source_port and dest_port not in _MULTI_SCRIPT_PORTS:
             cmd += ['--source-port', source_port]
+        cmd += _nmap_network_args(net_override)
         cmd += ['-iL', input_file, '-oX', output_file]
         scripts = _get_scripts_for_port(dest_port, target_scan)
         if scripts:
@@ -2898,6 +2978,8 @@ def _build_nmap_cmd(dest_port, input_file, output_file, source_port,
         # 4-tuple collision between concurrent NSE connections
         if source_port and not (script_scan and dest_port in _MULTI_SCRIPT_PORTS):
             cmd += ['--source-port', source_port]
+
+    cmd += _nmap_network_args(net_override)
 
     # Greppable output alongside the XML, one file per port so that each has a
     # single writer.  nmap_scan() runs several workers concurrently, so a shared
@@ -2955,7 +3037,8 @@ def _quarantine_failed_output(output_file):
 
 def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                 interrupt_event, ip_to_hostname, script_scan=False,
-                target_scan='Internal', start_time=None, extra_script_args=None):
+                target_scan='Internal', start_time=None, extra_script_args=None,
+                net_override=None):
     """Worker thread function to process NMAP scans from queue"""
 
     def _report_nmap_failure(pass_label, dest_port, proc, stderr_output, output_file):
@@ -3044,6 +3127,7 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
             nmap_cmd = _build_nmap_cmd(
                 dest_port, input_file, output_file, source_port,
                 script_scan=script_scan, target_scan=target_scan,
+                net_override=net_override,
             )
             # Prior record goes before the scan that replaces its output, so an
             # externally killed nmap cannot leave a record claiming coverage of
@@ -3131,6 +3215,7 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                             dest_port, input_file, nse_output, source_port,
                             script_scan=True, target_scan=target_scan,
                             script_only=True, extra_script_args=extra_script_args,
+                            net_override=net_override,
                         )
                         _discard_coverage_record(nse_output)
                         nse_process = subprocess.Popen(
@@ -3186,7 +3271,8 @@ def nmap_worker(work_queue, completed_count, total_count, source_port, lock,
                     work_queue.task_done()
 
 def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
-              script_scan=False, target_scan='Internal', extra_script_args=None):
+              script_scan=False, target_scan='Internal', extra_script_args=None,
+              net_override=None):
     """
     Perform NMAP scans using multiple threads for efficiency
 
@@ -3277,7 +3363,7 @@ def nmap_scan(source_port, max_threads=5, ip_to_hostname=None,
                 target=nmap_worker,
                 args=(work_queue, completed_count, total_count, source_port, lock,
                       interrupt_event, ip_to_hostname, script_scan, target_scan,
-                      start_time, extra_script_args)
+                      start_time, extra_script_args, net_override)
             )
             thread.daemon = True
             thread.start()
@@ -3692,7 +3778,7 @@ SERVICE_CATEGORIES = {
 }
 
 
-def _scan_extra_sql_ports(output_path, source_port):
+def _scan_extra_sql_ports(output_path, source_port, net_override=None):
     """Scan SQL Server named instances discovered on non-standard ports."""
     discovered = {}  # {host_ip: [port, ...]}
 
@@ -3743,6 +3829,7 @@ def _scan_extra_sql_ports(output_path, source_port):
                         'nmap', '-n', '-T4', '-sS', '-sV', '--version-intensity', '0',
                         '-Pn', '-p', port,
                         *(['--source-port', source_port] if source_port else []),
+                        *_nmap_network_args(net_override),
                         ip, '-oX', out_file
                     ])
                     proc.wait()
@@ -3767,6 +3854,7 @@ def _scan_extra_sql_ports(output_path, source_port):
                     '--script', f'{_NSE_DIR}/azure-sql-detect.nse',
                     '--script-timeout', '30s',
                     *(['--source-port', source_port] if source_port else []),
+                    *_nmap_network_args(net_override),
                     ip, '-oX', nse_out_file
                 ])
                 proc.wait()
@@ -3776,7 +3864,7 @@ def _scan_extra_sql_ports(output_path, source_port):
                 restore_terminal_state(term_state)
 
 
-def _validate_snmp_any_community(nmap_dir, scan_type, extra_script_args=None):
+def _validate_snmp_any_community(nmap_dir, scan_type, extra_script_args=None, net_override=None):
     """Return dict {ip: True} for hosts confirmed to accept any SNMP community string."""
     import uuid as _uuid
     _ACCEPTS_ANY_THRESHOLD = 5
@@ -3824,6 +3912,7 @@ def _validate_snmp_any_community(nmap_dir, scan_type, extra_script_args=None):
                         '--script', 'snmp-brute',
                         '--script-args', script_args,
                         '--script-timeout', '30s',
+                        *_nmap_network_args(net_override),
                         ip,
                     ]
                     result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
@@ -6242,6 +6331,23 @@ _CONFIG_DOCS = {
          'TLS/JA3 fingerprinting, or scan rate/shape; those are unrelated to string '
          'substitution.'),
     ],
+    'interface': [
+        ('__network_override_note__',
+         'Optional, independent knobs for a host where masscan and/or nmap cannot '
+         'reliably auto-detect which interface, source IP, or next-hop gateway to '
+         'scan from — e.g. a host with more than one default route (common behind '
+         'NAT/VPN split-tunnel setups). All three default to absent/empty, meaning '
+         'masscan/nmap auto-detect as before; setting any one of them is enough to '
+         'activate the override for that tool. interface maps to masscan --interface '
+         'and nmap -e. source_ip maps to masscan --source-ip and nmap -S (nmap also '
+         'gets --disable-arp-ping automatically whenever source_ip is set, since '
+         "nmap's own ARP-ping host discovery bypasses -S/-e entirely and can "
+         'contradict the pinned identity against a target on the same local subnet). '
+         'router_ip maps to masscan --router-ip only — nmap resolves its own next-hop '
+         'once source/interface are fixed. An invalid interface name or a non-IPv4 '
+         'address in source_ip/router_ip stops the run rather than silently falling '
+         'back to auto-detection.'),
+    ],
 }
 
 # Canonical key order for a written config.json, matching config.json.sample.
@@ -6250,7 +6356,7 @@ _CONFIG_FIELD_ORDER = (
     'script_scan', 'host_discovery', 'resume', 'check_for_updates',
     'honeypot_active_confirm', 'target_scan', 'max_rate',
     'nmap_threads', 'nmap_threshold', 'target_file', 'output_path',
-    'exclusions_file', 'scanner_profile',
+    'exclusions_file', 'scanner_profile', 'interface', 'source_ip', 'router_ip',
 )
 
 
@@ -6259,7 +6365,8 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
                               output_path, exclusions_file, nmap_threads,
                               masscan_batch_size, nmap_threshold, host_discovery,
                               check_for_updates=False, scanner_profile=None,
-                              honeypot_active_confirm=False):
+                              honeypot_active_confirm=False, interface='',
+                              source_ip='', router_ip=''):
     """Build a config.json-compatible dict from interactively collected options.
 
     The result round-trips through main()'s config loader: reloading it
@@ -6297,6 +6404,13 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
     left out of ``values`` entirely when disabled so a regenerated config.json
     reads identically to one that never had it — not a `false` cluttering an
     otherwise-default file.
+
+    ``interface``/``source_ip``/``router_ip`` have no interactive prompt either
+    (see ``_config_network_override()``) and follow the same rule as a group:
+    all three are written together whenever any one of them is non-empty, so
+    the ``interface`` doc note (the only one of the three carrying one, since
+    it explains all three together) is never silently dropped because the
+    operator happened to only set ``source_ip``.
     """
     values = {
         'banner_scan': bool(banner_scan),
@@ -6320,6 +6434,10 @@ def _build_interactive_config(scan_categories, dest_ports, scan_type, banner_sca
         values['scan_categories'] = scan_categories
     if scanner_profile:
         values['scanner_profile'] = scanner_profile
+    if interface or source_ip or router_ip:
+        values['interface'] = interface or ''
+        values['source_ip'] = source_ip or ''
+        values['router_ip'] = router_ip or ''
 
     config = {_CONFIG_GENERATED_KEY: _CONFIG_GENERATED_NOTE}
     for key in _CONFIG_FIELD_ORDER:
@@ -6714,6 +6832,56 @@ def _validate_scanner_token(key, token):
                              f'disallowed character(s) {"".join(sorted(bad))!r}.'
                              + _COLOR_RESET)
         sys.exit(1)
+
+
+def _config_network_override(interface, source_ip, router_ip):
+    """Build a NetworkOverride from config.json's interface/source_ip/router_ip, or None.
+
+    The three fields are independent — any subset may be set — so a
+    NetworkOverride is returned whenever at least one is non-empty; None is
+    returned only when all three are absent/empty, matching this module's
+    universal "absent means off" rule for optional knobs. router_ip with no
+    interface is accepted (masscan does not require one), even though in
+    practice an operator pins interface and source_ip together.
+
+    Unlike _config_bool, an invalid value exits rather than warning and
+    falling back to disabled, the same posture as _config_scanner_profile():
+    an operator who set this is routing around a host where masscan/nmap's
+    own interface and next-hop auto-detection is already known to be
+    unreliable (see NetworkOverride above) — falling back silently would
+    either reproduce that exact failure or send the scan out a path the
+    operator never intended, neither of which should happen quietly.
+    """
+    interface = (interface or '').strip() or None
+    source_ip = (source_ip or '').strip() or None
+    router_ip = (router_ip or '').strip() or None
+
+    if interface is None and source_ip is None and router_ip is None:
+        return None
+
+    if interface is not None:
+        try:
+            socket.if_nametoindex(interface)
+        except OSError:
+            print(_COLOR_ERROR + f'ERROR: config.json: interface = {interface!r} is not '
+                                 'a network interface on this host.' + _COLOR_RESET)
+            sys.exit(1)
+
+    for key, value in (('source_ip', source_ip), ('router_ip', router_ip)):
+        if value is None:
+            continue
+        try:
+            ip_obj = ipaddress.ip_address(value)
+        except ValueError:
+            print(_COLOR_ERROR + f'ERROR: config.json: {key} = {value!r} is not a valid '
+                                 'IP address.' + _COLOR_RESET)
+            sys.exit(1)
+        if ip_obj.version != 4:
+            print(_COLOR_ERROR + f'ERROR: config.json: {key} = {value!r} must be IPv4 — '
+                                 'SpooNMAP scans IPv4 exclusively.' + _COLOR_RESET)
+            sys.exit(1)
+
+    return NetworkOverride(interface, source_ip, router_ip)
 
 
 def _generate_scanner_tokens(overrides):
@@ -7266,6 +7434,13 @@ def _load_config(config_parser, dir_path, resume=False):
     # only way to enable the active probe. See _maybe_confirm_honeypot().
     honeypot_active_confirm = _config_bool(
         'honeypot_active_confirm', config_parser.get('honeypot_active_confirm', False), False)
+    # All three optional and independent; absent/empty means masscan/nmap keep
+    # auto-detecting as before. See NetworkOverride and _config_network_override()
+    # for why a host can need this at all.
+    interface = config_parser.get('interface') or ''
+    source_ip = config_parser.get('source_ip') or ''
+    router_ip = config_parser.get('router_ip') or ''
+    net_override = _config_network_override(interface, source_ip, router_ip)
     config_generated = bool(config_parser.get(_CONFIG_GENERATED_KEY))
 
     # Resolve relative paths in config relative to the operator directory
@@ -7296,6 +7471,10 @@ def _load_config(config_parser, dir_path, resume=False):
         'check_for_updates': check_for_updates,
         'scanner_profile': scanner_profile,
         'honeypot_active_confirm': honeypot_active_confirm,
+        'interface': interface,
+        'source_ip': source_ip,
+        'router_ip': router_ip,
+        'net_override': net_override,
         'config_generated': config_generated,
     }
 
@@ -7519,6 +7698,10 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         check_for_updates = False  # no interactive prompt; only set via config.json
         scanner_profile = None  # no interactive prompt; only set via config.json
         honeypot_active_confirm = False  # no interactive prompt; only set via config.json
+        interface = ''  # no interactive prompt; only set via config.json
+        source_ip = ''  # no interactive prompt; only set via config.json
+        router_ip = ''  # no interactive prompt; only set via config.json
+        net_override = None  # derived from interface/source_ip/router_ip above
 
 
         # Get options from configuration file if it exists
@@ -7558,6 +7741,10 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
             check_for_updates  = cfg['check_for_updates']
             scanner_profile    = cfg['scanner_profile']
             honeypot_active_confirm = cfg['honeypot_active_confirm']
+            interface          = cfg['interface']
+            source_ip          = cfg['source_ip']
+            router_ip          = cfg['router_ip']
+            net_override       = cfg['net_override']
 
             _maybe_check_for_updates(check_for_updates)
 
@@ -7869,6 +8056,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 target_scan, max_rate, target_file, output_path, exclusions_file,
                 nmap_threads, masscan_batch_size, nmap_threshold, host_discovery,
                 check_for_updates, scanner_profile, honeypot_active_confirm,
+                interface, source_ip, router_ip,
             )
             config_json_path = f'{dir_path}/config.json'
             if _write_interactive_config(config_json_path, interactive_config):
@@ -7976,7 +8164,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
         if host_discovery:
             discovery_file = _host_discovery(
                 masscan_target_file, output_path, max_rate, exclusions_file,
-                scan_type=target_scan, resume=resume,
+                scan_type=target_scan, resume=resume, net_override=net_override,
             )
         else:
             discovery_file = None
@@ -8005,6 +8193,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 _tcp_dest_ports, _count_file, source_port,
                 exclusions_file, scan_type=scan_type, resume=resume,
                 max_rate=max_rate, total_hosts=effective_host_count,
+                net_override=net_override,
             )
             # UDP ports are always discovered via nmap regardless of the TCP tool chosen.
             disc = _disc(output_path)
@@ -8014,6 +8203,7 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 ips = _nmap_udp_discovery(
                     udp_port, udp_target, output_path,
                     source_port, exclusions_file, resume=resume,
+                    net_override=net_override,
                 )
                 if ips:
                     with open(f'{disc}/live_hosts/port{_port_fname(udp_port)}.txt', 'w') as f:
@@ -8036,12 +8226,13 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 resume=resume, discovery_file=discovery_file,
                 target_scan=target_scan,
                 honeypot_active_confirm=honeypot_active_confirm,
+                net_override=net_override,
             )
 
         # If service banners requested, send to nmap
         if banner_scan or script_scan:
             nmap_scan(source_port, nmap_threads, ip_to_hostname, script_scan, target_scan,
-                     extra_script_args)
+                     extra_script_args, net_override=net_override)
             udp_confirmed = _filter_udp_live_hosts(output_path)
             for port_key, count in udp_confirmed.items():
                 lines = status_summary.split('\n')
@@ -8056,12 +8247,12 @@ def main():  # pragma: no cover -- interactive CLI entry point; orchestrates
                 status_summary = '\n'.join(updated)
 
             if script_scan and target_scan == 'Internal':
-                _scan_extra_sql_ports(output_path, source_port)
+                _scan_extra_sql_ports(output_path, source_port, net_override=net_override)
 
             snmp_any_validated = {}
             if script_scan:
                 snmp_any_validated = _validate_snmp_any_community(
-                    output_path, target_scan, extra_script_args)
+                    output_path, target_scan, extra_script_args, net_override=net_override)
                 ip_to_hostname = _merge_ssl_cert_hostnames(output_path, ip_to_hostname)
 
         # Combine all live hosts into one file
