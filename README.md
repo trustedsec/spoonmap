@@ -309,6 +309,9 @@ git update-index --no-skip-worktree ranges.txt
 | `check_for_updates` | `"True"` / `"False"` | Contact api.github.com at startup to check for a newer release. Off unless set; see `--check-update` for a one-off check (default: False) |
 | `scanner_profile` | `false`, `"random"`, or an object | Substitutes strings that identify nmap/SpooNMAP in probe traffic (e.g. the RDP probe's `mstshash=nmap` cookie). Off unless set — see below |
 | `honeypot_active_confirm` | `"True"` / `"False"` | Actively confirm suspected decoy hosts with a few raw TCP connects to unscanned high ports. Off unless set; only probes in-scope hosts flagged by the TTL-spread or port-profile signals, and only on the masscan scan path (default: False) |
+| `interface` | Interface name | Pin the network interface masscan/nmap scan from. Off unless set — see below |
+| `source_ip` | IPv4 address | Pin the source IP masscan/nmap scan from. Off unless set — see below |
+| `router_ip` | IPv4 address | Pin the next-hop gateway masscan ARPs for (masscan only; nmap resolves its own next-hop). Off unless set — see below |
 | `__generated_by_prompts__` | String | Present only in a config the prompts wrote. While it is present, **[d]elete**/**[a]ppend** re-ask the options using this file's values as defaults; remove it to keep them fixed |
 
 Keys beginning and ending with `__` are documentation and are ignored by the loader, so you can annotate the file freely — a re-prompted run preserves them.
@@ -340,6 +343,40 @@ Every run writes `scan_profile.json` next to your other output, recording exactl
 **What this does not do:** it has no effect on TCP/IP stack fingerprinting (nmap's `-sS` SYN characteristics), TLS/JA3 fingerprinting (only the ClientHello `Random` field changes, not cipher/extension ordering), or scan rate and shape. It substitutes strings inside probe payloads, nothing else.
 
 If the substitution can't be verified as actually taking effect — including because nmap's data directory can't be located — the run aborts rather than scanning under a false assumption of evasion.
+
+### interface / source_ip / router_ip: fixing ambiguous routing
+
+On a host with more than one default route — a hypervisor's shared-network/NAT
+adapter alongside a real LAN gateway, or a VPN client's split-tunnel setup are
+the two common cases — masscan and nmap can't reliably auto-detect which
+interface, source IP, or next-hop gateway to scan from. Symptoms range from
+masscan refusing to start at all (`FAIL: could not determine default
+interface`) to nmap silently reporting every host down or every port filtered
+while an ordinary `curl`/`nc` to the same target works fine.
+
+All three keys are optional and independent; setting any one of them activates
+the override for that tool, and absent/empty means masscan/nmap keep
+auto-detecting exactly as before:
+
+```jsonc
+"interface": "eth0",
+"source_ip": "10.0.0.5",
+"router_ip": ""
+```
+
+`interface` maps to masscan `--interface` and nmap `-e`. `source_ip` maps to
+masscan `--source-ip` and nmap `-S` (nmap also gets `--disable-arp-ping`
+automatically, since its own ARP-ping host discovery otherwise bypasses `-S`/`-e`
+entirely). `router_ip` maps to masscan `--router-ip` only — nmap resolves its
+own next-hop once `interface`/`source_ip` are fixed.
+
+To find the right values on your scanning host: `ip route`/`netstat -rn` shows
+your default route(s) and which interface they're on, and `ip addr`/`ifconfig`
+shows which IP(s) that interface actually owns. `source_ip` must be an address
+the interface actually holds — a routing table entry for some other host is
+not a valid source. An invalid interface name or a non-IPv4 address in
+`source_ip`/`router_ip` stops the run rather than silently falling back to
+auto-detection.
 
 ### max_rate guidance
 Rates that are too high can create a denial-of-service condition — use caution.
