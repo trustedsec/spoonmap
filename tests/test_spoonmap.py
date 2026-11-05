@@ -3033,6 +3033,31 @@ class TestServiceCategoriesDockerPorts:
         assert '7002' in sensitive_ports
 
 
+# ── Search & Observability category (Elasticsearch / Kibana) ─────────────────
+
+class TestSearchObservabilityCategory:
+    def test_category_exists_with_elastic_stack_ports(self):
+        assert SERVICE_CATEGORIES['Search & Observability'] == ['9200', '9300', '5601']
+
+    def test_category_is_a_real_entry(self):
+        # "Full Port Scan" is numbered len(SERVICE_CATEGORIES)+1, so the new
+        # category must be a real entry rather than a hidden special case.
+        assert 'Search & Observability' in list(SERVICE_CATEGORIES)
+
+    def test_kibana_and_transport_ports_flagged_external_high(self):
+        sensitive = {p: sev for p, sev, _ in EXTERNAL_SENSITIVE_PORTS}
+        assert sensitive['5601'] == 'HIGH'
+        assert sensitive['9300'] == 'HIGH'
+
+    def test_kibana_detect_runs_on_5601_both_scan_types(self):
+        assert 'kibana-detect.nse' in EXTERNAL_PORT_SCRIPTS['5601']
+        assert 'kibana-detect.nse' in INTERNAL_PORT_SCRIPTS['5601']
+
+    def test_kibana_detect_script_file_ships(self):
+        assert os.path.isfile(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), 'nse', 'kibana-detect.nse'))
+
+
 # ── LDAP / SMB category split ─────────────────────────────────────────────────
 
 class TestLdapSmbCategorySplit:
@@ -7558,6 +7583,35 @@ class TestInternalNseFindings:
         content = (nmap_dir / 'findings.txt').read_text()
         assert 'KoboldCpp LLM API Unauthenticated' in content
         assert 'MEDIUM' in content
+
+    def test_kibana_internal_medium(self, nmap_dir):
+        """kibana-detect output on internal scan -> MEDIUM finding."""
+        xml = _nmap_xml('10.0.2.5', 'tcp', '5601',
+                        scripts={'kibana-detect': 'Kibana accessible without authentication \u2014 version: 8.11.0'})
+        (nmap_dir / 'nse_results' / 'port5601.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        content = (nmap_dir / 'findings.txt').read_text()
+        assert 'Kibana Unauthenticated' in content
+        assert 'MEDIUM' in content
+        assert '10.0.2.5' in content
+
+    def test_kibana_external_high(self, nmap_dir):
+        """kibana-detect output on external scan -> HIGH finding."""
+        xml = _nmap_xml('1.2.3.4', 'tcp', '5601',
+                        scripts={'kibana-detect': 'Kibana accessible without authentication \u2014 version: 8.11.0'})
+        (nmap_dir / 'nse_results' / 'port5601.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'External')
+        content = (nmap_dir / 'findings.txt').read_text()
+        assert 'Kibana Unauthenticated' in content
+        assert 'HIGH' in content
+
+    def test_kibana_empty_output_no_finding(self, nmap_dir):
+        xml = _nmap_xml('10.0.2.5', 'tcp', '5601', scripts={'kibana-detect': ''})
+        (nmap_dir / 'nse_results' / 'port5601.xml').write_text(xml)
+        generate_findings(str(nmap_dir), 'Internal')
+        findings_file = nmap_dir / 'findings.txt'
+        if findings_file.exists():
+            assert 'Kibana Unauthenticated' not in findings_file.read_text()
 
     def test_llm_no_finding_for_empty_output(self, nmap_dir):
         """ollama-detect with empty output → no finding generated."""

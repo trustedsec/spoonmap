@@ -111,7 +111,8 @@ Service Categories (comma-separated numbers, default: All)
 	(9) Specialized  [1090, 3300, 4786, 6970, 2375, 4243, 9100, 8530, 8531]
 	(10) Containers & Debuggers  [2377, 10250, 8001, 9229, 2345, 5005, 61616, 8009, 6000]
 	(11) Local LLM  [11434, 1234, 7860, 5000, 5001, 1337, 3000, 8000, 8080]
-	(12) Full Port Scan  [1-65535, TCP only — no UDP]
+	(12) Search & Observability  [9200, 9300, 5601]
+	(13) Full Port Scan  [1-65535, TCP only — no UDP]
 	(c) Custom Port Scan  [enter your own comma-separated ports]
 
 (The Full Port Scan number increments automatically with the number of categories.)
@@ -573,9 +574,9 @@ Written for the banner scan only; a masscan-only run (`banner_scan` off) produce
 
 When `script_scan` is enabled, nmap runs targeted NSE scripts against relevant ports. Scripts are chosen based on scan type (External vs Internal):
 
-**External scans** run: `ftp-anon`, `ssh-auth-methods`, `ssh2-enum-algos`, `*-ntlm-info`, `ssl-cert`, `ms-sql-ntlm-info`, `rdp-ntlm-info`, `docker-version`, `snmp-brute`, `snmp-sysdescr`, `ajp-headers`, `x11-access`, `dameware-detect` (custom, 6129), `cucm-detect` (custom, 6970), `ipmi-version`, `ipmi-cipher-zero`, `ipmi-hashdump` (custom, U:623), `ike-version` (U:500), `openvpn-detect` (custom, U:1194/1194), `vnc-info`, `realvnc-auth-bypass`, `vnc-title` (5900, 5901), `ollama-detect` (custom, 11434), `openai-api-detect` (custom, 1234/1337/3000/8000), `gradio-detect` (custom, 7860), `koboldcpp-detect` (custom, 5001)
+**External scans** run: `ftp-anon`, `ssh-auth-methods`, `ssh2-enum-algos`, `*-ntlm-info`, `ssl-cert`, `ms-sql-ntlm-info`, `rdp-ntlm-info`, `docker-version`, `snmp-brute`, `snmp-sysdescr`, `ajp-headers`, `x11-access`, `dameware-detect` (custom, 6129), `cucm-detect` (custom, 6970), `ipmi-version`, `ipmi-cipher-zero`, `ipmi-hashdump` (custom, U:623), `ike-version` (U:500), `openvpn-detect` (custom, U:1194/1194), `vnc-info`, `realvnc-auth-bypass`, `vnc-title` (5900, 5901), `ollama-detect` (custom, 11434), `openai-api-detect` (custom, 1234/1337/3000/8000), `gradio-detect` (custom, 7860), `koboldcpp-detect` (custom, 5001), `kibana-detect` (custom, 5601)
 
-**Internal scans** run: `ftp-anon`, `rpcinfo`, `nfs-showmount`, `nfs-ls`, `smb-security-mode`, `smb2-security-mode`, `smb-vuln-ms17-010`, `smb-vuln-ms08-067`, `smb-double-pulsar-backdoor`, `smb-vuln-cve-2017-7494`, `rmi-dumpregistry`, `ms-sql-info`, `docker-version`, `snmp-brute`, `snmp-sysdescr`, `ajp-headers`, `x11-access`, `jdwp-info` (5005), `http-title` (8001), `banner` (61616), `dameware-detect` (custom, 6129), `cucm-detect` (custom, 6970), `nodejs-inspector` (custom, 9229), `kubelet-anon-check` (custom, 10250), `delve-debugger` (custom, 2345), `ipmi-version`, `ipmi-cipher-zero`, `ipmi-hashdump` (custom, U:623), `ike-version` (U:500), `openvpn-detect` (custom, U:1194/1194), `vnc-info`, `realvnc-auth-bypass`, `vnc-title` (5900, 5901), `ollama-detect` (custom, 11434), `openai-api-detect` (custom, 1234/1337/3000/8000), `gradio-detect` (custom, 7860), `koboldcpp-detect` (custom, 5001)
+**Internal scans** run: `ftp-anon`, `rpcinfo`, `nfs-showmount`, `nfs-ls`, `smb-security-mode`, `smb2-security-mode`, `smb-vuln-ms17-010`, `smb-vuln-ms08-067`, `smb-double-pulsar-backdoor`, `smb-vuln-cve-2017-7494`, `rmi-dumpregistry`, `ms-sql-info`, `docker-version`, `snmp-brute`, `snmp-sysdescr`, `ajp-headers`, `x11-access`, `jdwp-info` (5005), `http-title` (8001), `banner` (61616), `dameware-detect` (custom, 6129), `cucm-detect` (custom, 6970), `nodejs-inspector` (custom, 9229), `kubelet-anon-check` (custom, 10250), `delve-debugger` (custom, 2345), `ipmi-version`, `ipmi-cipher-zero`, `ipmi-hashdump` (custom, U:623), `ike-version` (U:500), `openvpn-detect` (custom, U:1194/1194), `vnc-info`, `realvnc-auth-bypass`, `vnc-title` (5900, 5901), `ollama-detect` (custom, 11434), `openai-api-detect` (custom, 1234/1337/3000/8000), `gradio-detect` (custom, 7860), `koboldcpp-detect` (custom, 5001), `kibana-detect` (custom, 5601)
 
 Port 9100 (JetDirect raw printing protocol) is included in the Specialized category. Hosts with port 9100 open are identified as printers; SNMP default community string and anonymous FTP findings are suppressed for these hosts to reduce noise.
 
@@ -677,6 +678,8 @@ On External scans, each externally-exposed sensitive service is additionally vul
 | 3000, 8000 | OpenAI-compatible LLM API | Custom NSE (`openai-api-detect`) probes `/v1/models` with three-string fingerprint to avoid false positives on generic web apps |
 | 7860 | Gradio / text-generation-webui | Custom NSE (`gradio-detect`) probes `/info` (fallback: `/`); unauthenticated access to LLM web UI |
 | 5001 | KoboldCpp | Custom NSE (`koboldcpp-detect`) probes `/api/v1/model`; unauthenticated inference API exposes loaded model |
+| 9200, 9300 | Elasticsearch | Flagged as exposed on External scans (HIGH); 9200 is the REST API, 9300 the node-to-node transport port |
+| 5601 | Kibana / OpenSearch Dashboards | Custom NSE (`kibana-detect`) probes `/api/status` and requires Kibana's version/status JSON shape; a 401 (security enabled) is not reported |
 | 8530, 8531 | Microsoft WSUS | Custom NSE (`wsus-detect`) probes the WSUS web-service endpoints (e.g. `/ClientWebService/client.asmx`) to identify WSUS; detection only — review CVE-2025-59287 (unauth RCE, CVSS 9.8) patch status |
 
 ### References

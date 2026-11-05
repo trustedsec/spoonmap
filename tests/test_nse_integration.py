@@ -468,6 +468,52 @@ class TestGradioDetectNse:
         assert 'gradio-detect' not in output
 
 
+# ── kibana-detect ─────────────────────────────────────────────────────────────
+
+_KIBANA_PORT   = 5601
+_KIBANA_SCRIPT = os.path.join(_NSE_DIR, 'kibana-detect.nse')
+
+_KIBANA_VALID = (
+    b'HTTP/1.0 200 OK\r\n'
+    b'Content-Type: application/json\r\n\r\n'
+    b'{"name":"kibana","version":{"number":"8.11.0","build_flavor":"traditional"},'
+    b'"status":{"overall":{"level":"available"}}}'
+)
+_KIBANA_UNAUTHORIZED = (
+    b'HTTP/1.0 401 Unauthorized\r\n'
+    b'Content-Type: application/json\r\n\r\n'
+    b'{"statusCode":401,"error":"Unauthorized","message":"Unauthorized"}'
+)
+_KIBANA_NOT_KIBANA = (
+    b'HTTP/1.0 200 OK\r\n'
+    b'Content-Type: application/json\r\n\r\n'
+    b'{"status":"ok","version":"1.0"}'
+)
+
+
+class TestKibanaDetectNse:
+    required_tcp_port = _KIBANA_PORT
+
+    def test_detects_unauthenticated_kibana(self):
+        """Stub returns a Kibana /api/status body -> script reports access and version."""
+        with _StubServer(_KIBANA_PORT, _KIBANA_VALID):
+            output = _run_nmap(_KIBANA_PORT, _KIBANA_SCRIPT)
+        assert 'Kibana accessible without authentication' in output
+        assert '8.11.0' in output
+
+    def test_no_output_when_auth_enforced(self):
+        """401 means security is on -> no finding."""
+        with _StubServer(_KIBANA_PORT, _KIBANA_UNAUTHORIZED):
+            output = _run_nmap(_KIBANA_PORT, _KIBANA_SCRIPT)
+        assert 'kibana-detect' not in output
+
+    def test_no_output_for_non_kibana_service(self):
+        """200 JSON with status/version keys but not Kibana's shape -> no output."""
+        with _StubServer(_KIBANA_PORT, _KIBANA_NOT_KIBANA):
+            output = _run_nmap(_KIBANA_PORT, _KIBANA_SCRIPT)
+        assert 'kibana-detect' not in output
+
+
 # ── koboldcpp-detect ──────────────────────────────────────────────────────────
 
 _KOBOLD_PORT   = 5001
