@@ -3667,6 +3667,8 @@ EXTERNAL_PORT_SCRIPTS = {
     '3000':  f'{_NSE_DIR}/openai-api-detect.nse',
     '5001':  f'{_NSE_DIR}/koboldcpp-detect.nse',
     '7860':  f'{_NSE_DIR}/gradio-detect.nse',
+    # Search & Observability
+    '5601':  f'{_NSE_DIR}/kibana-detect.nse',
     '8000':  f'{_NSE_DIR}/openai-api-detect.nse',
 }
 
@@ -3725,6 +3727,8 @@ INTERNAL_PORT_SCRIPTS = {
     '3000':  f'{_NSE_DIR}/openai-api-detect.nse',
     '5001':  f'{_NSE_DIR}/koboldcpp-detect.nse',
     '7860':  f'{_NSE_DIR}/gradio-detect.nse',
+    # Search & Observability
+    '5601':  f'{_NSE_DIR}/kibana-detect.nse',
     '8000':  f'{_NSE_DIR}/openai-api-detect.nse',
 }
 
@@ -3767,6 +3771,8 @@ EXTERNAL_SENSITIVE_PORTS = [
     ('5432',  'HIGH', 'PostgreSQL — database port should not be internet-facing'),
     ('6379',  'HIGH', 'Redis — database port should not be internet-facing'),
     ('9200',  'HIGH', 'Elasticsearch — should not be internet-facing'),
+    ('9300',  'HIGH', 'Elasticsearch transport — node-to-node cluster port should not be internet-facing'),
+    ('5601',  'HIGH', 'Kibana — dashboard/management UI should not be internet-facing'),
     ('27017', 'HIGH', 'MongoDB — database port should not be internet-facing'),
     ('111',   'HIGH', 'RPC/NFS — should not be internet-facing'),
     ('U:161', 'HIGH', 'SNMP — should not be internet-facing'),
@@ -3861,6 +3867,9 @@ SERVICE_CATEGORIES = {
     ],
     'Local LLM': [
         '11434', '1234', '7860', '5000', '5001', '1337', '3000', '8000', '8080',
+    ],
+    'Search & Observability': [
+        '9200', '9300', '5601'
     ],
 }
 
@@ -5051,6 +5060,11 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                     detail = gradio_out.strip()[:200]
                     add(sev_llm, ip, port_str, 'Gradio LLM Web UI Accessible', detail)
 
+                kibana_out = scripts.get('kibana-detect', '')
+                if kibana_out.strip():
+                    detail = kibana_out.strip()[:200]
+                    add(sev_llm, ip, port_str, 'Kibana Unauthenticated', detail)
+
                 kobold_out = scripts.get('koboldcpp-detect', '')
                 if kobold_out.strip():
                     detail = kobold_out.strip()[:200]
@@ -5673,6 +5687,20 @@ _FINDING_REPRO = {
             '7860/tcp open  gradio\n'
             '| gradio-detect:\n'
             '|_  Gradio web UI accessible \u2014 version: 3.50.2'
+        ),
+    },
+    'Kibana Unauthenticated': {
+        'flags': f'--script {_NSE_DIR}/kibana-detect.nse',
+        'extra_cmds': [
+            'curl -s http://{host}:5601/api/status | python3 -m json.tool',
+            'curl -s http://{host}:5601/api/saved_objects/_find?type=index-pattern',
+            'curl -s http://{host}:9200/_cat/indices?v  # if Elasticsearch is also reachable',
+        ],
+        'sample': (
+            'PORT     STATE SERVICE\n'
+            '5601/tcp open  kibana\n'
+            '| kibana-detect:\n'
+            '|_  Kibana accessible without authentication \u2014 version: 8.11.0'
         ),
     },
     'KoboldCpp LLM API Unauthenticated': {
