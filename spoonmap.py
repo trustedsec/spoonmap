@@ -4375,7 +4375,25 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                 'Microsoft support and no longer receives security updates. '
                 + ms_sql_output[:300])
         else:
-            add('LOW', ip, port_str, 'SQL Server Instance Discovered', ms_sql_output[:300])
+            add('LOW', _sql_endpoint_label(ip, port_str),
+                'various', 'SQL Server Instances Identified', ms_sql_output[:300])
+
+    def _sql_endpoint_label(ip, port_str):
+        """Format an 'ip:port' label for the consolidated SQL discovery finding.
+
+        A bare on-prem/unclassified SQL Server sighting (no EOL or Azure signal)
+        isn't actionable on its own — an operator just wants the inventory of
+        where SQL Server is listening, not one finding per port it happened to
+        be found on. Every such sighting is grouped under one finding ('various'
+        as its constant port_str) with this label as the 'host' field, so
+        findings.txt/.md/.json all render it as a flat IP:port list instead of
+        splitting into a separate group per discovered port. The protocol is
+        kept only for UDP (the SQL Server Browser probe on 1434) since a SQL
+        Server endpoint is otherwise always TCP and a bare port number already
+        reads as the IP:port convention operators expect.
+        """
+        proto, pnum = port_str.split('/', 1)
+        return f'{ip}:{pnum}/udp' if proto == 'udp' else f'{ip}:{pnum}'
 
     def port_str_from_fname(fname):
         """Derive a port string from a filename like port445.xml or portU_1434.xml."""
@@ -4900,7 +4918,8 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                                 f'{basis} Azure SQL Database/Managed Instance (managed, evergreen '
                                 f'service) — {az_out_flat}')
                         else:
-                            add('LOW', ip, port_str, 'SQL Server PRELOGIN Probe', az_out_flat)
+                            add('LOW', _sql_endpoint_label(ip, port_str),
+                                'various', 'SQL Server Instances Identified', az_out_flat)
 
                 # ── ipmi-cipher-zero (CVE-2013-4786 Cipher Zero auth bypass) ──
                 if 'ipmi-cipher-zero' in scripts:
@@ -5435,20 +5454,6 @@ _FINDING_REPRO = {
             '|_Subject Alternative Name: DNS:example.corp, DNS:www.example.corp'
         ),
     },
-    'SQL Server Instance Discovered': {
-        'flags': '--script ms-sql-info',
-        'sample': (
-            'PORT     STATE SERVICE\n'
-            '1433/tcp open  ms-sql-s\n'
-            '| ms-sql-info:\n'
-            '|   10.0.0.5\\MSSQLSERVER:\n'
-            '|     Instance name: MSSQLSERVER\n'
-            '|     Version:\n'
-            '|       name: Microsoft SQL Server 2019 RTM\n'
-            '|       number: 15.00.2000.00\n'
-            '|_      Product: Microsoft SQL Server 2019'
-        ),
-    },
     'End-of-Life SQL Server': {
         'flags': '--script ms-sql-info',
         'sample': (
@@ -5474,19 +5479,6 @@ _FINDING_REPRO = {
             '|     FEDAUTHREQUIRED=1\n'
             '|     ENCRYPT=REQUIRED\n'
             '|_    CERT_SAN=myserver.database.windows.net'
-        ),
-    },
-    'SQL Server PRELOGIN Probe': {
-        'flags': f'--script {_NSE_DIR}/azure-sql-detect.nse',
-        'sample': (
-            'PORT     STATE SERVICE\n'
-            '1433/tcp open  ms-sql-s\n'
-            '| azure-sql-detect: No Azure SQL Gateway signals detected\n'
-            '|   Reported version: 15.0.2000.0\n'
-            '|   Raw signals:\n'
-            '|     FEDAUTHREQUIRED=not offered\n'
-            '|     ENCRYPT=ON\n'
-            '|_    CERT_SAN=none'
         ),
     },
     'SNMP Default Community String': {

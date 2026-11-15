@@ -6850,7 +6850,7 @@ class TestMsSqlInfoUdp1434:
         (nmap_dir / 'nse_results' / 'portU:1434.xml').write_text(_MS_SQL_INFO_UDP_XML)
         generate_findings(str(nmap_dir), 'Internal')
         content = (nmap_dir / 'findings.txt').read_text()
-        assert 'SQL Server Instance Discovered' in content
+        assert 'SQL Server Instances Identified' in content
         assert '192.168.1.10' in content
 
     def test_hostscript_produces_finding(self, nmap_dir):
@@ -6860,7 +6860,7 @@ class TestMsSqlInfoUdp1434:
         (nmap_dir / 'nse_results' / 'portU:1434.xml').write_text(xml)
         generate_findings(str(nmap_dir), 'Internal')
         content = (nmap_dir / 'findings.txt').read_text()
-        assert 'SQL Server Instance Discovered' in content
+        assert 'SQL Server Instances Identified' in content
         assert '192.168.1.10' in content
 
     def test_no_finding_for_external_scan(self, nmap_dir):
@@ -6869,7 +6869,36 @@ class TestMsSqlInfoUdp1434:
         generate_findings(str(nmap_dir), 'External')
         findings_file = nmap_dir / 'findings.txt'
         if findings_file.exists():
-            assert 'SQL Server Instance Discovered' not in findings_file.read_text()
+            assert 'SQL Server Instances Identified' not in findings_file.read_text()
+
+    def test_multiple_ports_consolidate_into_one_ip_port_list(self, nmap_dir):
+        """Bare SQL sightings on different ports must collapse into a single
+        finding listing each instance as 'ip:port', not one finding per port.
+
+        One host is seen via the UDP 1434 ms-sql-info browser probe, another
+        via azure-sql-detect's on-prem (non-Azure) branch on a named-instance
+        TCP port — two different code paths that both feed the same
+        consolidated finding.
+        """
+        xml_a = _nmap_xml_hostscript('10.0.0.40', 'udp', '1434',
+                                      hostscripts={'ms-sql-info': 'name: Microsoft SQL Server 2019 RTM'})
+        (nmap_dir / 'nse_results' / 'portU_1434.xml').write_text(xml_a)
+        xml_b = _nmap_xml('10.0.0.41', 'tcp', '51234', scripts={
+            'azure-sql-detect': 'FEDAUTHREQUIRED=0 ENCRYPT=ON version 15.00.2000',
+        })
+        (nmap_dir / 'nse_results' / 'port51234_sql.xml').write_text(xml_b)
+
+        generate_findings(str(nmap_dir), 'Internal')
+
+        records = json.loads((nmap_dir / 'findings.json').read_text())
+        sql_records = [r for r in records if r['title'] == 'SQL Server Instances Identified']
+        assert {r['host'] for r in sql_records} == {'10.0.0.40:1434/udp', '10.0.0.41:51234'}
+        assert {r['port'] for r in sql_records} == {'various'}
+
+        txt = (nmap_dir / 'findings.txt').read_text()
+        assert txt.count('[SQL Server Instances Identified]') == 1
+        assert '10.0.0.40:1434/udp' in txt
+        assert '10.0.0.41:51234' in txt
 
 
 # ── _scan_extra_sql_ports ─────────────────────────────────────────────────────
@@ -7273,7 +7302,7 @@ class TestGenerateFindingsSqlEolAndAzure:
         (nmap_dir / 'nse_results' / 'port1434.xml').write_text(xml)
         generate_findings(str(nmap_dir), 'Internal')  # must not raise
         txt = (nmap_dir / 'findings.txt').read_text()
-        assert 'SQL Server Instance Discovered' in txt
+        assert 'SQL Server Instances Identified' in txt
 
     def test_onprem_eol_sql_2014_is_high(self, nmap_dir):
         xml = _nmap_xml_hostscript(
@@ -7332,7 +7361,7 @@ class TestGenerateFindingsSqlEolAndAzure:
         (nmap_dir / 'nse_results' / 'port1433.xml').write_text(xml)
         generate_findings(str(nmap_dir), 'Internal')
         txt = (nmap_dir / 'findings.txt').read_text()
-        assert 'SQL Server PRELOGIN Probe' in txt
+        assert 'SQL Server Instances Identified' in txt
         assert 'Azure SQL Database Detected' not in txt
 
     def test_azure_sql_detect_runs_on_external_scan_too(self, nmap_dir):
