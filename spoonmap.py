@@ -650,6 +650,9 @@ _PRODUCT_VERSION_RE = re.compile(
     r'^\s*Product_Version:\s*(\d+\.\d+\.\d+)\s*$', re.MULTILINE)
 _SMB_OS_LINE_RE = re.compile(r'^\s*OS:\s*(.+?)\s*$', re.MULTILINE)
 _SMB_FQDN_LINE_RE = re.compile(r'^\s*FQDN:\s*(.+?)\s*$', re.MULTILINE)
+# An NFS export line from nfs-showmount ("/exports *") or nfs-ls
+# ("Volume /exports"); see generate_findings().
+_NFS_EXPORT_LINE_RE = re.compile(r'^\s*(?:Volume\s+)?/', re.MULTILINE)
 
 
 def _extract_os_details(scripts):
@@ -4647,10 +4650,14 @@ def generate_findings(output_path, target_scan, snmp_any_validated=None):
                                 f'Internal host details exposed: {detail}')
 
                 # ── nfs-showmount / nfs-ls ────────────────────────────────
+                # Require an actual export path (nfs-showmount: "/path ...",
+                # nfs-ls: "Volume /path") rather than any non-empty output:
+                # nfs-showmount reports an empty export list as the literal
+                # "No NFS mounts available", which is not an exposed share.
                 for sid in ('nfs-showmount', 'nfs-ls'):
                     if sid in scripts and target_scan == 'Internal':
                         out = scripts[sid].strip()
-                        if out:
+                        if _NFS_EXPORT_LINE_RE.search(out):
                             add('HIGH', ip, port_str, 'NFS Shares Exposed',
                                 f'NFS mount points visible: {out[:200]}')
 
