@@ -1760,6 +1760,35 @@ class TestGenerateFindings:
         generate_findings(str(nmap_dir), 'Internal')
         assert 'SAP Gateway' in (nmap_dir / 'findings.txt').read_text()
 
+    # ── nfs-showmount / nfs-ls ───────────────────────────────────────────────
+
+    def test_nfs_no_mounts_available_is_not_a_finding(self, nmap_dir):
+        # nfs-showmount.nse returns this literal string when rpcbind answers
+        # but the export list is empty; it is not an exposed share.
+        (nmap_dir / 'nse_results' / 'port111.xml').write_text(
+            _nmap_xml('10.0.0.1', 'tcp', '111',
+                      scripts={'nfs-showmount': 'No NFS mounts available'})
+        )
+        generate_findings(str(nmap_dir), 'Internal')
+        findings = nmap_dir / 'findings.txt'
+        assert not findings.exists() or 'NFS Shares Exposed' not in findings.read_text()
+
+    def test_nfs_showmount_export_is_a_finding(self, nmap_dir):
+        (nmap_dir / 'nse_results' / 'port111.xml').write_text(
+            _nmap_xml('10.0.0.1', 'tcp', '111',
+                      scripts={'nfs-showmount': '\n  /exports *\n  /home 10.0.0.0/24'})
+        )
+        generate_findings(str(nmap_dir), 'Internal')
+        assert 'NFS Shares Exposed' in (nmap_dir / 'findings.txt').read_text()
+
+    def test_nfs_ls_volume_listing_is_a_finding(self, nmap_dir):
+        (nmap_dir / 'nse_results' / 'port111.xml').write_text(
+            _nmap_xml('10.0.0.1', 'tcp', '111',
+                      scripts={'nfs-ls': 'Volume /exports\n  access: Read Lookup'})
+        )
+        generate_findings(str(nmap_dir), 'Internal')
+        assert 'NFS Shares Exposed' in (nmap_dir / 'findings.txt').read_text()
+
     # ── output files ─────────────────────────────────────────────────────────
 
     def test_both_output_files_created(self, nmap_dir):
